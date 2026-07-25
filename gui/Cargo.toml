@@ -1,0 +1,29 @@
+[package]
+name = "js8-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Panoramic multi-channel JS8 monitor (waterfall + inline decoded text)"
+
+[lib]
+name = "js8_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "js8-gui"
+path = "src/main.rs"
+
+[features]
+default = ["desktop"]
+# The interactive eframe app + live audio. Disable (`--no-default-features`) to
+# build just the pure rendering pieces (e.g. the render_png example) without the
+# windowing/audio stack.
+desktop = ["dep:eframe", "dep:cpal"]
+
+[dependencies]
+js8 = { path = ".." }
+eframe = { version = "0.28", optional = true, default-features = true }
+cpal = { version = "0.15", optional = true }
+
+[dev-dependencies]
+png = "0.17"

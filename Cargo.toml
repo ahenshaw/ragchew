@@ -1,0 +1,24 @@
+[workspace]
+members = ["gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[package]
+name = "js8"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JS8 (JS8Call) HAM radio message encoder and decoder"
+
+[lib]
+name = "js8"
+path = "src/lib.rs"
+
+[dependencies]
+rustfft = "6"
+
+[profile.release]
+opt-level = 3
