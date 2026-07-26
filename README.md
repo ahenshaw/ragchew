@@ -24,6 +24,11 @@ cargo run -p ragchew-gui --release -- --live          # decode the default audio
 cargo run -p ragchew-gui --release -- recording.wav   # play back a recording
 ```
 
+The demo band carries eleven stations — all four JS8 submodes and three Olivia
+modes — including a JS8 station transmitting *inside* an Olivia signal's
+bandwidth at 2000 Hz, which is where the two protocols visibly stay separate
+conversations while sharing a patch of spectrum.
+
 The mode menus in the toolbar control what is scanned for; each protocol's
 channels are coloured by mode. Scroll to pan, pinch (or ctrl+scroll) to zoom,
 shift+scroll to size the text.

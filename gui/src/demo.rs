@@ -1,11 +1,24 @@
 //! A synthetic multi-protocol band for the app's `--demo` mode and the headless
 //! scene validator.
 //!
-//! Ten stations: all four JS8 submodes on their own cycles, plus three Olivia
-//! stations rag-chewing continuously across the same band. Carriers are spaced
-//! so no two occupied bandwidths collide — Olivia is wide, so it takes most of
-//! the room — and everything sits under a little noise, inside the 300–2600 Hz
-//! band the app scans.
+//! Eleven stations: all four JS8 submodes on their own cycles, plus three
+//! Olivia stations rag-chewing continuously across the same band, under a little
+//! noise, inside the 300–2600 Hz the app scans.
+//!
+//! Carriers are spaced so no two occupied bandwidths collide — Olivia is wide,
+//! so it takes most of the room — with one deliberate exception: a JS8 station
+//! sits squarely inside the Olivia 16/500 signal at 2000 Hz. Real bands are not
+//! tidy, and a monitor that only works when signals are politely separated is
+//! not much of a monitor. It also makes the point that the two protocols are
+//! tracked independently: they share a patch of spectrum without sharing a row
+//! of text.
+//!
+//! They do interfere, and asymmetrically. The JS8 frames come through intact —
+//! Olivia spreads its power over sixteen tones, so only one or two ever land in
+//! JS8's 50 Hz, and the LDPC absorbs that. The Olivia station loses a couple of
+//! blocks, because the JS8 carrier is narrow and strong and parks in one of its
+//! tone bins for a whole frame. That asymmetry is real, not a defect in the
+//! demo: it is what QRM costs each mode.
 
 use ragchew::js8::message::{self, IType};
 use ragchew::js8::modem;
@@ -24,6 +37,10 @@ pub const JS8_STATIONS: &[(f64, Submode, &[&str])] = &[
     (1620.0, submode::TURBO, &["TEST DE W9T ", "FAST QSO ", "FB 73 GL "]),
     (2320.0, submode::NORMAL, &["DE G4ABC ", "IO91 QRP ", "TU 72 "]),
     (2460.0, submode::TURBO, &["DE ZL2T ", "QRO 400W ", "GL SK "]),
+    // Deliberately co-channel with the Olivia 16/500 station below: its 50 Hz
+    // lands in the middle of that signal's 500, and its first two frames run
+    // while the Olivia station is transmitting.
+    (2000.0, submode::NORMAL, &["DE W2QRM ", "IN THE MUD ", "TU 73 "]),
 ];
 
 /// (centre Hz, mode, start time in seconds, text). Olivia stations transmit
@@ -78,10 +95,13 @@ pub fn synth() -> Vec<f32> {
 mod tests {
     use super::*;
 
-    /// No two demo stations overlap in frequency — the whole point of the demo
-    /// band is that every station is separately decodable.
+    /// The one place two stations share spectrum is the deliberate one.
+    ///
+    /// Everything else is spaced clear, so that a station failing to decode in
+    /// the demo means something is wrong with the decoder rather than with the
+    /// band plan.
     #[test]
-    fn stations_do_not_overlap() {
+    fn only_the_deliberate_collision_overlaps() {
         let mut bands: Vec<(f64, f64, String)> = Vec::new();
         for (hz, sm, _) in JS8_STATIONS {
             let bw = 8.0 * sm.spacing();
@@ -92,8 +112,16 @@ mod tests {
             bands.push((hz - bw / 2.0, hz + bw / 2.0, format!("{} @ {hz}", m.name())));
         }
         bands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        for w in bands.windows(2) {
-            assert!(w[0].1 <= w[1].0, "{} overlaps {}", w[0].2, w[1].2);
-        }
+
+        let collisions: Vec<String> = bands
+            .windows(2)
+            .filter(|w| w[0].1 > w[1].0)
+            .map(|w| format!("{} / {}", w[0].2, w[1].2))
+            .collect();
+        assert_eq!(
+            collisions,
+            vec!["Olivia 16/500 @ 2000 / JS8 Normal @ 2000"],
+            "unintended overlap in the demo band"
+        );
     }
 }
