@@ -91,37 +91,70 @@ fn co_channel_protocols_are_both_copied() {
 
 /// The weak-signal band decodes exactly as far down as it claims to.
 ///
-/// Each station's text states its own SNR, so these assertions are what keeps
-/// the demo honest: if the decoder's reach changes, the labels become a lie and
-/// this fails. Full copy is expected down to -13 dB — about what Olivia 8/250
-/// is documented to manage — with the -16 dB station breaking up, which is the
-/// point of including it.
+/// Each station's text states its own mode and SNR, so these assertions are
+/// what keeps the demo honest: if the decoder's reach changes, the labels
+/// become a lie and this fails.
 #[test]
 fn weak_signal_demo_copies_what_it_claims() {
     use ragchew::olivia;
-    use ragchew_gui::demo::{WEAK_MODE, WEAK_STATIONS};
+    use ragchew_gui::demo::WEAK_STATIONS;
 
     let samples = demo::synth_weak();
-    let res = olivia::decode_all(&samples, 300.0, 2600.0, &[WEAK_MODE]);
+    let res = olivia::decode_all(&samples, 300.0, 2600.0, &olivia::COMMON);
 
-    for (hz, _, snr_db, text) in WEAK_STATIONS {
-        let got: String =
-            res.iter().filter(|r| (r.hz - hz).abs() < 60.0).map(|r| r.text()).collect();
-        if *snr_db >= -13.0 {
-            assert_eq!(got, *text, "{snr_db:+} dB station at {hz} Hz should copy in full");
+    for st in WEAK_STATIONS {
+        let got: String = res
+            .iter()
+            .filter(|r| r.mode == st.mode && (r.hz - st.hz).abs() < st.mode.spacing() * 2.0)
+            .map(|r| r.text())
+            .collect();
+        if st.full_copy {
+            assert_eq!(got, st.text, "{} at {} Hz should copy in full", st.mode.name(), st.hz);
         } else {
-            // past the limit: some of it survives, but not all
-            assert!(!got.is_empty(), "{snr_db:+} dB station vanished entirely");
-            assert_ne!(got, *text, "{snr_db:+} dB station copied in full — recalibrate the demo");
+            // the one past its reach: recognisable, but visibly damaged
+            assert!(!got.is_empty(), "{} vanished entirely", st.mode.name());
+            assert_ne!(got, st.text, "{} copied in full — recalibrate the demo", st.mode.name());
         }
+    }
+
+    // nothing is claimed that no station transmitted
+    for r in &res {
+        let real = WEAK_STATIONS
+            .iter()
+            .any(|st| r.mode == st.mode && (r.hz - st.hz).abs() < st.mode.spacing() * 2.0);
+        assert!(real, "invented a {} signal at {:.0} Hz", r.mode.name(), r.hz);
     }
 }
 
-/// The weak stations really are weak: the ones below the noise floor put less
-/// power into the band than the noise does, which is what makes them invisible
-/// on the waterfall and the demo worth looking at.
+/// Stations really are stacked on top of each other, and really are under the
+/// noise — the two things the band exists to demonstrate.
 #[test]
-fn weak_stations_are_actually_below_the_noise() {
-    let quiet = ragchew_gui::demo::WEAK_STATIONS.iter().filter(|(_, _, snr, _)| *snr < 0.0).count();
-    assert!(quiet >= 3, "only {quiet} stations below the noise floor");
+fn weak_band_overlaps_and_sits_below_the_noise() {
+    use ragchew_gui::demo::WEAK_STATIONS;
+
+    let quiet = WEAK_STATIONS.iter().filter(|st| st.snr_db < 0.0).count();
+    assert_eq!(quiet, WEAK_STATIONS.len(), "every station should be below the noise floor");
+
+    let overlaps = WEAK_STATIONS
+        .iter()
+        .enumerate()
+        .flat_map(|(i, a)| WEAK_STATIONS[i + 1..].iter().map(move |b| (a, b)))
+        .filter(|(a, b)| {
+            let gap = (a.hz - b.hz).abs();
+            gap < (a.mode.bandwidth + b.mode.bandwidth) as f64 / 2.0
+        })
+        .count();
+    assert!(overlaps >= 2, "only {overlaps} overlapping pairs");
+
+    // overlapping neighbours stay within a few dB, or the louder simply buries
+    // the quieter and the demo shows physics rather than decoding
+    for (i, a) in WEAK_STATIONS.iter().enumerate() {
+        for b in &WEAK_STATIONS[i + 1..] {
+            let gap = (a.hz - b.hz).abs();
+            if gap < (a.mode.bandwidth + b.mode.bandwidth) as f64 / 2.0 {
+                let d = (a.snr_db - b.snr_db).abs();
+                assert!(d <= 6.0, "{} and {} differ by {d} dB", a.mode.name(), b.mode.name());
+            }
+        }
+    }
 }

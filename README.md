@@ -25,30 +25,29 @@ cargo run -p ragchew-gui --release -- --live          # decode the default audio
 cargo run -p ragchew-gui --release -- recording.wav   # play back a recording
 ```
 
-`--weak` is the one that shows what Olivia is *for*: six stations in one mode
-(8/250), each a stated number of dB above or below the noise floor, each
-announcing its own SNR in its text.
+`--weak` is the one that shows what Olivia is *for*: five stations across four
+modes, every one of them **below the noise floor**, and several stacked inside
+each other's bandwidth.
 
-| station | SNR (2.5 kHz) | on the waterfall | copy |
-|---------|--------------:|------------------|------|
-| W1LOUD  | +10 dB | blazing | full |
-| K2EVEN  |   0 dB | obvious | full |
-| N3WEAK  |  −6 dB | visible if you look | full |
-| W4FADE  | −10 dB | a faint texture | full |
-| K5DEEP  | −13 dB | indistinguishable from noise | full |
-| W6GONE  | −16 dB | nothing at all | fragments |
+| station | mode | SNR (2.5 kHz) | placement | copy |
+|---------|------|--------------:|-----------|------|
+| W1WIDE | 32/1000 |  −9 dB | host | full |
+| K2IN   | 8/250   |  −9 dB | inside W1WIDE's 1 kHz | full |
+| W4HOST | 16/500  | −12 dB | host | full |
+| N3NARO | 4/125   | −12 dB | inside W4HOST's 500 Hz | full |
+| W6GONE | 8/500   | −12.5 dB | in the clear | **fragments** |
 
-The bottom half of that table is the interesting part: those stations put *less
-power into the band than the noise does*, leave no trace a human eye can find,
-and their text arrives anyway. That is what spreading every character over a
-64-chip Walsh function buys — and −13 dB is about what Olivia 8/250 is
-documented to manage, so the reach is real rather than an artefact of synthetic
-audio.
+Every one of those puts less power into the band than the noise does, leaves no
+trace an eye can find on the waterfall, and is read anyway — including where two
+of them are sitting on top of each other.
 
-The demo band carries eleven stations — all four JS8 submodes and three Olivia
-modes — including a JS8 station transmitting *inside* an Olivia signal's
-bandwidth at 2000 Hz, which is where the two protocols visibly stay separate
-conversations while sharing a patch of spectrum.
+The last row is the interesting one. It is in the clear, half a decibel below
+stations that copy perfectly, and it still falls apart — because sensitivity
+tracks *characters per second*, not bandwidth. Every mode spreads a character
+over the same 64 chips, so a slower mode spends more energy on each and hears
+further: 4/125 at a leisurely 0.98 char/s copies at −12 dB while 8/500, three
+times faster, is already breaking up. The FEC does not degrade gently either —
+the window between clean copy and nothing at all is about a decibel wide.
 
 The mode menus in the toolbar control what is scanned for; each protocol's
 channels are coloured by mode. Scroll to pan, pinch (or ctrl+scroll) to zoom,

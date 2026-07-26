@@ -389,55 +389,23 @@ fn sustained(blocks: &[f64]) -> f64 {
 
 /// Decode every Olivia block of any of `modes` in `samples`.
 ///
-/// One transmission can sync weakly as a *neighbouring* mode — a narrow mode
-/// will happily lock onto a slice of a wide one — so where two modes claim the
-/// same stretch of band the better-synced signal wins outright, taking all its
-/// blocks with it. Judging block by block would interleave the two into
-/// nonsense.
+/// Modes are independent of each other here: a signal is reported under every
+/// mode that genuinely syncs to it, and nothing is suppressed for merely
+/// sharing a stretch of band. Real bands stack signals — a narrow mode inside a
+/// wide one is an ordinary sight — and a scanner that assumes one signal per
+/// slice of spectrum will silently drop the quieter of any such pair.
+///
+/// What keeps a *single* signal from being reported twice under two modes is
+/// [`threshold`], not arbitration after the fact: a narrow mode locking onto a
+/// slice of a wide one produces a marginal correlation that no longer clears
+/// the bar.
 pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[Mode]) -> Vec<DecodeResult> {
-    // Every block from one synced candidate shares its exact centre and sync,
-    // which is what makes them groupable.
-    let mut signals: Vec<Vec<DecodeResult>> = Vec::new();
-    for &mode in modes {
-        for r in decode_all_mode(samples, hz_lo, hz_hi, mode) {
-            match signals
-                .iter_mut()
-                .find(|g| g[0].mode == r.mode && g[0].hz == r.hz)
-            {
-                Some(g) => g.push(r),
-                None => signals.push(vec![r]),
-            }
-        }
-    }
-
-    // Strongest first, so a weaker overlapping interpretation is the one dropped.
-    signals.sort_by(|a, b| b[0].sync.partial_cmp(&a[0].sync).unwrap());
-    let mut kept: Vec<Vec<DecodeResult>> = Vec::new();
-    for g in signals {
-        if !kept.iter().any(|k| signals_overlap(k, &g)) {
-            kept.push(g);
-        }
-    }
-
-    let mut out: Vec<DecodeResult> = kept.into_iter().flatten().collect();
+    let mut out: Vec<DecodeResult> = modes
+        .iter()
+        .flat_map(|&mode| decode_all_mode(samples, hz_lo, hz_hi, mode))
+        .collect();
     out.sort_by_key(|r| r.offset);
     out
-}
-
-/// Whether two synced signals occupy the same band at the same time, and so
-/// cannot both be real.
-fn signals_overlap(a: &[DecodeResult], b: &[DecodeResult]) -> bool {
-    let bw = a[0].mode.bandwidth.max(b[0].mode.bandwidth) as f64 / 2.0;
-    if (a[0].hz - b[0].hz).abs() >= bw {
-        return false;
-    }
-    let span = |g: &[DecodeResult]| {
-        let block = (g[0].mode.block_secs() * SAMPLE_RATE as f64) as usize;
-        (g.first().unwrap().offset, g.last().unwrap().offset + block)
-    };
-    let (a0, a1) = span(a);
-    let (b0, b1) = span(b);
-    a0 < b1 && b0 < a1
 }
 
 #[cfg(test)]

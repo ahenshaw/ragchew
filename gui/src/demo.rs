@@ -63,24 +63,63 @@ const SNR_REF_BW: f32 = 2500.0;
 /// against.
 const NOISE_RMS: f32 = 0.08;
 
-/// (centre Hz, start time, SNR in dB, text) for [`synth_weak`]. All one mode, so
-/// the only thing that varies between stations is how far under the noise they
-/// are.
-///
-/// 0 dB is the noise floor: the station is putting as much power into the
-/// reference bandwidth as the noise is. Everything below that is inaudible and
-/// invisible, and most of it still decodes.
-pub const WEAK_STATIONS: &[(f64, f64, f32, &str)] = &[
-    (500.0, 0.5, 10.0, "DE W1LOUD +10 DB EASY COPY "),
-    (900.0, 1.2, 0.0, "DE K2EVEN 0 DB AT THE NOISE FLOOR "),
-    (1300.0, 1.9, -6.0, "DE N3WEAK -6 DB UNDER THE NOISE "),
-    (1700.0, 2.6, -10.0, "DE W4FADE -10 DB STILL SOLID COPY "),
-    (2100.0, 3.3, -13.0, "DE K5DEEP -13 DB NEAR THE LIMIT "),
-    (2450.0, 4.0, -16.0, "DE W6GONE -16 DB FRAGMENTS ONLY "),
-];
+/// One station in the weak-signal band.
+pub struct WeakStation {
+    pub hz: f64,
+    pub mode: Olivia,
+    pub start_s: f64,
+    /// Level relative to the noise in [`SNR_REF_BW`]. 0 dB is the noise floor:
+    /// the station is putting as much power into that bandwidth as the noise is.
+    pub snr_db: f32,
+    /// Whether this station is expected to copy in full — see [`WEAK_STATIONS`]
+    /// for why one of them is not.
+    pub full_copy: bool,
+    pub text: &'static str,
+}
 
-/// The mode the weak-signal demo uses throughout.
-pub const WEAK_MODE: Olivia = olivia::OL_8_250;
+/// The weak-signal band: four modes, several of them overlapping, each station
+/// a stated number of dB above or below the noise floor.
+///
+/// Two things are on show. **Overlap**: a narrow station sits inside a wider
+/// one's bandwidth twice over, which is an ordinary sight on the air and the
+/// arrangement most likely to make a scanner drop the quieter of a pair. They
+/// are kept within a few dB of each other, because a signal 10 dB stronger
+/// really does bury its neighbour and that makes for a demonstration of physics
+/// rather than of decoding.
+///
+/// **Mode against depth**: the levels are not equal, they are each mode's own
+/// reach. Sensitivity tracks characters per second almost exactly — every mode
+/// spreads a character over the same 64 chips, so the slower ones spend more
+/// energy on each and hear further. Hence 4/125 copying at -12 dB while 8/500,
+/// three times faster, is already in pieces at -15.
+pub const WEAK_STATIONS: &[WeakStation] = &[
+    // A wide, slow host with a narrow station inside its 1 kHz.
+    WeakStation {
+        hz: 900.0, mode: olivia::OL_32_1000, start_s: 0.4, snr_db: -9.0, full_copy: true,
+        text: "DE W1WIDE 32/1000 -9 DB ",
+    },
+    WeakStation {
+        hz: 700.0, mode: olivia::OL_8_250, start_s: 1.1, snr_db: -9.0, full_copy: true,
+        text: "DE K2IN 8/250 -9 DB INSIDE THE WIDE ONE ",
+    },
+    // And again, deeper: the narrowest mode inside a 500 Hz one.
+    WeakStation {
+        hz: 1750.0, mode: olivia::OL_16_500, start_s: 1.8, snr_db: -12.0, full_copy: true,
+        text: "DE W4HOST 16/500 -12 DB ",
+    },
+    WeakStation {
+        hz: 1700.0, mode: olivia::OL_4_125, start_s: 2.5, snr_db: -12.0, full_copy: true,
+        text: "DE N3NARO 4/125 -12 DB INSIDE TOO ",
+    },
+    // Half a dB below the two above, in the clear rather than buried, and three
+    // times their character rate — which is all it takes. The FEC does not
+    // degrade gently: a mode copies or it does not, and the window where it
+    // merely stumbles is about a decibel wide.
+    WeakStation {
+        hz: 2350.0, mode: olivia::OL_8_500, start_s: 3.2, snr_db: -12.5, full_copy: false,
+        text: "DE W6GONE 8/500 -12.5 DB SAME LEVEL BUT TOO FAST ",
+    },
+];
 
 fn rms(x: &[f32]) -> f32 {
     (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
@@ -118,23 +157,25 @@ fn noise(n: usize, rms_target: f32, seed: u64) -> Vec<f32> {
     v
 }
 
-/// Synthesize the weak-signal band: one Olivia mode, six stations, each a known
-/// number of dB above or below the noise floor.
+/// Synthesize the weak-signal band: Olivia stations across four modes, each a
+/// known number of dB below the noise floor, several of them overlapping in
+/// frequency.
 ///
 /// This is the demonstration of what the mode is actually for. Spreading every
 /// character over a 64-chip Walsh function buys enough coding gain that a signal
 /// putting less power into the band than the noise does still comes through —
-/// so the stations at the bottom of the list leave no visible trace on the
-/// waterfall at all, and their text arrives anyway.
+/// so most of these stations leave no visible trace on the waterfall at all,
+/// and their text arrives anyway, even where they are sitting on top of each
+/// other.
 pub fn synth_weak() -> Vec<f32> {
     let rate = SAMPLE_RATE as usize;
     let total = 60 * rate;
     let mut buf = noise(total, NOISE_RMS, 0x51A9_2C3D_7E10_4B6F);
 
-    for (hz, start_s, snr_db, text) in WEAK_STATIONS {
-        let sig = olivia::encode(text, *hz, WEAK_MODE);
-        let amp = scale_for_snr(&sig, *snr_db);
-        let start = (start_s * rate as f64) as usize;
+    for st in WEAK_STATIONS {
+        let sig = olivia::encode(st.text, st.hz, st.mode);
+        let amp = scale_for_snr(&sig, st.snr_db);
+        let start = (st.start_s * rate as f64) as usize;
         for (i, s) in sig.iter().enumerate() {
             if start + i < total {
                 buf[start + i] += *s * amp;
