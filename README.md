@@ -20,9 +20,30 @@ presents them the same way.
 
 ```
 cargo run -p ragchew-gui --release -- --demo          # synthetic multi-protocol band
+cargo run -p ragchew-gui --release -- --weak          # Olivia under the noise floor
 cargo run -p ragchew-gui --release -- --live          # decode the default audio input
 cargo run -p ragchew-gui --release -- recording.wav   # play back a recording
 ```
+
+`--weak` is the one that shows what Olivia is *for*: six stations in one mode
+(8/250), each a stated number of dB above or below the noise floor, each
+announcing its own SNR in its text.
+
+| station | SNR (2.5 kHz) | on the waterfall | copy |
+|---------|--------------:|------------------|------|
+| W1LOUD  | +10 dB | blazing | full |
+| K2EVEN  |   0 dB | obvious | full |
+| N3WEAK  |  −6 dB | visible if you look | full |
+| W4FADE  | −10 dB | a faint texture | full |
+| K5DEEP  | −13 dB | indistinguishable from noise | full |
+| W6GONE  | −16 dB | nothing at all | fragments |
+
+The bottom half of that table is the interesting part: those stations put *less
+power into the band than the noise does*, leave no trace a human eye can find,
+and their text arrives anyway. That is what spreading every character over a
+64-chip Walsh function buys — and −13 dB is about what Olivia 8/250 is
+documented to manage, so the reach is real rather than an artefact of synthetic
+audio.
 
 The demo band carries eleven stations — all four JS8 submodes and three Olivia
 modes — including a JS8 station transmitting *inside* an Olivia signal's

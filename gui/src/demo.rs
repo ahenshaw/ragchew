@@ -1,5 +1,8 @@
-//! A synthetic multi-protocol band for the app's `--demo` mode and the headless
-//! scene validator.
+//! Synthetic bands for the app's demo modes and the headless scene validator.
+//!
+//! [`synth`] builds the mixed-protocol band behind `--demo`; [`synth_weak`]
+//! builds the Olivia weak-signal band behind `--weak`, where the whole point is
+//! how far under the noise a signal can be and still be read.
 //!
 //! Eleven stations: all four JS8 submodes on their own cycles, plus three
 //! Olivia stations rag-chewing continuously across the same band, under a little
@@ -51,6 +54,95 @@ pub const OLIVIA_STATIONS: &[(f64, Olivia, f64, &str)] = &[
     (1330.0, olivia::OL_4_125, 3.0, "DE VE7OLV QRP 5W "),
     (2000.0, olivia::OL_16_500, 6.0, "GM OM UR RST 579 IN EM73 BTU "),
 ];
+
+/// Bandwidth (Hz) the SNR figures below are quoted in — the convention amateur
+/// weak-signal work uses, so the numbers mean what a ham expects them to.
+const SNR_REF_BW: f32 = 2500.0;
+
+/// Noise RMS in the weak-signal demo, and the level its SNRs are measured
+/// against.
+const NOISE_RMS: f32 = 0.08;
+
+/// (centre Hz, start time, SNR in dB, text) for [`synth_weak`]. All one mode, so
+/// the only thing that varies between stations is how far under the noise they
+/// are.
+///
+/// 0 dB is the noise floor: the station is putting as much power into the
+/// reference bandwidth as the noise is. Everything below that is inaudible and
+/// invisible, and most of it still decodes.
+pub const WEAK_STATIONS: &[(f64, f64, f32, &str)] = &[
+    (500.0, 0.5, 10.0, "DE W1LOUD +10 DB EASY COPY "),
+    (900.0, 1.2, 0.0, "DE K2EVEN 0 DB AT THE NOISE FLOOR "),
+    (1300.0, 1.9, -6.0, "DE N3WEAK -6 DB UNDER THE NOISE "),
+    (1700.0, 2.6, -10.0, "DE W4FADE -10 DB STILL SOLID COPY "),
+    (2100.0, 3.3, -13.0, "DE K5DEEP -13 DB NEAR THE LIMIT "),
+    (2450.0, 4.0, -16.0, "DE W6GONE -16 DB FRAGMENTS ONLY "),
+];
+
+/// The mode the weak-signal demo uses throughout.
+pub const WEAK_MODE: Olivia = olivia::OL_8_250;
+
+fn rms(x: &[f32]) -> f32 {
+    (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
+}
+
+/// Scale a signal so it sits `snr_db` relative to the demo's noise, measured in
+/// [`SNR_REF_BW`].
+///
+/// The noise is white across the whole Nyquist span, so only the fraction of it
+/// inside the reference bandwidth counts against the signal.
+fn scale_for_snr(sig: &[f32], snr_db: f32) -> f32 {
+    let noise_in_ref = NOISE_RMS * NOISE_RMS * SNR_REF_BW / (SAMPLE_RATE as f32 / 2.0);
+    let want = noise_in_ref * 10f32.powf(snr_db / 10.0);
+    let have = rms(sig).powi(2);
+    if have > 0.0 {
+        (want / have).sqrt()
+    } else {
+        0.0
+    }
+}
+
+/// Deterministic white noise of a given RMS.
+fn noise(n: usize, rms_target: f32, seed: u64) -> Vec<f32> {
+    let mut s = seed;
+    let mut v: Vec<f32> = (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (s >> 40) as f32 / (1u32 << 24) as f32 - 0.5
+        })
+        .collect();
+    let k = rms_target / rms(&v).max(f32::EPSILON);
+    for x in v.iter_mut() {
+        *x *= k;
+    }
+    v
+}
+
+/// Synthesize the weak-signal band: one Olivia mode, six stations, each a known
+/// number of dB above or below the noise floor.
+///
+/// This is the demonstration of what the mode is actually for. Spreading every
+/// character over a 64-chip Walsh function buys enough coding gain that a signal
+/// putting less power into the band than the noise does still comes through —
+/// so the stations at the bottom of the list leave no visible trace on the
+/// waterfall at all, and their text arrives anyway.
+pub fn synth_weak() -> Vec<f32> {
+    let rate = SAMPLE_RATE as usize;
+    let total = 60 * rate;
+    let mut buf = noise(total, NOISE_RMS, 0x51A9_2C3D_7E10_4B6F);
+
+    for (hz, start_s, snr_db, text) in WEAK_STATIONS {
+        let sig = olivia::encode(text, *hz, WEAK_MODE);
+        let amp = scale_for_snr(&sig, *snr_db);
+        let start = (start_s * rate as f64) as usize;
+        for (i, s) in sig.iter().enumerate() {
+            if start + i < total {
+                buf[start + i] += *s * amp;
+            }
+        }
+    }
+    buf
+}
 
 /// Synthesize the demo band (12 kHz mono, one minute).
 pub fn synth() -> Vec<f32> {

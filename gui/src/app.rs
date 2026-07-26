@@ -62,6 +62,7 @@ fn clamp_waterfall_w(window_w: f32, strip_w: f32, want: f32) -> f32 {
 pub fn run() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let demo = args.iter().any(|a| a == "--demo");
+    let weak = args.iter().any(|a| a == "--weak" || a == "--olivia");
     let live = args.iter().any(|a| a == "--live");
     let path = args
         .iter()
@@ -71,6 +72,8 @@ pub fn run() -> eframe::Result<()> {
 
     let title = if live {
         "ragchew — live"
+    } else if weak {
+        "ragchew — weak-signal demo"
     } else if demo {
         "ragchew — demo"
     } else {
@@ -89,6 +92,8 @@ pub fn run() -> eframe::Result<()> {
         Box::new(move |_cc| {
             let app = if live {
                 App::live()
+            } else if weak {
+                App::from_samples(crate::demo::synth_weak())
             } else if demo {
                 App::from_samples(crate::demo::synth())
             } else {

@@ -88,3 +88,40 @@ fn co_channel_protocols_are_both_copied() {
     assert_eq!(here.len(), 2, "co-channel stations should not share a channel");
     assert_ne!(here[0].mode.protocol(), here[1].mode.protocol());
 }
+
+/// The weak-signal band decodes exactly as far down as it claims to.
+///
+/// Each station's text states its own SNR, so these assertions are what keeps
+/// the demo honest: if the decoder's reach changes, the labels become a lie and
+/// this fails. Full copy is expected down to -13 dB — about what Olivia 8/250
+/// is documented to manage — with the -16 dB station breaking up, which is the
+/// point of including it.
+#[test]
+fn weak_signal_demo_copies_what_it_claims() {
+    use ragchew::olivia;
+    use ragchew_gui::demo::{WEAK_MODE, WEAK_STATIONS};
+
+    let samples = demo::synth_weak();
+    let res = olivia::decode_all(&samples, 300.0, 2600.0, &[WEAK_MODE]);
+
+    for (hz, _, snr_db, text) in WEAK_STATIONS {
+        let got: String =
+            res.iter().filter(|r| (r.hz - hz).abs() < 60.0).map(|r| r.text()).collect();
+        if *snr_db >= -13.0 {
+            assert_eq!(got, *text, "{snr_db:+} dB station at {hz} Hz should copy in full");
+        } else {
+            // past the limit: some of it survives, but not all
+            assert!(!got.is_empty(), "{snr_db:+} dB station vanished entirely");
+            assert_ne!(got, *text, "{snr_db:+} dB station copied in full — recalibrate the demo");
+        }
+    }
+}
+
+/// The weak stations really are weak: the ones below the noise floor put less
+/// power into the band than the noise does, which is what makes them invisible
+/// on the waterfall and the demo worth looking at.
+#[test]
+fn weak_stations_are_actually_below_the_noise() {
+    let quiet = ragchew_gui::demo::WEAK_STATIONS.iter().filter(|(_, _, snr, _)| *snr < 0.0).count();
+    assert!(quiet >= 3, "only {quiet} stations below the noise floor");
+}
