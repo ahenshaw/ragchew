@@ -97,6 +97,16 @@ fn mode_color(m: ModeId) -> Color32 {
     }
 }
 
+/// A round tick spacing for a `span` Hz view, aiming for roughly six labels.
+///
+/// The old scale was fixed at whole kilohertz, which is fine for the whole band
+/// and useless the moment you zoom into one conversation.
+fn tick_step(span: f64) -> f64 {
+    const STEPS: [f64; 9] = [5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0];
+    let target = span / 6.0;
+    STEPS.iter().copied().find(|&s| s >= target).unwrap_or(*STEPS.last().unwrap())
+}
+
 /// A decode plus the playback time at which it should appear.
 struct Frame {
     reveal_s: f64,
@@ -815,22 +825,62 @@ impl eframe::App for App {
                 painter.circle_filled(to_screen(g.waterfall_x0(), y_freq), 2.5, color);
             }
 
-            // frequency ticks
-            let tick = Stroke::new(1.0, Color32::from_gray(90));
-            for khz in 0..=4 {
-                let hz = khz as f64 * 1000.0;
-                if g.visible(&self.vp, hz) {
-                    let y = g.hz_to_y(&self.vp, hz);
-                    painter.line_segment([to_screen(0.0, y), to_screen(8.0, y)], tick);
-                    painter.text(
-                        to_screen(10.0, y),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{hz:.0} Hz"),
-                        FontId::proportional(11.0),
-                        Color32::from_gray(120),
-                    );
-                }
+            // Frequency scale, overlaid on the right-hand edge of the waterfall.
+            // It belongs on the axis it labels, and putting it there gives the
+            // text panel its full width back. Each label carries its own dim
+            // backing so it stays legible over a bright trace.
+            let tick = Stroke::new(1.0, Color32::from_gray(160));
+            let font = FontId::proportional(11.0);
+            let step = tick_step(self.vp.f_hi - self.vp.f_lo);
+            let mut hz = (self.vp.f_lo / step).ceil() * step;
+            while hz <= self.vp.f_hi {
+                let y = g.hz_to_y(&self.vp, hz);
+                let galley =
+                    painter.layout_no_wrap(format!("{hz:.0} Hz"), font.clone(), Color32::WHITE);
+                let size = galley.size();
+                let pos = to_screen(g.width - 12.0 - size.x, y - size.y / 2.0);
+                let pad = egui::vec2(4.0, 1.0);
+                painter.rect_filled(
+                    Rect::from_min_size(pos - pad, size + 2.0 * pad),
+                    3.0,
+                    Color32::from_black_alpha(170),
+                );
+                painter.galley(pos, galley, Color32::from_gray(210));
+                painter.line_segment(
+                    [to_screen(g.width - 8.0, y), to_screen(g.width - 2.0, y)],
+                    tick,
+                );
+                hz += step;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frequency scale stays legible at any zoom: a handful of round
+    /// numbers, whether the view is the whole band or one conversation.
+    #[test]
+    fn tick_spacing_suits_the_zoom() {
+        for span in [50.0, 120.0, 500.0, 1500.0, 4000.0] {
+            let step = tick_step(span);
+            let n = span / step;
+            assert!((2.0..=12.0).contains(&n), "{n} labels across {span} Hz (step {step})");
+        }
+    }
+
+    /// Every step is a round number a reader can do arithmetic with.
+    #[test]
+    fn tick_steps_are_round() {
+        for span in [40.0, 77.0, 333.0, 999.0, 4000.0, 8000.0] {
+            let step = tick_step(span);
+            let mantissa = step / 10f64.powf(step.log10().floor());
+            assert!(
+                [1.0, 2.0, 5.0].iter().any(|m| (m - mantissa).abs() < 1e-9),
+                "step {step} is not a 1/2/5 multiple"
+            );
+        }
     }
 }
