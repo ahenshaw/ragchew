@@ -15,6 +15,7 @@
 //! block every couple of seconds — and the waterfall scrolls. Stand-in for the
 //! live decode loop.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -59,22 +60,39 @@ fn clamp_waterfall_w(window_w: f32, strip_w: f32, want: f32) -> f32 {
     want.clamp(MIN_WATERFALL_W, max)
 }
 
-pub fn run() -> eframe::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let demo = args.iter().any(|a| a == "--demo");
-    let weak = args.iter().any(|a| a == "--weak" || a == "--olivia");
-    let live = args.iter().any(|a| a == "--live");
-    let path = args
-        .iter()
-        .find(|a| !a.starts_with("--"))
-        .cloned()
-        .unwrap_or_else(|| "tests/vectors/john_3_16.wav".to_string());
+/// Panoramic monitor for HAM radio digital modes: a waterfall of a whole audio
+/// band, with every conversation in it decoded and printed inline.
+#[derive(clap::Parser)]
+#[command(name = "ragchew", version, about, long_about = None)]
+struct Args {
+    /// Audio file to decode: 12 kHz mono 16-bit PCM WAV.
+    ///
+    /// Transcode anything else with
+    /// `ffmpeg -i in.mp3 -ac 1 -ar 12000 out.wav`.
+    #[arg(value_name = "FILE")]
+    file: Option<PathBuf>,
 
-    let title = if live {
+    /// Decode live from an audio input device.
+    #[arg(long, conflicts_with_all = ["file", "demo", "weak"])]
+    live: bool,
+
+    /// Synthetic band carrying both protocols, eleven stations.
+    #[arg(long, conflicts_with_all = ["file", "weak"])]
+    demo: bool,
+
+    /// Synthetic Olivia band, every station below the noise floor.
+    #[arg(long, alias = "olivia", conflicts_with = "file")]
+    weak: bool,
+}
+
+pub fn run() -> eframe::Result<()> {
+    let args = <Args as clap::Parser>::parse();
+
+    let title = if args.live {
         "ragchew — live"
-    } else if weak {
+    } else if args.weak {
         "ragchew — weak-signal demo"
-    } else if demo {
+    } else if args.demo {
         "ragchew — demo"
     } else {
         "ragchew"
@@ -90,15 +108,18 @@ pub fn run() -> eframe::Result<()> {
         title,
         options,
         Box::new(move |_cc| {
-            let app = if live {
-                App::live()
-            } else if weak {
-                App::from_samples(crate::demo::synth_weak())
-            } else if demo {
-                App::from_samples(crate::demo::synth())
-            } else {
-                App::load(&path)
-            };
+            let mut app = App::base((0.0, 4000.0));
+            if args.live {
+                app.go_live();
+            } else if args.weak {
+                app.set_source(crate::demo::synth_weak(), "weak-signal demo");
+            } else if args.demo {
+                app.set_source(crate::demo::synth(), "demo band");
+            } else if let Some(path) = &args.file {
+                app.open_file(path);
+            }
+            // With no argument at all it opens empty, and the File menu is
+            // right there — better than silently loading something.
             Ok(Box::new(app))
         }),
     )
@@ -318,6 +339,10 @@ struct App {
     modes: Vec<(ModeId, bool)>,
     /// Kept so a change to `modes` can re-scan a file without reloading it.
     samples: Arc<Vec<f32>>,
+    /// What is being monitored, for the title bar.
+    source: String,
+    /// Why the last open failed, if it did.
+    status: Option<String>,
 
     /// True while a drag that began on the band bar is in progress, and the
     /// frequency offset between where it was grabbed and the view centre — so
@@ -361,6 +386,8 @@ impl App {
             tex_key: (0, 0, 0, 0, 0, 0),
             modes: protocol::default_modes().into_iter().map(|m| (m, true)).collect(),
             samples: Arc::new(Vec::new()),
+            source: String::new(),
+            status: None,
             bar_drag: false,
             bar_grab_hz: 0.0,
             split_drag: false,
@@ -374,42 +401,71 @@ impl App {
         self.modes.iter().filter(|(_, on)| *on).map(|(m, _)| *m).collect()
     }
 
-    /// Live capture from the default input device.
-    fn live() -> App {
-        let band = (0.0, 4000.0);
-        let mut app = App::base(band);
-        app.live = Some(LiveMode::start(band, app.enabled_modes()));
-        app
+    /// Switch to live capture from the default input device.
+    fn go_live(&mut self) {
+        self.samples = Arc::new(Vec::new());
+        self.spec = None;
+        self.frames = Vec::new();
+        self.frames_ready = true;
+        self.status = None;
+        self.source = "live input".to_string();
+        self.live = Some(LiveMode::start(self.band, self.enabled_modes()));
     }
 
-    fn load(path: &str) -> App {
-        let (samples, _rate) = wav::read(path).unwrap_or((Vec::new(), SAMPLE_RATE));
-        App::from_samples(samples)
+    /// Load an audio file, replacing whatever is on screen.
+    ///
+    /// A file at the wrong sample rate is refused rather than decoded into
+    /// nonsense: every mode here is defined in terms of symbol durations, so
+    /// the wrong rate is the wrong protocol.
+    fn open_file(&mut self, path: &Path) {
+        let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().to_string();
+        let Some(p) = path.to_str() else {
+            self.status = Some(format!("{name}: path is not valid UTF-8"));
+            return;
+        };
+        match wav::read(p) {
+            Ok((samples, rate)) if rate == SAMPLE_RATE => self.set_source(samples, &name),
+            Ok((_, rate)) => {
+                self.status = Some(format!(
+                    "{name} is {rate} Hz; ragchew needs {SAMPLE_RATE} Hz mono \
+                     (ffmpeg -i in -ac 1 -ar {SAMPLE_RATE} out.wav)"
+                ));
+            }
+            Err(e) => self.status = Some(format!("{name}: {e}")),
+        }
     }
 
-    fn from_samples(samples: Vec<f32>) -> App {
-        let band = (0.0, 4000.0);
-        let mut app = App::base(band);
-        app.duration_s = samples.len() as f64 / SAMPLE_RATE as f64;
-        app.samples = Arc::new(samples);
+    /// Take a new block of audio as the thing being monitored.
+    fn set_source(&mut self, samples: Vec<f32>, name: &str) {
+        self.live = None;
+        self.status = None;
+        self.source = name.to_string();
+        self.duration_s = samples.len() as f64 / SAMPLE_RATE as f64;
+        self.samples = Arc::new(samples);
+        self.spec = None;
+        self.norm = (0.0, 1.0);
+        self.tex = None;
+        self.t_now = 0.0;
+        self.playing = false;
 
         // The spectrogram is fast and the decode is not, so they go to the UI on
         // separate channels: the waterfall can be up while decoding runs.
         let (spec_tx, spec_rx) = channel();
-        let samples = app.samples.clone();
+        let samples = self.samples.clone();
+        let band = self.band;
         thread::spawn(move || {
             let spec = Spectrogram::compute(&samples, band.0, band.1, WINDOW / 4);
             let norm = waterfall::percentiles(&spec);
             let _ = spec_tx.send((Arc::new(spec), norm));
         });
-        app.spec_rx = spec_rx;
-        app.rescan();
-        app
+        self.spec_rx = spec_rx;
+        self.rescan();
     }
 
     /// (Re)decode the loaded file with the currently enabled modes.
     fn rescan(&mut self) {
         if self.samples.is_empty() {
+            self.frames_ready = true; // nothing to wait for
             return;
         }
         let (frames_tx, frames_rx) = channel();
@@ -600,8 +656,42 @@ impl eframe::App for App {
 
         let mut chosen_device: Option<String> = None;
         let mut modes_changed = false;
+        let mut open_file: Option<PathBuf> = None;
+        let mut demo_request: Option<bool> = None; // Some(weak?)
+        let mut go_live = false;
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open audio file…").clicked() {
+                        // Blocks the UI thread while the dialog is up, which is
+                        // what you want: there is nothing to interact with
+                        // behind it, and it keeps the result in hand rather
+                        // than needing a channel back.
+                        open_file = rfd::FileDialog::new()
+                            .add_filter("audio", &["wav"])
+                            .set_title("Open a 12 kHz mono WAV")
+                            .pick_file();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Demo band").clicked() {
+                        demo_request = Some(false);
+                        ui.close_menu();
+                    }
+                    if ui.button("Weak-signal band").clicked() {
+                        demo_request = Some(true);
+                        ui.close_menu();
+                    }
+                    if ui.button("Live input").clicked() {
+                        go_live = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.separator();
                 if live {
                     ui.strong(&live_label);
                     ui.separator();
@@ -656,6 +746,16 @@ impl eframe::App for App {
                     ui.label(format!("{} channels", channels.channels().len()));
                 }
                 ui.separator();
+                match &self.status {
+                    Some(err) => {
+                        ui.colored_label(Color32::from_rgb(255, 150, 150), format!("⚠ {err}"));
+                    }
+                    None if !live && !self.source.is_empty() => {
+                        ui.weak(&self.source);
+                    }
+                    None => {}
+                }
+                ui.separator();
                 modes_changed = self.modes_menu(ui);
                 ui.separator();
                 ui.weak(
@@ -664,6 +764,17 @@ impl eframe::App for App {
                 );
             });
         });
+
+        if let Some(path) = open_file {
+            self.open_file(&path);
+        }
+        if let Some(weak) = demo_request {
+            let samples = if weak { crate::demo::synth_weak() } else { crate::demo::synth() };
+            self.set_source(samples, if weak { "weak-signal demo" } else { "demo band" });
+        }
+        if go_live && self.live.is_none() {
+            self.go_live();
+        }
 
         // switch input device if the user picked a different one
         if let Some(name) = chosen_device {
@@ -687,6 +798,16 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             let spec = match &spec {
                 Some(s) => s.clone(),
+                // Nothing loaded at all is a different state from something
+                // loading, and saying "computing…" forever would be a lie.
+                None if !live && self.samples.is_empty() => {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            "Nothing loaded.\n\n                             File ▸ Open audio file…   for a 12 kHz mono WAV\n                             File ▸ Demo band          for a synthetic band\n                             File ▸ Live input         to decode the sound card",
+                        );
+                    });
+                    return;
+                }
                 None => {
                     ui.centered_and_justified(|ui| {
                         ui.heading("⏳ computing spectrogram…");

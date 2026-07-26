@@ -22,8 +22,13 @@ presents them the same way.
 cargo run -p ragchew-gui --release -- --demo          # synthetic multi-protocol band
 cargo run -p ragchew-gui --release -- --weak          # Olivia under the noise floor
 cargo run -p ragchew-gui --release -- --live          # decode the default audio input
-cargo run -p ragchew-gui --release -- recording.wav   # play back a recording
+cargo run -p ragchew-gui --release -- recording.wav   # decode a recording
+cargo run -p ragchew-gui --release                    # start empty; File ▸ Open…
 ```
+
+Run it with no arguments and it opens empty, with everything reachable from the
+**File** menu: *Open audio file…* for a native file picker, or straight to the
+demo bands or live input. `--help` lists the lot.
 
 `--weak` is the one that shows what Olivia is *for*: five stations across four
 modes, every one of them **below the noise floor**, and several stacked inside
