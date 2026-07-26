@@ -6,7 +6,8 @@ filter down to the signal, lock to it, demodulate. This is a walk through what
 
 Source: [`src/olivia/`](../src/olivia/) — `mode.rs` (parameters), `fht.rs`
 (Hadamard transform), `fec.rs` (spreading and block decode), `modem.rs`
-(modulator, tone grid, band search).
+(modulator, tone grid, band search) — and [`gui/src/audio.rs`](../gui/src/audio.rs)
+for how the live path schedules it.
 
 ## The input
 
@@ -127,6 +128,78 @@ For a minute of audio in one mode that is on the order of a million
 single-character correlations: **1–3 seconds**, a quiet band being at the fast
 end and a busy one at the slow end, since every plausible timing has to be
 decoded properly to be ruled out.
+
+## Why there is no tracking mode
+
+The conventional shape for a receiver like this is *acquire, then track*: search
+hard once, and having found a signal, follow it cheaply from then on. This
+decoder does not do that. It is **stateless, and re-derives everything every
+pass**.
+
+`decode_all_mode` is a pure function of the sample buffer: it builds the grids,
+sweeps every candidate bin against every block phase, returns, and remembers
+nothing. The live path wakes every 4 seconds, takes the last 24 seconds, and
+runs that entire search again from scratch — never reusing the frequency, timing
+or mode it found last time.
+
+The only state anywhere is a list of already-reported `(mode, hz, time)`
+triples, and that is **output deduplication, not decoding**. A 24-second window
+stepping 4 seconds means a block in the middle gets decoded about six times; the
+list is what stops it reaching the screen six times. Remove it and the decoding
+is unchanged.
+
+### Why acquire-then-track would not buy what it usually does
+
+The usual economy assumes you eventually *stop searching*. A GPS receiver
+acquires its satellites and is then done; tracking them is far cheaper than
+finding them, so the saving is real and permanent.
+
+That never happens here. A station can key up at any frequency, in any mode, at
+any moment, so the sweep must run every pass no matter what is already locked.
+And the sweep is where effectively all the cost is — a million-odd
+single-character correlations, spent almost entirely on hypotheses that turn out
+to be empty.
+
+**The expense is proving absence, not decoding presence**, and tracking does
+nothing about proving absence. Adding it would leave the dominant cost untouched
+while introducing a lock to acquire, hold, and eventually get wrong.
+
+### What statelessness buys
+
+Re-deriving timing every pass is what lets both sides of a QSO be copied — see
+[what real signals forced](#what-real-signals-forced) below. A decoder locked to
+a frequency and phase follows one station and goes deaf to the other, which is
+precisely the bug that a weaker form of this design had.
+
+It also handles drift for nothing. Real signals wander — the JS8 recording in
+this repository drifts about 10 Hz over two minutes — and a tracker needs
+explicit drift following to survive that. Re-deriving the frequency each pass
+just finds it wherever it now is.
+
+And it makes the decoder testable: every result is a deterministic function of
+its input, with no state machine to wedge itself into an odd corner.
+
+### The one place hypotheses are reused
+
+JS8's decoder does something acquisition-like, but scoped to a single call.
+Its first pass finds what it can straight from the spectrogram; the second then
+takes the median cycle phase and the active carrier bins from those results and
+searches the *predicted empty slots* on the same carriers. That is "found
+something, now look harder nearby" — reasonable there because JS8 frames repeat
+on a fixed UTC grid, so a found frame really does predict where the next one
+will be. Olivia offers no such grid.
+
+### If the cost ever matters
+
+The fix would not be a tracker but decoupled rates: re-decode confirmed signals
+at their known bin and phase every couple of seconds — one block decode each,
+negligible — while running the full sweep every twelve rather than every four.
+Existing conversations would stream with *lower* latency than today, new
+stations would take up to twelve seconds to appear, and the sweep cost would
+drop threefold.
+
+Note what the knob is in that scheme: the sweep interval. Which is the same
+admission as above — the sweep is the cost.
 
 ## Sensitivity, and what sets it
 
