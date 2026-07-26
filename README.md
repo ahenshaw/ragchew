@@ -142,6 +142,10 @@ detector, and the decoder searches every frequency in the band against every
 block timing. What makes that affordable is screening each hypothesis on a
 single character first, and only paying for a whole block when one survives.
 
+[**docs/olivia-decoder.md**](docs/olivia-decoder.md) walks through the whole
+receive chain: the tone grid, the search, how the decision thresholds are
+calibrated, and the two bugs that only a real off-air recording exposed.
+
 Every timing that syncs is kept, not just the best one per frequency. Two
 stations working each other sit within a fraction of a tone spacing of one
 another and take turns, each keying up on its own block boundary — so a single
