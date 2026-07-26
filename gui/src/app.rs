@@ -39,6 +39,26 @@ const BAND_BAR_W: f32 = 14.0;
 /// something to grab.
 const MIN_THUMB_H: f32 = 10.0;
 
+/// How far either side of the connector strip still counts as grabbing the
+/// splitter.
+const SPLIT_GRAB: f32 = 3.0;
+
+/// Neither panel may be dragged smaller than this.
+const MIN_WATERFALL_W: f32 = 80.0;
+const MIN_TEXT_W: f32 = 160.0;
+
+/// Clamp a wanted waterfall width so both panels stay usable in a window this
+/// wide.
+///
+/// The minimums cannot always both be honoured — a narrow enough window has no
+/// room for either — so the waterfall's wins and the text panel takes what is
+/// left. Getting that order wrong is a panic, not a cosmetic bug: `clamp` needs
+/// its bounds the right way round.
+fn clamp_waterfall_w(window_w: f32, strip_w: f32, want: f32) -> f32 {
+    let max = (window_w - strip_w - MIN_TEXT_W).max(MIN_WATERFALL_W);
+    want.clamp(MIN_WATERFALL_W, max)
+}
+
 pub fn run() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let demo = args.iter().any(|a| a == "--demo");
@@ -300,6 +320,12 @@ struct App {
     bar_drag: bool,
     bar_grab_hz: f64,
 
+    /// True while a drag that began on the connector strip is resizing the
+    /// waterfall, and where in the strip it was grabbed — so the strip tracks
+    /// the cursor instead of snapping its edge to it.
+    split_drag: bool,
+    split_grab_dx: f32,
+
     live: Option<LiveMode>,
 }
 
@@ -332,6 +358,8 @@ impl App {
             samples: Arc::new(Vec::new()),
             bar_drag: false,
             bar_grab_hz: 0.0,
+            split_drag: false,
+            split_grab_dx: 0.0,
             live: None,
         }
     }
@@ -665,6 +693,8 @@ impl eframe::App for App {
             let (resp, painter) =
                 ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
             let rect = resp.rect;
+            // the window may have been resized since the split was last set
+            self.waterfall_w = clamp_waterfall_w(rect.width(), self.strip_w, self.waterfall_w);
             let g = Geometry {
                 width: rect.width(),
                 height: rect.height(),
@@ -709,6 +739,34 @@ impl eframe::App for App {
                     self.center_on(y_to_band_hz(p.y));
                 }
             }
+
+            // The connector strip doubles as the splitter between the two
+            // panels: it is the gutter between them, so it is where a hand
+            // reaches to move the boundary.
+            let on_split = |p: Pos2| {
+                let x = p.x - rect.min.x;
+                (g.strip_x0() - SPLIT_GRAB..=g.strip_x1() + SPLIT_GRAB).contains(&x)
+            };
+            if resp.drag_started() && !self.bar_drag {
+                self.split_drag = pointer.is_some_and(on_split);
+                if let (true, Some(p)) = (self.split_drag, pointer) {
+                    self.split_grab_dx = p.x - rect.min.x - g.strip_x0();
+                }
+            }
+            if !resp.dragged() {
+                self.split_drag = false;
+            }
+            if self.split_drag {
+                if let Some(p) = pointer {
+                    let strip_x0 = p.x - rect.min.x - self.split_grab_dx;
+                    let want = g.width - strip_x0 - self.strip_w;
+                    self.waterfall_w = clamp_waterfall_w(g.width, self.strip_w, want);
+                }
+            }
+            let split_hot = self.split_drag || (!self.bar_drag && pointer.is_some_and(on_split));
+            if split_hot {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
             // Frequency zoom comes from `zoom_delta()`, which egui synthesizes
             // from touchpad pinch AND Ctrl/Cmd+scroll (both are removed from the
             // plain scroll delta). Plain scroll pans; Shift+scroll sizes text.
@@ -733,7 +791,7 @@ impl eframe::App for App {
                     }
                 }
             }
-            if resp.dragged() && !self.bar_drag {
+            if resp.dragged() && !self.bar_drag && !self.split_drag {
                 let dhz =
                     resp.drag_delta().y as f64 * (self.vp.f_hi - self.vp.f_lo) / g.height as f64;
                 self.pan_hz(dhz);
@@ -766,7 +824,17 @@ impl eframe::App for App {
                 Color32::WHITE,
             );
 
-            let div = Stroke::new(1.0, Color32::from_gray(70));
+            if split_hot {
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        to_screen(g.strip_x0(), 0.0),
+                        to_screen(g.strip_x1(), g.height),
+                    ),
+                    0.0,
+                    Color32::from_white_alpha(12),
+                );
+            }
+            let div = Stroke::new(1.0, Color32::from_gray(if split_hot { 150 } else { 70 }));
             painter.line_segment([to_screen(g.strip_x0(), 0.0), to_screen(g.strip_x0(), g.height)], div);
             painter.line_segment([to_screen(g.strip_x1(), 0.0), to_screen(g.strip_x1(), g.height)], div);
 
@@ -912,6 +980,26 @@ mod tests {
             let n = span / step;
             assert!((2.0..=12.0).contains(&n), "{n} labels across {span} Hz (step {step})");
         }
+    }
+
+    /// The split stays inside the window, and both panels keep some width —
+    /// even when the window is too narrow to honour both minimums.
+    #[test]
+    fn split_stays_usable_at_any_window_width() {
+        for window in [1280.0f32, 640.0, 300.0, 200.0, 120.0] {
+            for want in [-50.0f32, 0.0, 100.0, 300.0, 5000.0] {
+                let w = clamp_waterfall_w(window, 35.0, want);
+                assert!(w >= MIN_WATERFALL_W, "waterfall {w} in a {window} window");
+                assert!(w <= window.max(MIN_WATERFALL_W), "waterfall {w} exceeds {window}");
+            }
+        }
+    }
+
+    /// A comfortable window honours both minimums and the requested width.
+    #[test]
+    fn split_is_respected_when_there_is_room() {
+        assert_eq!(clamp_waterfall_w(1280.0, 35.0, 420.0), 420.0);
+        assert_eq!(clamp_waterfall_w(1280.0, 35.0, 5000.0), 1280.0 - 35.0 - MIN_TEXT_W);
     }
 
     /// Every step is a round number a reader can do arithmetic with.

@@ -33,7 +33,8 @@ The mode menus in the toolbar control what is scanned for; each protocol's
 channels are coloured by mode. Scroll to pan, pinch (or ctrl+scroll) to zoom,
 shift+scroll to size the text. The frequency axis — scale and band position —
 is overlaid on the waterfall's right edge; drag the bar there to move around the
-whole band whatever the zoom.
+whole band whatever the zoom. Drag the gutter between the text and the waterfall
+to give either side more room.
 
 Headless, without the windowing/audio stack — renders straight to PNG:
 
