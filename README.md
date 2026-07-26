@@ -31,7 +31,9 @@ conversations while sharing a patch of spectrum.
 
 The mode menus in the toolbar control what is scanned for; each protocol's
 channels are coloured by mode. Scroll to pan, pinch (or ctrl+scroll) to zoom,
-shift+scroll to size the text.
+shift+scroll to size the text. The frequency axis — scale and band position —
+is overlaid on the waterfall's right edge; drag the bar there to move around the
+whole band whatever the zoom.
 
 Headless, without the windowing/audio stack — renders straight to PNG:
 

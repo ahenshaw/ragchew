@@ -32,6 +32,13 @@ use crate::waterfall::{self, Viewport};
 
 const HIGHLIGHT_SECS: f64 = 2.5;
 
+/// Width of the band bar overlaid on the waterfall's right edge.
+const BAND_BAR_W: f32 = 14.0;
+
+/// Shortest the band bar's thumb is allowed to get, so a deep zoom still leaves
+/// something to grab.
+const MIN_THUMB_H: f32 = 10.0;
+
 pub fn run() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let demo = args.iter().any(|a| a == "--demo");
@@ -287,6 +294,12 @@ struct App {
     /// Kept so a change to `modes` can re-scan a file without reloading it.
     samples: Arc<Vec<f32>>,
 
+    /// True while a drag that began on the band bar is in progress, and the
+    /// frequency offset between where it was grabbed and the view centre — so
+    /// the grabbed point stays under the cursor instead of snapping to it.
+    bar_drag: bool,
+    bar_grab_hz: f64,
+
     live: Option<LiveMode>,
 }
 
@@ -317,6 +330,8 @@ impl App {
             tex_key: (0, 0, 0, 0, 0, 0),
             modes: protocol::default_modes().into_iter().map(|m| (m, true)).collect(),
             samples: Arc::new(Vec::new()),
+            bar_drag: false,
+            bar_grab_hz: 0.0,
             live: None,
         }
     }
@@ -610,7 +625,10 @@ impl eframe::App for App {
                 ui.separator();
                 modes_changed = self.modes_menu(ui);
                 ui.separator();
-                ui.weak("scroll: pan · pinch or ctrl+scroll: zoom · shift+scroll: text · drag: pan");
+                ui.weak(
+                    "scroll: pan · pinch or ctrl+scroll: zoom · shift+scroll: text · \
+                     drag: pan · right edge: whole band",
+                );
             });
         });
 
@@ -632,36 +650,6 @@ impl eframe::App for App {
                 None => self.rescan(),
             }
         }
-
-        // Frequency scrollbar (full band = full height; thumb = current view).
-        egui::SidePanel::left("freqbar")
-            .exact_width(16.0)
-            .resizable(false)
-            .show(ctx, |ui| {
-                let (resp, painter) =
-                    ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
-                let rect = resp.rect;
-                let (blo, bhi) = self.band;
-                let span = bhi - blo;
-                let h = rect.height();
-                let y_of = |hz: f64| rect.top() + ((bhi - hz) / span) as f32 * h;
-
-                painter.rect_filled(rect.shrink(3.0), 4.0, Color32::from_gray(28));
-                let thumb = Rect::from_min_max(
-                    Pos2::new(rect.left() + 3.0, y_of(self.vp.f_hi)),
-                    Pos2::new(rect.right() - 3.0, y_of(self.vp.f_lo)),
-                );
-                let hot = resp.hovered() || resp.dragged();
-                painter.rect_filled(thumb, 4.0, Color32::from_gray(if hot { 120 } else { 80 }));
-
-                if resp.dragged() {
-                    self.pan_hz(-(resp.drag_delta().y as f64) * span / h as f64);
-                } else if resp.clicked() {
-                    if let Some(p) = resp.interact_pointer_pos() {
-                        self.center_on(bhi - ((p.y - rect.top()) / h) as f64 * span);
-                    }
-                }
-            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let spec = match &spec {
@@ -685,11 +673,42 @@ impl eframe::App for App {
             };
             let to_screen = |x: f32, y: f32| Pos2::new(rect.min.x + x, rect.min.y + y);
 
-            // interaction
-            let y_to_hz = |y: f32| {
-                let f = (y - rect.min.y) / g.height.max(1.0);
-                self.vp.f_hi - f as f64 * (self.vp.f_hi - self.vp.f_lo)
+            // interaction. The frequency mappings snapshot the viewport rather
+            // than borrowing it, so panning mid-frame does not fight them.
+            let (vp_lo, vp_hi) = (self.vp.f_lo, self.vp.f_hi);
+            let (band_lo, band_hi) = self.band;
+            let top_y = rect.min.y;
+            let h = g.height.max(1.0);
+            let y_to_hz = move |y: f32| vp_hi - ((y - top_y) / h) as f64 * (vp_hi - vp_lo);
+            // The band bar maps the *whole* band over the full height, whatever
+            // the view is zoomed to — that is the point of it.
+            let y_to_band_hz = move |y: f32| {
+                let f = ((y - top_y) / h).clamp(0.0, 1.0) as f64;
+                band_hi - f * (band_hi - band_lo)
             };
+            let bar_x0 = g.width - BAND_BAR_W;
+            let on_bar = |p: Pos2| p.x - rect.min.x >= bar_x0;
+            let pointer = ui.input(|i| i.pointer.interact_pos());
+
+            if resp.drag_started() {
+                self.bar_drag = pointer.is_some_and(on_bar);
+                if let (true, Some(p)) = (self.bar_drag, pointer) {
+                    let center = (self.vp.f_lo + self.vp.f_hi) / 2.0;
+                    self.bar_grab_hz = y_to_band_hz(p.y) - center;
+                }
+            }
+            if !resp.dragged() {
+                self.bar_drag = false;
+            }
+            if self.bar_drag {
+                if let Some(p) = pointer {
+                    self.center_on(y_to_band_hz(p.y) - self.bar_grab_hz);
+                }
+            } else if resp.clicked() && pointer.is_some_and(on_bar) {
+                if let Some(p) = pointer {
+                    self.center_on(y_to_band_hz(p.y));
+                }
+            }
             // Frequency zoom comes from `zoom_delta()`, which egui synthesizes
             // from touchpad pinch AND Ctrl/Cmd+scroll (both are removed from the
             // plain scroll delta). Plain scroll pans; Shift+scroll sizes text.
@@ -714,7 +733,7 @@ impl eframe::App for App {
                     }
                 }
             }
-            if resp.dragged() {
+            if resp.dragged() && !self.bar_drag {
                 let dhz =
                     resp.drag_delta().y as f64 * (self.vp.f_hi - self.vp.f_lo) / g.height as f64;
                 self.pan_hz(dhz);
@@ -825,10 +844,34 @@ impl eframe::App for App {
                 painter.circle_filled(to_screen(g.waterfall_x0(), y_freq), 2.5, color);
             }
 
-            // Frequency scale, overlaid on the right-hand edge of the waterfall.
-            // It belongs on the axis it labels, and putting it there gives the
-            // text panel its full width back. Each label carries its own dim
-            // backing so it stays legible over a bright trace.
+            // The whole frequency axis lives on the right-hand edge of the
+            // waterfall, overlaid: the band bar hard against the edge, then the
+            // scale labels just inside it. Both belong on the axis they describe
+            // rather than in the text panel, and the waterfall draws
+            // newest-at-left, so they cover the oldest history and never hide a
+            // signal as it arrives.
+
+            // Band bar: the full band over the full height, with the current
+            // view as the thumb. Drag it to pan, click to jump.
+            let bar = Rect::from_min_max(to_screen(bar_x0, 0.0), to_screen(g.width, g.height));
+            let hot = self.bar_drag || pointer.is_some_and(on_bar);
+            painter.rect_filled(bar, 0.0, Color32::from_black_alpha(110));
+            let y_of_band =
+                |hz: f64| top_y + ((band_hi - hz) / (band_hi - band_lo)) as f32 * g.height;
+            let (top, bot) = (y_of_band(self.vp.f_hi), y_of_band(self.vp.f_lo));
+            // a deep zoom would otherwise leave a thumb too thin to grab
+            let grow = ((MIN_THUMB_H - (bot - top)) / 2.0).max(0.0);
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(bar.left() + 2.0, top - grow),
+                    Pos2::new(bar.right() - 2.0, bot + grow),
+                ),
+                3.0,
+                Color32::from_white_alpha(if hot { 120 } else { 70 }),
+            );
+
+            // Scale labels, each on a dim backing so they stay legible over a
+            // bright trace.
             let tick = Stroke::new(1.0, Color32::from_gray(160));
             let font = FontId::proportional(11.0);
             let step = tick_step(self.vp.f_hi - self.vp.f_lo);
@@ -838,7 +881,7 @@ impl eframe::App for App {
                 let galley =
                     painter.layout_no_wrap(format!("{hz:.0} Hz"), font.clone(), Color32::WHITE);
                 let size = galley.size();
-                let pos = to_screen(g.width - 12.0 - size.x, y - size.y / 2.0);
+                let pos = to_screen(bar_x0 - 10.0 - size.x, y - size.y / 2.0);
                 let pad = egui::vec2(4.0, 1.0);
                 painter.rect_filled(
                     Rect::from_min_size(pos - pad, size + 2.0 * pad),
@@ -847,7 +890,7 @@ impl eframe::App for App {
                 );
                 painter.galley(pos, galley, Color32::from_gray(210));
                 painter.line_segment(
-                    [to_screen(g.width - 8.0, y), to_screen(g.width - 2.0, y)],
+                    [to_screen(bar_x0 - 7.0, y), to_screen(bar_x0 - 1.0, y)],
                     tick,
                 );
                 hz += step;
