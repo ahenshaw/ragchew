@@ -2,48 +2,40 @@
 //! (with close pairs to force row nudging), track channels, lay out text rows,
 //! and composite waterfall + connector strip + leader lines + text bars to PNG.
 //!
-//!   cargo run -p js8-gui --no-default-features --example scene_png -- out.png
+//!   cargo run -p ragchew-gui --no-default-features --example scene_png -- out.png
 
 use std::fs::File;
 use std::io::BufWriter;
 
-use js8::{modem, Spectrogram};
-use js8_gui::channels::{ChannelSet, Decode};
-use js8_gui::scene::{self, Geometry};
-use js8_gui::waterfall::{self, Viewport};
+use ragchew::protocol;
+use ragchew::SAMPLE_RATE as RATE;
+use ragchew::spectrogram::WINDOW;
+use ragchew::Spectrogram;
+use ragchew_gui::channels::ChannelSet;
+use ragchew_gui::scene::{self, Geometry};
+use ragchew_gui::waterfall::{self, Viewport};
 
-const RATE: usize = 12000;
-
-const FRAME_SECS: f64 = 79.0 * 1920.0 / 12000.0; // 12.64 s
 
 fn main() {
     // args: [out.png] [t_now_secs]. With t_now, render the streaming state at
     // that playback time (windowed waterfall + only-revealed channels).
     let out = std::env::args().nth(1).unwrap_or_else(|| "scene.png".to_string());
     let t_now: Option<f64> = std::env::args().nth(2).and_then(|s| s.parse().ok());
-    let samples = js8_gui::demo::synth();
+    let samples = ragchew_gui::demo::synth();
 
-    // decode all submodes; reveal frames whose audio has finished by t_now
-    let decodes = modem::decode_all_multi(&samples, 300.0, 2600.0, 30);
-    eprintln!("decoded {} frames", decodes.len());
+    // decode every mode; reveal decodes whose audio has finished by t_now
+    let modes = protocol::default_modes();
+    let decodes = protocol::decode_all(&samples, 300.0, 2600.0, &modes);
+    eprintln!("decoded {} chunks", decodes.len());
     let set = ChannelSet::from_decodes(
-        decodes
-            .iter()
-            .filter(|r| {
-                let reveal = r.offset as f64 / RATE as f64 + FRAME_SECS;
-                t_now.map_or(true, |t| reveal <= t)
-            })
-            .map(|r| Decode {
-                hz: r.hz,
-                time_s: r.offset as f64 / RATE as f64,
-                text: js8::message::unpack(&r.a87).text(),
-                mode: r.mode,
-            }),
+        decodes.into_iter().filter(|d| {
+            t_now.map_or(true, |t| d.time_s + d.mode.chunk_secs() <= t)
+        }),
         15.0,
     );
     eprintln!("at t={:?}: {} channels", t_now, set.channels().len());
     for c in set.channels() {
-        eprintln!("  {:7.1} Hz  [{:6}]  {:?}", c.hz, c.mode.name(), c.text);
+        eprintln!("  {:7.1} Hz  [{:>14}]  {:?}", c.hz, c.mode.name(), c.text);
     }
 
     // geometry + view
@@ -53,7 +45,7 @@ fn main() {
     let mut canvas = vec![10u8, 12, 16, 255].repeat(w * h); // dark bg (RGBA)
 
     // waterfall into the right region (windowed if t_now given)
-    let spec = Spectrogram::compute(&samples, vp.f_lo, vp.f_hi, modem::SAMPLES_PER_SYMBOL / 4);
+    let spec = Spectrogram::compute(&samples, vp.f_lo, vp.f_hi, WINDOW / 4);
     let norm = waterfall::percentiles(&spec);
     let wf = match t_now {
         Some(t) => {
@@ -67,11 +59,11 @@ fn main() {
     blit(&mut canvas, w, h, &wf, g.waterfall_x0() as usize, 0);
 
     // channel rows: nudge layout on ideal y from frequency
-    let visible: Vec<&js8_gui::channels::Channel> =
+    let visible: Vec<&ragchew_gui::channels::Channel> =
         set.channels().iter().filter(|c| g.visible(&vp, c.hz)).collect();
     let ideals: Vec<f32> = visible.iter().map(|c| g.hz_to_y(&vp, c.hz)).collect();
     let line_h = 18.0;
-    let rows = js8_gui::layout::place(&ideals, line_h, 10.0, g.height - 10.0);
+    let rows = ragchew_gui::layout::place(&ideals, line_h, 10.0, g.height - 10.0);
 
     let palette = [
         [120u8, 200, 255],

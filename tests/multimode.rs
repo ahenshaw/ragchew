@@ -1,7 +1,7 @@
 //! Per-submode round-trip and multi-mode auto-detection.
 
-use js8::message::{self, IType};
-use js8::{modem, submode, Mode};
+use ragchew::js8::message::{self, IType};
+use ragchew::js8::{modem, submode, Mode};
 
 fn cycle_audio(bursts: &[(Vec<f32>, f64)], total_s: usize) -> Vec<f32> {
     let rate = modem::SAMPLE_RATE as usize;

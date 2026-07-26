@@ -2,14 +2,16 @@
 //! marker at every frame the decoder found, so the visualization can be checked
 //! without a display.
 //!
-//!   cargo run -p js8-gui --no-default-features --example render_png -- \
+//!   cargo run -p ragchew-gui --no-default-features --example render_png -- \
 //!       ../tests/vectors/john_3_16.wav out.png
 
 use std::fs::File;
 use std::io::BufWriter;
 
-use js8::{modem, wav, Spectrogram};
-use js8_gui::waterfall::{self, Viewport};
+use ragchew::js8::modem;
+use ragchew::spectrogram::WINDOW;
+use ragchew::{wav, Spectrogram};
+use ragchew_gui::waterfall::{self, Viewport};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -20,7 +22,7 @@ fn main() {
     assert_eq!(rate, modem::SAMPLE_RATE);
 
     // full-band view, ~4 columns per symbol time resolution
-    let spec = Spectrogram::compute(&samples, 0.0, 4000.0, modem::SAMPLES_PER_SYMBOL / 4);
+    let spec = Spectrogram::compute(&samples, 0.0, 4000.0, WINDOW / 4);
     let vp = Viewport { f_lo: 0.0, f_hi: 4000.0 };
     let (w, h) = (1200usize, 760usize);
     let mut img = waterfall::render(&spec, &vp, w, h);

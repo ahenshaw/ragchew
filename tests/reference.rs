@@ -7,8 +7,8 @@
 //! KIND|itype|text|a87(87 bits)|a174(174 bits)|a79(79 symbols)|unpacked
 //! ```
 
-use js8::message::{self, IType};
-use js8::{ldpc, modem};
+use ragchew::js8::message::{self, IType};
+use ragchew::js8::{ldpc, modem};
 
 fn itype_from(n: u8) -> IType {
     match n {
@@ -109,11 +109,11 @@ fn audio_roundtrip_clean() {
         let base_hz = 1500.0;
         let burst = modem::encode_audio(&a87, base_hz);
         // place after 0.5 s of silence, like a real cycle
-        let mut audio = vec![0.0f32; js8::CYCLE_LEAD_SAMPLES];
+        let mut audio = vec![0.0f32; ragchew::js8::CYCLE_LEAD_SAMPLES];
         audio.extend_from_slice(&burst);
         audio.resize(15 * modem::SAMPLE_RATE as usize, 0.0);
 
-        let r = modem::decode_near(&audio, base_hz, js8::CYCLE_LEAD_SAMPLES, 4, 30)
+        let r = modem::decode_near(&audio, base_hz, ragchew::js8::CYCLE_LEAD_SAMPLES, 4, 30)
             .expect("sync should be found");
         assert!(r.ldpc_ok, "LDPC should converge for {:?} (score {})", v.text, r.ldpc_score);
         assert_eq!(r.a87.to_vec(), v.a87, "decoded bits differ for {:?}", v.text);
@@ -125,10 +125,10 @@ fn audio_roundtrip_clean() {
 /// Decode the reference-synthesized WAV (their modulator -> our decoder).
 #[test]
 fn decode_reference_wav() {
-    let (samples, rate) = js8::wav::read("tests/vectors/hello_1500.wav").expect("read wav");
+    let (samples, rate) = ragchew::wav::read("tests/vectors/hello_1500.wav").expect("read wav");
     assert_eq!(rate, modem::SAMPLE_RATE);
     // reference placed the burst after 0.5 s of silence
-    let start = js8::CYCLE_LEAD_SAMPLES;
+    let start = ragchew::js8::CYCLE_LEAD_SAMPLES;
     let r = modem::decode_near(&samples, 1500.0, start, 6, 30).expect("sync");
     assert!(r.ldpc_ok, "should decode reference wav (score {})", r.ldpc_score);
     assert_eq!(message::unpack(&r.a87).text(), "HELLO WORLD");

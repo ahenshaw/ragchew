@@ -1,16 +1,16 @@
 [package]
-name = "js8-gui"
+name = "ragchew-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Panoramic multi-channel JS8 monitor (waterfall + inline decoded text)"
+description = "ragchew — panoramic multi-protocol monitor (waterfall + inline decoded text)"
 
 [lib]
-name = "js8_gui"
+name = "ragchew_gui"
 path = "src/lib.rs"
 
 [[bin]]
-name = "js8-gui"
+name = "ragchew"
 path = "src/main.rs"
 
 [features]
@@ -21,7 +21,7 @@ default = ["desktop"]
 desktop = ["dep:eframe", "dep:cpal"]
 
 [dependencies]
-js8 = { path = ".." }
+ragchew = { path = ".." }
 eframe = { version = "0.28", optional = true, default-features = true }
 cpal = { version = "0.15", optional = true }
 

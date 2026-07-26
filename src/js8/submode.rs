@@ -3,10 +3,10 @@
 //! spacing, and Costas sync arrays. Parameters from JS8Call's `js8*_params.f90`
 //! and Costas arrays from `syncjs8.f90` / `genjs8.f90`.
 
-use crate::modem::{N_SYMBOLS, SAMPLE_RATE};
+use crate::js8::modem::{N_SYMBOLS, SAMPLE_RATE};
 
 /// The four standard JS8 submodes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Mode {
     Slow,
     Normal,

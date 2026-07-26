@@ -1,21 +1,24 @@
-//! Live audio capture (cpal) → 12 kHz mono, with a rolling buffer and a
-//! cycle-aligned decode thread. Desktop-only.
+//! Live audio capture (cpal) → 12 kHz mono, with a rolling buffer and the
+//! decode threads that feed off it. Desktop-only.
 //!
 //! Untested in CI (no audio device / display here); verified to compile.
 
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use js8::{message, modem};
+use ragchew::protocol::{self, ModeId};
+use ragchew::spectrogram::WINDOW;
 
-use crate::channels::Decode;
+/// Everything is decoded at the crate's internal rate; the sound card is
+/// resampled to it on the way in.
+const RATE: u32 = ragchew::SAMPLE_RATE;
 
-/// JS8 works at 12 kHz.
-const RATE: u32 = 12000;
+/// Band scanned for signals (Hz). Wider costs time on every decode pass.
+const BAND: (f64, f64) = (300.0, 2600.0);
 
 fn unix_now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
@@ -71,10 +74,10 @@ impl AudioBuf {
         let b = (hi - self.global_start) as usize;
         self.samples[a..b].to_vec()
     }
-    /// The window at global index `g0` of length [`modem::SAMPLES_PER_SYMBOL`],
-    /// or `None` if not fully held yet.
+    /// The spectrogram window at global index `g0`, or `None` if not fully
+    /// held yet.
     pub fn window_at(&self, g0: u64) -> Option<Vec<f32>> {
-        let n = modem::SAMPLES_PER_SYMBOL as u64;
+        let n = WINDOW as u64;
         if g0 < self.global_start || g0 + n > self.global_len() {
             return None;
         }
@@ -257,77 +260,162 @@ impl LiveAudio {
     }
 }
 
-/// Spawn the cycle-aligned decoder. Each submode is decoded on its own UTC
-/// grid (Slow 30 s, Normal 15 s, Fast 10 s, Turbo 6 s); a cycle is decoded
-/// shortly after its frame completes. Frames carry capture-relative `time_s`.
-pub fn spawn_decoder(buf: Arc<Mutex<AudioBuf>>) -> Receiver<Vec<Decode>> {
+/// Spawn the decode threads for `modes` and return the channel they report on.
+///
+/// The two protocol families need opposite scheduling, so they get a thread
+/// each: JS8 is *cycle-aligned* — its frames start on UTC multiples of the
+/// submode's period, so a decode is triggered the moment each cycle's audio is
+/// complete — while Olivia is *continuous*, with no schedule at all, so it is
+/// re-scanned on a rolling window. Dropping the returned receiver retires both
+/// threads at their next send, which is how a change of modes takes effect.
+pub fn spawn_decoder(
+    buf: Arc<Mutex<AudioBuf>>,
+    modes: Vec<ModeId>,
+) -> Receiver<Vec<protocol::Decode>> {
     let (tx, rx) = channel();
+    let js8: Vec<ModeId> = modes.iter().copied().filter(|m| matches!(m, ModeId::Js8(_))).collect();
+    let olivia: Vec<ModeId> =
+        modes.iter().copied().filter(|m| matches!(m, ModeId::Olivia(_))).collect();
+    if !js8.is_empty() {
+        spawn_js8(buf.clone(), js8, tx.clone());
+    }
+    if !olivia.is_empty() {
+        spawn_olivia(buf, olivia, tx);
+    }
+    rx
+}
+
+/// Cycle-aligned JS8 decoding: each submode has its own UTC grid (Slow 30 s,
+/// Normal 15 s, Fast 10 s, Turbo 6 s) and each cycle is decoded shortly after
+/// its frame would have finished. Decodes carry capture-relative `time_s`.
+fn spawn_js8(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<protocol::Decode>>) {
     thread::spawn(move || {
-        let modes = js8::submode::ALL;
         // next cycle-start (UTC seconds) to decode, per mode
-        let mut next: Vec<f64> = modes
-            .iter()
-            .map(|sm| (unix_now() / sm.period_s as f64).floor() * sm.period_s as f64)
-            .collect();
+        let period = |m: &ModeId| m.period_s().unwrap_or(15) as f64;
+        let ready = |m: &ModeId| m.chunk_secs() + 1.0; // frame done, plus slack
+        let mut next: Vec<f64> =
+            modes.iter().map(|m| (unix_now() / period(m)).floor() * period(m)).collect();
 
         loop {
             let now = unix_now();
             // skip any cycles whose decode time already passed
-            for (i, sm) in modes.iter().enumerate() {
-                while next[i] + sm.frame_secs() + 1.0 <= now {
-                    next[i] += sm.period_s as f64;
+            for (i, m) in modes.iter().enumerate() {
+                while next[i] + ready(m) <= now {
+                    next[i] += period(m);
                 }
             }
-            // pick the mode with the earliest upcoming decode time
-            let mut best = 0usize;
-            let mut best_t = f64::MAX;
-            for (i, sm) in modes.iter().enumerate() {
-                let t = next[i] + sm.frame_secs() + 1.0;
-                if t < best_t {
-                    best_t = t;
-                    best = i;
-                }
-            }
-            let sm = modes[best];
+            // decode whichever mode comes due first
+            let best = (0..modes.len())
+                .min_by(|&a, &b| {
+                    (next[a] + ready(&modes[a]))
+                        .partial_cmp(&(next[b] + ready(&modes[b])))
+                        .unwrap()
+                })
+                .unwrap();
+            let mode = modes[best];
             let cycle_start = next[best];
-            next[best] += sm.period_s as f64;
+            next[best] += period(&mode);
 
-            let wait = best_t - unix_now();
+            let wait = cycle_start + ready(&mode) - unix_now();
             if wait > 0.0 {
                 thread::sleep(Duration::from_secs_f64(wait));
             }
 
-            let win = sm.period_s as f64;
-            let (samples, win_start_global, rate) = {
-                let b = buf.lock().unwrap();
-                if !b.started() {
-                    (Vec::new(), 0u64, RATE as f64)
-                } else {
-                    let rate = RATE as f64;
-                    let su = b.start_unix();
-                    let g0 = (((cycle_start - 0.5 - su) * rate).max(0.0)) as u64;
-                    let g1 = (((cycle_start + win + 0.5 - su) * rate).max(0.0)) as u64;
-                    let start = g0.max(b.global_start());
-                    (b.slice_global(g0, g1), start, rate)
-                }
-            };
-
-            if samples.len() < sm.frame_samples() {
+            // half a second either side of the cycle, for clock skew
+            let (samples, win_start) =
+                slice_around(&buf, cycle_start - 0.5, period(&mode) + 1.0);
+            if (samples.len() as f64) < mode.chunk_secs() * RATE as f64 {
                 continue;
             }
-            let frames: Vec<Decode> = modem::decode_all_sm(&samples, 300.0, 2600.0, 30, &sm)
-                .iter()
-                .map(|r| Decode {
-                    hz: r.hz,
-                    time_s: (win_start_global as f64 + r.offset as f64) / rate,
-                    text: message::unpack(&r.a87).text(),
-                    mode: r.mode,
-                })
-                .collect();
-            if !frames.is_empty() && tx.send(frames).is_err() {
+            let decodes = shift_times(
+                protocol::decode_all(&samples, BAND.0, BAND.1, &[mode]),
+                win_start,
+            );
+            if !decodes.is_empty() && tx.send(decodes).is_err() {
                 break; // UI gone
             }
         }
     });
-    rx
+}
+
+/// Rolling-window Olivia decoding.
+///
+/// Olivia never tells you where a transmission starts, so there is nothing to
+/// align to: the last [`OLIVIA_WINDOW_S`] seconds are simply re-scanned every
+/// [`OLIVIA_STEP_S`]. Windows overlap heavily, both so a block straddling a
+/// boundary is not lost and because the decoder needs several consecutive
+/// blocks in view before it will trust a signal — so the same block gets
+/// decoded repeatedly and duplicates are filtered on the way out.
+fn spawn_olivia(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<protocol::Decode>>) {
+    thread::spawn(move || {
+        let mut seen: Vec<(ModeId, f64, f64)> = Vec::new(); // (mode, hz, time_s)
+        loop {
+            thread::sleep(Duration::from_secs_f64(OLIVIA_STEP_S));
+            let now = match buf.lock().unwrap().started() {
+                true => unix_now(),
+                false => continue,
+            };
+            let (samples, win_start) =
+                slice_around(&buf, now - OLIVIA_WINDOW_S, OLIVIA_WINDOW_S);
+            if samples.len() < RATE as usize {
+                continue;
+            }
+
+            let fresh: Vec<protocol::Decode> =
+                shift_times(protocol::decode_all(&samples, BAND.0, BAND.1, &modes), win_start)
+                    .into_iter()
+                    .filter(|d| {
+                        // The same block decoded in the previous window comes
+                        // back at the same time and frequency, give or take the
+                        // sync search's resolution.
+                        !seen.iter().any(|&(m, hz, t)| {
+                            m == d.mode
+                                && (hz - d.hz).abs() < d.mode.bandwidth_hz() / 2.0
+                                && (t - d.time_s).abs() < d.mode.chunk_secs() / 2.0
+                        })
+                    })
+                    .collect();
+
+            seen.extend(fresh.iter().map(|d| (d.mode, d.hz, d.time_s)));
+            let cutoff = win_start - OLIVIA_WINDOW_S;
+            seen.retain(|&(_, _, t)| t >= cutoff);
+
+            if !fresh.is_empty() && tx.send(fresh).is_err() {
+                break; // UI gone
+            }
+        }
+    });
+}
+
+/// Audio window an Olivia pass looks at. It must hold several FEC blocks of the
+/// slowest mode for the decoder to sync at all.
+const OLIVIA_WINDOW_S: f64 = 24.0;
+
+/// How often an Olivia pass runs. Text appears this long after it is sent, so
+/// shorter is livelier — at the cost of re-scanning the band more often.
+const OLIVIA_STEP_S: f64 = 4.0;
+
+/// `secs` seconds of audio starting at UTC time `from`, plus the capture-relative
+/// time of the first sample returned.
+fn slice_around(buf: &Arc<Mutex<AudioBuf>>, from: f64, secs: f64) -> (Vec<f32>, f64) {
+    let b = buf.lock().unwrap();
+    if !b.started() {
+        return (Vec::new(), 0.0);
+    }
+    let rate = RATE as f64;
+    let g0 = (((from - b.start_unix()) * rate).max(0.0)) as u64;
+    let g1 = g0 + (secs * rate) as u64;
+    let start = g0.max(b.global_start());
+    (b.slice_global(g0, g1), start as f64 / rate)
+}
+
+/// Rebase decode times from window-relative to capture-relative.
+fn shift_times(decodes: Vec<protocol::Decode>, win_start: f64) -> Vec<protocol::Decode> {
+    decodes
+        .into_iter()
+        .map(|mut d| {
+            d.time_s += win_start;
+            d
+        })
+        .collect()
 }

@@ -4,7 +4,7 @@
 //! Orientation (per the design spec): **frequency is vertical, high at the top;
 //! time is horizontal, newest at the LEFT edge and ageing to the right.**
 
-use js8::Spectrogram;
+use ragchew::Spectrogram;
 
 use crate::colormap;
 

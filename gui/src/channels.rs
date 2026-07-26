@@ -1,17 +1,13 @@
-//! Channel tracking: associate per-cycle decodes into persistent "channels"
+//! Channel tracking: associate individual decodes into persistent "channels"
 //! (one per station/conversation) by carrier frequency, tolerating drift, so a
 //! station's text stays on one row over time.
+//!
+//! A "decode" is one JS8 frame or one Olivia FEC block — the tracker does not
+//! care which, only where it landed and when.
 
-/// A single decoded frame handed to the tracker.
-#[derive(Clone, Debug)]
-pub struct Decode {
-    pub hz: f64,
-    pub time_s: f64,
-    pub text: String,
-    pub mode: js8::Mode,
-}
+use ragchew::protocol::{Decode, ModeId};
 
-/// A tracked signal accumulating text across cycles.
+/// A tracked signal accumulating text across transmissions.
 #[derive(Clone, Debug)]
 pub struct Channel {
     pub id: u64,
@@ -21,14 +17,14 @@ pub struct Channel {
     pub hz_history: Vec<(f64, f64)>,
     /// Accumulated decoded text, oldest first.
     pub text: String,
-    /// Submode of the most recent frame.
-    pub mode: js8::Mode,
-    /// Character count of the most recently appended frame's text (for the
-    /// scroll-in animation).
+    /// Mode of the most recent decode.
+    pub mode: ModeId,
+    /// Character count of the most recently appended chunk (for the scroll-in
+    /// animation).
     pub last_chunk_chars: usize,
-    /// Audio time (s) of the most recent frame.
+    /// Audio time (s) of the most recent decode.
     pub last_heard_s: f64,
-    /// Audio time (s) of the first frame.
+    /// Audio time (s) of the first decode.
     pub first_heard_s: f64,
 }
 
@@ -37,7 +33,8 @@ pub struct Channel {
 pub struct ChannelSet {
     channels: Vec<Channel>,
     next_id: u64,
-    /// Frequency association tolerance (Hz).
+    /// Baseline frequency association tolerance (Hz). Modes wider than this ask
+    /// for more; see [`ModeId::assoc_tol_hz`].
     pub tol_hz: f64,
 }
 
@@ -46,15 +43,20 @@ impl ChannelSet {
         ChannelSet { channels: Vec::new(), next_id: 0, tol_hz }
     }
 
-    /// Ingest a decode: append to the nearest channel within `tol_hz`, else
+    /// Ingest a decode: append to the nearest channel within tolerance, else
     /// start a new channel. Decodes are expected in non-decreasing `time_s`.
     pub fn add(&mut self, d: Decode) {
-        // Association tolerance is at least the mode's tone spacing, so a
-        // wide-spacing mode (e.g. Turbo, 20 Hz bins) whose per-frame frequency
-        // estimate lands in adjacent bins still tracks as one channel.
-        let tol = self.tol_hz.max(js8::submode::of(d.mode).spacing());
+        // Tolerance is at least what the mode itself needs: a wide-spacing mode
+        // (JS8 Turbo's 20 Hz bins, an Olivia signal 1 kHz across) whose
+        // per-decode frequency estimate lands a bin over still tracks as one
+        // channel. Decodes only ever join a channel of the same protocol, so a
+        // wide Olivia signal cannot swallow a JS8 station sitting inside it.
+        let tol = self.tol_hz.max(d.mode.assoc_tol_hz());
         let mut best: Option<(usize, f64)> = None;
         for (i, ch) in self.channels.iter().enumerate() {
+            if ch.mode.protocol() != d.mode.protocol() {
+                continue;
+            }
             let dhz = (ch.hz - d.hz).abs();
             if dhz <= tol && best.map_or(true, |(_, bd)| dhz < bd) {
                 best = Some((i, dhz));
@@ -106,9 +108,16 @@ impl ChannelSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ragchew::{js8, olivia};
 
     fn d(hz: f64, t: f64, s: &str) -> Decode {
-        Decode { hz, time_s: t, text: s.to_string(), mode: js8::Mode::Normal }
+        Decode {
+            hz,
+            time_s: t,
+            text: s.to_string(),
+            mode: ModeId::Js8(js8::Mode::Normal),
+            quality: 1.0,
+        }
     }
 
     #[test]
@@ -129,5 +138,39 @@ mod tests {
         // 30 Hz apart with a 15 Hz tolerance -> two channels
         let set = ChannelSet::from_decodes([d(1000.0, 0.0, "A"), d(1030.0, 15.0, "B")], 15.0);
         assert_eq!(set.channels().len(), 2);
+    }
+
+    /// A JS8 station transmitting inside a wide Olivia signal's bandwidth is
+    /// still its own conversation.
+    #[test]
+    fn protocols_never_share_a_channel() {
+        let ol = Decode {
+            hz: 1000.0,
+            time_s: 0.0,
+            text: "OL".to_string(),
+            mode: ModeId::Olivia(olivia::OL_32_1000),
+            quality: 4.0,
+        };
+        let set = ChannelSet::from_decodes([ol, d(1010.0, 1.0, "JS")], 15.0);
+        assert_eq!(set.channels().len(), 2);
+    }
+
+    /// Successive Olivia blocks of one transmission join up, even though the
+    /// mode's frequency estimate is only good to a tone spacing.
+    #[test]
+    fn olivia_blocks_accumulate_into_one_channel() {
+        let block = |hz: f64, t: f64, s: &str| Decode {
+            hz,
+            time_s: t,
+            text: s.to_string(),
+            mode: ModeId::Olivia(olivia::OL_16_500),
+            quality: 5.0,
+        };
+        let set = ChannelSet::from_decodes(
+            [block(1500.0, 0.0, "CQ C"), block(1508.0, 2.0, "Q DE"), block(1492.0, 4.0, " W1AW")],
+            15.0,
+        );
+        assert_eq!(set.channels().len(), 1);
+        assert_eq!(set.channels()[0].text, "CQ CQ DE W1AW");
     }
 }

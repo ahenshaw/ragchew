@@ -1,8 +1,8 @@
 //! Decoder robustness under additive white Gaussian noise. This exercises the
 //! soft-decision LDPC path (clean round-trips alone would pass with hard bits).
 
-use js8::message::{self, IType};
-use js8::modem;
+use ragchew::js8::message::{self, IType};
+use ragchew::js8::modem;
 
 /// Small deterministic Gaussian generator (Box–Muller over a 64-bit LCG),
 /// so the test is reproducible without external crates.
@@ -26,7 +26,7 @@ impl Rng {
 fn build_audio(text: &str, base_hz: f64, sigma: f32, seed: u64) -> Vec<f32> {
     let (a87, _) = message::freetext(text, IType::None);
     let burst = modem::encode_audio(&a87, base_hz);
-    let mut audio = vec![0.0f32; js8::CYCLE_LEAD_SAMPLES];
+    let mut audio = vec![0.0f32; ragchew::js8::CYCLE_LEAD_SAMPLES];
     audio.extend_from_slice(&burst);
     audio.resize(15 * modem::SAMPLE_RATE as usize, 0.0);
     let mut rng = Rng(seed);
@@ -42,7 +42,7 @@ fn decodes_through_noise() {
     let base_hz = 1500.0;
     for (i, text) in ["HELLO WORLD", "CQ CQ DE TEST", "73 GL"].iter().enumerate() {
         let audio = build_audio(text, base_hz, 0.8, 0x1234 + i as u64);
-        let r = modem::decode_near(&audio, base_hz, js8::CYCLE_LEAD_SAMPLES, 4, 40)
+        let r = modem::decode_near(&audio, base_hz, ragchew::js8::CYCLE_LEAD_SAMPLES, 4, 40)
             .expect("sync found");
         assert!(
             r.ldpc_ok && message::crc_ok(&r.a87),
@@ -66,7 +66,7 @@ fn noise_threshold_report() {
     for step in 1..=20 {
         let sigma = step as f32 * 0.2;
         let audio = build_audio(text, base_hz, sigma, 99);
-        match modem::decode_near(&audio, base_hz, js8::CYCLE_LEAD_SAMPLES, 4, 40) {
+        match modem::decode_near(&audio, base_hz, ragchew::js8::CYCLE_LEAD_SAMPLES, 4, 40) {
             Some(r) if r.ldpc_ok && message::crc_ok(&r.a87) => last_ok = sigma,
             _ => break,
         }

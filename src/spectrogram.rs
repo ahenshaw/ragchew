@@ -1,23 +1,22 @@
-//! A public magnitude spectrogram for display (e.g. a waterfall), sharing the
-//! JS8 6.25 Hz bin grid. This is separate from the decoder's internal sync
-//! spectrogram so UI code can build one without pulling in decode internals.
+//! A public magnitude spectrogram for display (e.g. a waterfall). It is kept
+//! separate from the decoders' internal sync spectrograms so UI code can build
+//! one without pulling in decode internals, and so a single waterfall can serve
+//! every protocol.
 
-use std::cell::RefCell;
-use std::sync::Arc;
+use rustfft::num_complex::Complex32;
 
-use rustfft::{num_complex::Complex32, Fft, FftPlanner};
+use crate::SAMPLE_RATE;
 
-use crate::modem::{SAMPLES_PER_SYMBOL, SAMPLE_RATE};
-
-thread_local! {
-    static FFT: RefCell<Arc<dyn Fft<f32>>> =
-        RefCell::new(FftPlanner::<f32>::new().plan_fft_forward(SAMPLES_PER_SYMBOL));
-}
+/// Analysis window length in samples: 160 ms, i.e. a 6.25 Hz bin grid.
+///
+/// That is exactly one JS8 Normal symbol, and fine enough for Olivia too, whose
+/// tone spacings start at 15.6 Hz.
+pub const WINDOW: usize = 1920;
 
 /// Time/frequency magnitude grid over a frequency band.
 ///
 /// `columns[t][b]` is the magnitude of FFT bin `bin_lo + b` at time column `t`.
-/// Column `t` covers samples `[t*hop, t*hop + SAMPLES_PER_SYMBOL)`, so later
+/// Column `t` covers samples `[t*hop, t*hop + WINDOW)`, so later
 /// `t` is later in time. Frequency of bin index `b` is `(bin_lo + b) * bin_hz`.
 #[derive(Clone)]
 pub struct Spectrogram {
@@ -29,7 +28,7 @@ pub struct Spectrogram {
     pub bin_lo: usize,
     /// Number of bins per column.
     pub n_bins: usize,
-    /// Hz per bin (`sample_rate / SAMPLES_PER_SYMBOL` = 6.25).
+    /// Hz per bin (`SAMPLE_RATE / WINDOW` = 6.25).
     pub bin_hz: f64,
     /// Magnitude columns, oldest first.
     pub columns: Vec<Vec<f32>>,
@@ -40,12 +39,12 @@ impl Spectrogram {
     /// [`push_window`](Self::push_window). Frequency resolution is fixed at
     /// 6.25 Hz.
     pub fn empty(hz_lo: f64, hz_hi: f64, hop: usize) -> Spectrogram {
-        let bin_hz = SAMPLE_RATE as f64 / SAMPLES_PER_SYMBOL as f64; // 6.25
+        let bin_hz = SAMPLE_RATE as f64 / WINDOW as f64; // 6.25
         let bin_lo = (hz_lo / bin_hz).floor() as usize;
-        let bin_hi = ((hz_hi / bin_hz).ceil() as usize).min(SAMPLES_PER_SYMBOL / 2);
+        let bin_hi = ((hz_hi / bin_hz).ceil() as usize).min(WINDOW / 2);
         Spectrogram {
             sample_rate: SAMPLE_RATE,
-            hop: hop.clamp(1, SAMPLES_PER_SYMBOL),
+            hop: hop.clamp(1, WINDOW),
             bin_lo,
             n_bins: bin_hi.saturating_sub(bin_lo) + 1,
             bin_hz,
@@ -53,16 +52,16 @@ impl Spectrogram {
         }
     }
 
-    /// Append one column from a [`SAMPLES_PER_SYMBOL`]-length window (shorter is
+    /// Append one column from a [`WINDOW`]-length window (shorter is
     /// zero-padded). Used to build a rolling spectrogram from live audio.
     pub fn push_window(&mut self, window: &[f32]) {
-        let mut buf = vec![Complex32::new(0.0, 0.0); SAMPLES_PER_SYMBOL];
+        let mut buf = vec![Complex32::new(0.0, 0.0); WINDOW];
         for (i, b) in buf.iter_mut().enumerate() {
             if let Some(&s) = window.get(i) {
                 b.re = s;
             }
         }
-        FFT.with(|f| f.borrow().process(&mut buf));
+        crate::dsp::plan(WINDOW).process(&mut buf);
         let mut col = vec![0.0f32; self.n_bins];
         for (b, m) in col.iter_mut().enumerate() {
             *m = buf[self.bin_lo + b].norm();
@@ -71,16 +70,16 @@ impl Spectrogram {
     }
 
     /// Compute a spectrogram of `samples` over `hz_lo..hz_hi`, advancing `hop`
-    /// samples per column (`hop` <= [`SAMPLES_PER_SYMBOL`]; smaller = finer time
+    /// samples per column (`hop` <= [`WINDOW`]; smaller = finer time
     /// resolution). Frequency resolution is fixed at 6.25 Hz.
     pub fn compute(samples: &[f32], hz_lo: f64, hz_hi: f64, hop: usize) -> Spectrogram {
         let mut spec = Spectrogram::empty(hz_lo, hz_hi, hop);
-        if samples.len() >= SAMPLES_PER_SYMBOL {
-            let n_cols = (samples.len() - SAMPLES_PER_SYMBOL) / spec.hop + 1;
+        if samples.len() >= WINDOW {
+            let n_cols = (samples.len() - WINDOW) / spec.hop + 1;
             spec.columns.reserve(n_cols);
             for c in 0..n_cols {
                 let start = c * spec.hop;
-                spec.push_window(&samples[start..start + SAMPLES_PER_SYMBOL]);
+                spec.push_window(&samples[start..start + WINDOW]);
             }
         }
         spec
@@ -103,7 +102,7 @@ impl Spectrogram {
 
     /// Time (seconds from the start of `samples`) at the center of column `t`.
     pub fn secs_of_column(&self, t: usize) -> f64 {
-        (t * self.hop + SAMPLES_PER_SYMBOL / 2) as f64 / self.sample_rate as f64
+        (t * self.hop + WINDOW / 2) as f64 / self.sample_rate as f64
     }
 
     /// Total time span covered (seconds).
@@ -111,7 +110,7 @@ impl Spectrogram {
         if self.columns.is_empty() {
             0.0
         } else {
-            (self.columns.len() * self.hop + SAMPLES_PER_SYMBOL) as f64 / self.sample_rate as f64
+            (self.columns.len() * self.hop + WINDOW) as f64 / self.sample_rate as f64
         }
     }
 }
@@ -124,13 +123,13 @@ mod tests {
     fn peak_bin_matches_tone_frequency() {
         // 1500 Hz tone = bin 240 (1500 / 6.25). Should be the strongest bin.
         let hz = 1500.0;
-        let n = SAMPLES_PER_SYMBOL * 4;
+        let n = WINDOW * 4;
         let samples: Vec<f32> = (0..n)
             .map(|i| {
                 (2.0 * std::f64::consts::PI * hz * i as f64 / SAMPLE_RATE as f64).cos() as f32
             })
             .collect();
-        let spec = Spectrogram::compute(&samples, 0.0, 4000.0, SAMPLES_PER_SYMBOL);
+        let spec = Spectrogram::compute(&samples, 0.0, 4000.0, WINDOW);
         assert!(!spec.columns.is_empty());
         let col = &spec.columns[0];
         let peak = (0..spec.n_bins).max_by(|&a, &b| col[a].partial_cmp(&col[b]).unwrap()).unwrap();

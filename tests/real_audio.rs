@@ -2,7 +2,8 @@
 //! 9-frame transmission with a drifting carrier around ~1390 Hz). This is the
 //! same signal the reference decoder recovers 9/9; we assert full parity.
 
-use js8::{message, modem, wav};
+use ragchew::js8::{message, modem};
+use ragchew::wav;
 
 #[test]
 fn decodes_john_3_16_recording() {

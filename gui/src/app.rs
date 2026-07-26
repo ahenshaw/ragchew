@@ -9,10 +9,11 @@
 //! appears as soon as the (fast) spectrogram is ready, and decoded text streams
 //! in once the (slower) full-band decode finishes.
 //!
-//! Playback: frames are *revealed* as a simulated clock advances (each frame
-//! appears when its ~12.6 s of audio would have finished), so text streams into
-//! channels in the same ~13-char per 15 s chunks a live receiver produces, and
-//! the waterfall scrolls. Stand-in for the live cycle-aligned loop.
+//! Playback: decodes are *revealed* as a simulated clock advances (each appears
+//! when its audio would have finished), so text streams into channels in the
+//! same chunks a live receiver produces — a JS8 frame every 15 s, an Olivia
+//! block every couple of seconds — and the waterfall scrolls. Stand-in for the
+//! live decode loop.
 
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
@@ -20,15 +21,15 @@ use std::thread;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke};
 
-use js8::modem::{N_SYMBOLS, SAMPLES_PER_SYMBOL, SAMPLE_RATE};
-use js8::{message, modem, wav, Spectrogram};
+use ragchew::protocol::{self, ModeId, Protocol};
+use ragchew::spectrogram::WINDOW;
+use ragchew::{wav, Spectrogram, SAMPLE_RATE};
 
-use crate::channels::{Channel, ChannelSet, Decode};
+use crate::channels::{Channel, ChannelSet};
 use crate::layout;
 use crate::scene::{self, Geometry};
 use crate::waterfall::{self, Viewport};
 
-const FRAME_SECS: f64 = N_SYMBOLS as f64 * SAMPLES_PER_SYMBOL as f64 / SAMPLE_RATE as f64;
 const HIGHLIGHT_SECS: f64 = 2.5;
 
 pub fn run() -> eframe::Result<()> {
@@ -42,11 +43,11 @@ pub fn run() -> eframe::Result<()> {
         .unwrap_or_else(|| "tests/vectors/john_3_16.wav".to_string());
 
     let title = if live {
-        "JS8 Panorama — live"
+        "ragchew — live"
     } else if demo {
-        "JS8 Panorama — demo"
+        "ragchew — demo"
     } else {
-        "JS8 Panorama"
+        "ragchew"
     };
 
     let options = eframe::NativeOptions {
@@ -71,29 +72,45 @@ pub fn run() -> eframe::Result<()> {
     )
 }
 
-/// Per-submode color, so a channel's color tells you its detected mode.
-fn mode_color(m: js8::Mode) -> Color32 {
+/// Per-mode colour, so a channel's colour tells you what it is.
+///
+/// Each protocol gets its own end of the spectrum — JS8 cool through warm,
+/// Olivia violet through cyan — so you can tell the two families apart at a
+/// glance and still read the individual mode off the shade.
+fn mode_color(m: ModeId) -> Color32 {
+    use ragchew::js8::Mode as J;
     match m {
-        js8::Mode::Slow => Color32::from_rgb(130, 200, 255),   // blue
-        js8::Mode::Normal => Color32::from_rgb(150, 255, 150), // green
-        js8::Mode::Fast => Color32::from_rgb(255, 195, 120),   // orange
-        js8::Mode::Turbo => Color32::from_rgb(255, 140, 200),  // pink
+        ModeId::Js8(J::Slow) => Color32::from_rgb(130, 200, 255),   // blue
+        ModeId::Js8(J::Normal) => Color32::from_rgb(150, 255, 150), // green
+        ModeId::Js8(J::Fast) => Color32::from_rgb(255, 195, 120),   // orange
+        ModeId::Js8(J::Turbo) => Color32::from_rgb(255, 140, 200),  // pink
+        // Narrow and slow at the violet end, wide and fast towards cyan.
+        ModeId::Olivia(o) => match (o.tones, o.bandwidth) {
+            (4, 125) => Color32::from_rgb(190, 150, 255),
+            (8, 250) => Color32::from_rgb(215, 155, 235),
+            (16, 500) => Color32::from_rgb(235, 165, 205),
+            (32, 1000) => Color32::from_rgb(170, 180, 255),
+            (8, 500) => Color32::from_rgb(140, 220, 235),
+            (16, 1000) => Color32::from_rgb(130, 235, 200),
+            _ => Color32::from_rgb(200, 190, 230),
+        },
     }
 }
 
-/// A decoded frame plus the playback time at which it should appear.
+/// A decode plus the playback time at which it should appear.
 struct Frame {
     reveal_s: f64,
-    decode: Decode,
+    decode: protocol::Decode,
 }
 
 /// Live-capture state: a rolling spectrogram fed from the audio buffer and
-/// channels accumulated from the cycle-aligned decoder.
+/// channels accumulated from the decode threads.
 struct LiveMode {
     band: (f64, f64),
+    modes: Vec<ModeId>,
     audio: Option<crate::audio::LiveAudio>,
     err: Option<String>,
-    frames_rx: Option<std::sync::mpsc::Receiver<Vec<Decode>>>,
+    frames_rx: Option<std::sync::mpsc::Receiver<Vec<protocol::Decode>>>,
     spec: Arc<Spectrogram>,
     next_col: u64,
     channels: ChannelSet,
@@ -105,13 +122,14 @@ struct LiveMode {
 }
 
 impl LiveMode {
-    fn start(band: (f64, f64)) -> LiveMode {
+    fn start(band: (f64, f64), modes: Vec<ModeId>) -> LiveMode {
         let mut lm = LiveMode {
             band,
+            modes,
             audio: None,
             err: None,
             frames_rx: None,
-            spec: Arc::new(Spectrogram::empty(band.0, band.1, SAMPLES_PER_SYMBOL / 4)),
+            spec: Arc::new(Spectrogram::empty(band.0, band.1, WINDOW / 4)),
             next_col: 0,
             channels: ChannelSet::new(15.0),
             norm: (0.0, 1.0),
@@ -131,7 +149,7 @@ impl LiveMode {
         // makes the old decoder thread exit on its next send.
         self.audio = None;
         self.frames_rx = None;
-        self.spec = Arc::new(Spectrogram::empty(self.band.0, self.band.1, SAMPLES_PER_SYMBOL / 4));
+        self.spec = Arc::new(Spectrogram::empty(self.band.0, self.band.1, WINDOW / 4));
         self.next_col = 0;
         self.channels = ChannelSet::new(15.0);
         self.norm = (0.0, 1.0);
@@ -140,7 +158,8 @@ impl LiveMode {
         self.devices = crate::audio::input_devices();
         match crate::audio::LiveAudio::start(name.as_deref()) {
             Ok(audio) => {
-                self.frames_rx = Some(crate::audio::spawn_decoder(audio.buf.clone()));
+                self.frames_rx =
+                    Some(crate::audio::spawn_decoder(audio.buf.clone(), self.modes.clone()));
                 self.selected = Some(audio.device_name.clone());
                 self.err = None;
                 self.audio = Some(audio);
@@ -149,6 +168,17 @@ impl LiveMode {
                 self.selected = name;
                 self.err = Some(e);
             }
+        }
+    }
+
+    /// Change the set of modes being listened for, restarting the decode
+    /// threads. Already-decoded text stays on screen.
+    fn set_modes(&mut self, modes: Vec<ModeId>) {
+        self.modes = modes;
+        if let Some(audio) = &self.audio {
+            // dropping the old receiver retires the old decode threads
+            self.frames_rx =
+                Some(crate::audio::spawn_decoder(audio.buf.clone(), self.modes.clone()));
         }
     }
 
@@ -188,7 +218,7 @@ impl LiveMode {
             self.cols_since_norm += new_windows.len();
         }
 
-        self.t_now = global_len as f64 / js8::modem::SAMPLE_RATE as f64;
+        self.t_now = global_len as f64 / SAMPLE_RATE as f64;
 
         if self.cols_since_norm >= 25 && !self.spec.columns.is_empty() {
             self.norm = waterfall::percentiles(&self.spec);
@@ -241,6 +271,12 @@ struct App {
     tex: Option<egui::TextureHandle>,
     tex_key: (usize, usize, i64, i64, i64, i64),
 
+    /// Every mode the app knows about, and whether it is being listened for.
+    /// Scanning costs time per mode, so this is the app's main speed control.
+    modes: Vec<(ModeId, bool)>,
+    /// Kept so a change to `modes` can re-scan a file without reloading it.
+    samples: Arc<Vec<f32>>,
+
     live: Option<LiveMode>,
 }
 
@@ -269,15 +305,22 @@ impl App {
             strip_w: 35.0,
             tex: None,
             tex_key: (0, 0, 0, 0, 0, 0),
+            modes: protocol::default_modes().into_iter().map(|m| (m, true)).collect(),
+            samples: Arc::new(Vec::new()),
             live: None,
         }
+    }
+
+    /// The modes currently being listened for.
+    fn enabled_modes(&self) -> Vec<ModeId> {
+        self.modes.iter().filter(|(_, on)| *on).map(|(m, _)| *m).collect()
     }
 
     /// Live capture from the default input device.
     fn live() -> App {
         let band = (0.0, 4000.0);
         let mut app = App::base(band);
-        app.live = Some(LiveMode::start(band));
+        app.live = Some(LiveMode::start(band, app.enabled_modes()));
         app
     }
 
@@ -288,40 +331,83 @@ impl App {
 
     fn from_samples(samples: Vec<f32>) -> App {
         let band = (0.0, 4000.0);
-        let duration_s = samples.len() as f64 / SAMPLE_RATE as f64;
+        let mut app = App::base(band);
+        app.duration_s = samples.len() as f64 / SAMPLE_RATE as f64;
+        app.samples = Arc::new(samples);
 
-        // Do the heavy work (spectrogram + full-band decode) off the UI thread.
+        // The spectrogram is fast and the decode is not, so they go to the UI on
+        // separate channels: the waterfall can be up while decoding runs.
         let (spec_tx, spec_rx) = channel();
-        let (frames_tx, frames_rx) = channel();
+        let samples = app.samples.clone();
         thread::spawn(move || {
-            let spec = Spectrogram::compute(&samples, band.0, band.1, SAMPLES_PER_SYMBOL / 4);
+            let spec = Spectrogram::compute(&samples, band.0, band.1, WINDOW / 4);
             let norm = waterfall::percentiles(&spec);
             let _ = spec_tx.send((Arc::new(spec), norm));
+        });
+        app.spec_rx = spec_rx;
+        app.rescan();
+        app
+    }
 
-            let mut frames: Vec<Frame> = modem::decode_all_multi(&samples, 300.0, 2600.0, 30)
+    /// (Re)decode the loaded file with the currently enabled modes.
+    fn rescan(&mut self) {
+        if self.samples.is_empty() {
+            return;
+        }
+        let (frames_tx, frames_rx) = channel();
+        self.frames_rx = frames_rx;
+        self.frames = Vec::new();
+        self.frames_ready = false;
+        self.playing = false;
+        let samples = self.samples.clone();
+        let modes = self.enabled_modes();
+        thread::spawn(move || {
+            let mut frames: Vec<Frame> = protocol::decode_all(&samples, 300.0, 2600.0, &modes)
                 .into_iter()
-                .map(|r| {
-                    let time_s = r.offset as f64 / SAMPLE_RATE as f64;
-                    Frame {
-                        reveal_s: time_s + FRAME_SECS,
-                        decode: Decode {
-                            hz: r.hz,
-                            time_s,
-                            text: message::unpack(&r.a87).text(),
-                            mode: r.mode,
-                        },
-                    }
-                })
+                .map(|d| Frame { reveal_s: d.time_s + d.mode.chunk_secs(), decode: d })
                 .collect();
             frames.sort_by(|a, b| a.reveal_s.partial_cmp(&b.reveal_s).unwrap());
             let _ = frames_tx.send(frames);
         });
+    }
 
-        let mut app = App::base(band);
-        app.duration_s = duration_s;
-        app.spec_rx = spec_rx;
-        app.frames_rx = frames_rx;
-        app
+    /// The mode legend, doubling as the on/off control for what is scanned.
+    ///
+    /// Each protocol gets a menu of its modes; the colour swatch next to each
+    /// is the colour that mode's channels are drawn in. Returns true if the
+    /// selection changed.
+    fn modes_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = false;
+        for p in Protocol::ALL {
+            let on = self.modes.iter().filter(|(m, e)| m.protocol() == p && *e).count();
+            let total = self.modes.iter().filter(|(m, _)| m.protocol() == p).count();
+            let label = format!("{} {on}/{total}", p.name());
+            ui.menu_button(label, |ui| {
+                let set_all = |modes: &mut Vec<(ModeId, bool)>, on: bool| {
+                    for (_, e) in modes.iter_mut().filter(|(m, _)| m.protocol() == p) {
+                        *e = on;
+                    }
+                };
+                if ui.button("all").clicked() {
+                    set_all(&mut self.modes, true);
+                    changed = true;
+                }
+                if ui.button("none").clicked() {
+                    set_all(&mut self.modes, false);
+                    changed = true;
+                }
+                ui.separator();
+                for (m, enabled) in self.modes.iter_mut().filter(|(m, _)| m.protocol() == p) {
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(enabled, "").changed() {
+                            changed = true;
+                        }
+                        ui.colored_label(mode_color(*m), m.short_name());
+                    });
+                }
+            });
+        }
+        changed
     }
 
     fn channels_now(&self) -> ChannelSet {
@@ -455,6 +541,7 @@ impl eframe::App for App {
         let t_now = if live { live_t } else { self.t_now };
 
         let mut chosen_device: Option<String> = None;
+        let mut modes_changed = false;
         egui::TopBottomPanel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if live {
@@ -511,9 +598,7 @@ impl eframe::App for App {
                     ui.label(format!("{} channels", channels.channels().len()));
                 }
                 ui.separator();
-                for m in [js8::Mode::Slow, js8::Mode::Normal, js8::Mode::Fast, js8::Mode::Turbo] {
-                    ui.colored_label(mode_color(m), m.name());
-                }
+                modes_changed = self.modes_menu(ui);
                 ui.separator();
                 ui.weak("scroll: pan · pinch or ctrl+scroll: zoom · shift+scroll: text · drag: pan");
             });
@@ -525,6 +610,16 @@ impl eframe::App for App {
                 if let Some(lm) = self.live.as_mut() {
                     lm.open(Some(name));
                 }
+            }
+        }
+
+        // a change to the listened-for modes restarts the live decoders, or
+        // re-scans the file from the top
+        if modes_changed {
+            let enabled = self.enabled_modes();
+            match self.live.as_mut() {
+                Some(lm) => lm.set_modes(enabled),
+                None => self.rescan(),
             }
         }
 
@@ -672,7 +767,7 @@ impl eframe::App for App {
                 // seconds. File playback time runs at `speed`x (live is real-time),
                 // so animations look the same regardless of playback speed.
                 let eff_speed = if live { 1.0 } else { self.speed.max(1e-3) };
-                let playback_age = t_now - (ch.last_heard_s + FRAME_SECS);
+                let playback_age = t_now - (ch.last_heard_s + ch.mode.chunk_secs());
                 let age = playback_age / eff_speed as f64;
 
                 // scroll-in animation: when a new chunk just arrived, the row

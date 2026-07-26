@@ -4,7 +4,7 @@
 //! a log-likelihood ratio is `log(P(bit=0) / P(bit=1))`, so a **positive**
 //! LLR means the bit is more likely **0**.
 
-use crate::tables::{COLORDER, GEN, MN, NM};
+use crate::js8::tables::{COLORDER, GEN, MN, NM};
 
 /// Encode 87 plain (message) bits into a 174-bit codeword.
 ///

@@ -1,80 +1,46 @@
-//! # js8
+//! # ragchew
 //!
-//! A pure-Rust encoder and decoder for the **JS8** digital mode used by
-//! [JS8Call](https://js8call.com) for keyboard-to-keyboard HAM radio messaging.
+//! A pure-Rust codec library for HAM radio keyboard-to-keyboard digital modes,
+//! and the engine behind the `ragchew` panorama monitor — a waterfall that
+//! decodes *every* conversation in an audio band at once, whatever mode each
+//! one is using.
 //!
-//! This crate implements the JS8 **Normal** submode signal chain:
+//! Two protocol families are implemented today:
 //!
-//! ```text
-//! text ──varicode──▶ 72-bit payload ──+itype──▶ 75 bits ──+CRC12──▶ 87 bits
-//!      ──LDPC(174,87)──▶ 174 bits ──recode──▶ 79 8-FSK symbols (3 Costas sync)
-//!      ──continuous-phase FSK──▶ 12 kHz audio
+//! | module            | protocol | modes |
+//! |-------------------|----------|-------|
+//! | [`js8`]           | JS8 (JS8Call) — burst, cycle-aligned, LDPC | Slow / Normal / Fast / Turbo |
+//! | [`olivia`]        | Olivia MFSK — continuous, Walsh-Hadamard FEC | any tones/bandwidth pair, e.g. 8/250, 16/500, 32/1000 |
+//!
+//! [`protocol`] sits on top of both and is what applications normally use: it
+//! erases the difference between "JS8 Normal frame" and "Olivia 32/1000 block"
+//! down to a common [`Decode`] — some text, at some frequency, at some time.
+//!
+//! ```no_run
+//! use ragchew::protocol;
+//!
+//! let (samples, _rate) = ragchew::wav::read("recording.wav").unwrap();
+//! let modes = protocol::default_modes();
+//! for d in protocol::decode_all(&samples, 300.0, 2600.0, &modes) {
+//!     println!("{:7.1} Hz  t={:6.2}s  {:>14}  {}", d.hz, d.time_s, d.mode.name(), d.text);
+//! }
 //! ```
 //!
-//! and the reverse (sync search, Goertzel tone demod, soft-decision LDPC).
-//!
-//! Protocol constants and behavior are validated bit-for-bit against Robert
-//! Morris (AB1HL)'s independent JS8 implementation; see `tools/ref`.
-//!
-//! ## Quick start
-//! ```
-//! use js8::message::IType;
-//! let audio = js8::encode_freetext("HELLO WORLD", IType::None, 1500.0);
-//! let msg = js8::decode_freetext_near(&audio, 1500.0, 0).unwrap();
-//! assert_eq!(msg.text(), "HELLO WORLD");
-//! ```
+//! Everything runs at one internal sample rate ([`SAMPLE_RATE`]); the live
+//! capture path resamples the sound card to it.
 
-pub mod crc;
-pub mod ldpc;
-pub mod message;
-pub mod modem;
+pub mod dsp;
+pub mod js8;
+pub mod olivia;
+pub mod protocol;
 pub mod spectrogram;
-pub mod submode;
-pub mod tables;
-pub mod varicode;
 pub mod wav;
 
-pub use message::{IType, Message};
+pub use protocol::{Decode, ModeId, Protocol};
 pub use spectrogram::Spectrogram;
-pub use submode::{Mode, Submode};
 
-/// Number of samples of leading silence in a nominal JS8 cycle (0.5 s at 12 kHz).
-pub const CYCLE_LEAD_SAMPLES: usize = (modem::SAMPLE_RATE as usize) / 2;
-
-/// Encode free text into a JS8 audio burst (no leading silence) at `base_hz`.
+/// The internal audio sample rate (Hz) every decoder in this crate works at.
 ///
-/// Returns the modulated samples. Text longer than one frame is truncated to
-/// what fits; use [`encode_freetext_consumed`] to learn how much was used.
-pub fn encode_freetext(text: &str, itype: IType, base_hz: f64) -> Vec<f32> {
-    encode_freetext_consumed(text, itype, base_hz).0
-}
-
-/// Like [`encode_freetext`] but also returns how many characters were consumed.
-pub fn encode_freetext_consumed(text: &str, itype: IType, base_hz: f64) -> (Vec<f32>, usize) {
-    let (a87, consumed) = message::freetext(text, itype);
-    (modem::encode_audio(&a87, base_hz), consumed)
-}
-
-/// Decode a single JS8 signal near a known carrier and start offset, returning
-/// the parsed [`Message`] if the CRC checks out.
-pub fn decode_near(
-    samples: &[f32],
-    base_hz: f64,
-    start_sample: usize,
-) -> Option<Message> {
-    let r = modem::decode_near(samples, base_hz, start_sample, 4, 30)?;
-    if message::crc_ok(&r.a87) {
-        Some(message::unpack(&r.a87))
-    } else {
-        None
-    }
-}
-
-/// Convenience wrapper returning the message only when it is free text.
-pub fn decode_freetext_near(
-    samples: &[f32],
-    base_hz: f64,
-    start_sample: usize,
-) -> Option<Message> {
-    decode_near(samples, base_hz, start_sample)
-}
+/// JS8 fixes this at 12 kHz; Olivia has no intrinsic rate, so it uses the same
+/// one and a single capture stream can feed both.
+pub const SAMPLE_RATE: u32 = 12_000;

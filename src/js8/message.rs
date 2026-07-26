@@ -4,8 +4,8 @@
 //! `75..87` the 12-bit CRC. The leading bits of the payload select the frame
 //! type (`10` free-text, `000` heartbeat/CQ, `011` directed, `11` dense, …).
 
-use crate::crc::ft8_crc12;
-use crate::varicode;
+use crate::js8::crc::ft8_crc12;
+use crate::js8::varicode;
 
 /// The 3 itype flag bits carried at `a87[72..75]`.
 ///

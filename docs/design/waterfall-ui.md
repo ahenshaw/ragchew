@@ -1,22 +1,22 @@
-# Design spec: panoramic multi-channel JS8 monitor
+# Design spec: panoramic multi-channel monitor
 
-Status: **draft** · Scope: receive/monitor UI · Depends on: the `js8` codec crate
+Status: **draft** · Scope: receive/monitor UI · Depends on: the `ragchew` codec
+crate
 
 ## 1. Goal
 
 A single-screen "panorama" that shows an entire ~4 kHz audio band at once and
-decodes **every** JS8 conversation in it simultaneously — not a select-one-and-
-decode tuner. Each signal's decoded text is shown spatially anchored to that
-signal's frequency, so you can read many QSOs at a glance and see where the
-channels are.
+decodes **every** conversation in it simultaneously, in whatever mode each one
+is using — not a select-one-and-decode tuner. Each signal's decoded text is
+shown spatially anchored to that signal's frequency, so you can read many QSOs
+at a glance and see where the channels are.
 
-Non-goals (for this spec): transmit, logging/QSO management, non-Normal
-submodes. See §12.
+Non-goals (for this spec): transmit, logging/QSO management. See §12.
 
 ## 2. Guiding principle
 
 **Decoding is always full-band; the UI is only a view over it.** Every cycle we
-decode the whole band with `modem::decode_all`. Zoom, pan, and text-size are
+decode the whole band with `protocol::decode_all`. Zoom, pan, and text-size are
 *display-only* transforms — they never change what gets decoded. A channel
 scrolled out of view is still decoded and still accumulates text; it's just not
 currently on screen. This keeps the "see all conversations" promise intact
@@ -67,15 +67,21 @@ freshest energy.
 Per decode cycle the UI consumes, for every signal found in the band:
 
 ```rust
-// from js8::modem
-pub struct DecodeResult { pub hz: f64, pub offset: usize, pub sync: f64,
-                          pub a87: [u8;87], pub ldpc_ok: bool, pub ldpc_score: u32 }
-pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, iters: usize) -> Vec<DecodeResult>;
+// from ragchew::protocol
+pub struct Decode { pub mode: ModeId, pub hz: f64, pub time_s: f64,
+                    pub quality: f32, pub text: String }
+pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> Vec<Decode>;
 ```
 
-`js8::message::unpack(&a87).text()` gives the frame text. A full 4 kHz cycle
-decodes in ~0.7 s (see `README.md` §Performance), so per-cycle live decoding has
-ample headroom.
+This is deliberately protocol-blind: a JS8 frame and an Olivia FEC block arrive
+as the same kind of thing, and the UI never branches on which produced what. It
+only asks the `ModeId` for what it needs to draw — bandwidth, association
+tolerance, how long a chunk took on the air, what colour to use.
+
+A full 4 kHz JS8 cycle decodes in ~0.7 s (see `README.md` §Performance), so
+per-cycle live decoding has ample headroom. Olivia costs roughly a second per
+mode per minute of audio, which is why the toolbar lets the operator choose
+what to listen for.
 
 The UI also needs the **magnitude spectrogram** for the waterfall. The codec
 already computes one internally (`Spectro`); we should expose a public,
@@ -102,11 +108,13 @@ struct Channel {
 }
 ```
 
-- **Association:** a new `DecodeResult` joins the nearest existing channel within
-  a frequency tolerance (start ~±15 Hz; John 3:16 drifted ~10 Hz over 2 min),
-  else it starts a new channel.
-- **Text accumulation:** append the frame text; JS8 frames already carry the
-  `<>` end-of-over marker to delimit turns.
+- **Association:** a new `Decode` joins the nearest existing channel of the same
+  protocol within a frequency tolerance (at least ±15 Hz — John 3:16 drifted
+  ~10 Hz over 2 min — and more for wide modes), else it starts a new channel.
+  Protocols never share a channel, so a narrow JS8 station transmitting inside
+  a wide Olivia signal's bandwidth stays its own conversation.
+- **Text accumulation:** append the chunk text; JS8 frames carry the `<>`
+  end-of-over marker to delimit turns, Olivia just runs on.
 - **Expiry:** channels idle beyond a timeout fade and are dropped (configurable).
 
 ## 7. Frequency zoom / pan (density lever #1)
@@ -172,9 +180,12 @@ widens the visible history horizontally.
 **Interaction bindings (proposed):** wheel = frequency zoom · Ctrl-wheel = text
 size · drag = vertical pan · (waterfall span & history depth via settings).
 
-## 11. JS8 timing reality (bake into UX)
+## 11. Timing reality (bake into UX)
 
-JS8 is **framed, not continuous**. In Normal mode a station sends one ~13-char
+The two protocols deliver text on completely different rhythms, and the UI has
+to make both feel intentional.
+
+**JS8 is framed, not continuous.** In Normal mode a station sends one ~13-char
 frame per **15 s** cycle and it can't be decoded until the frame completes and is
 LDPC-decoded. So:
 
@@ -183,17 +194,28 @@ LDPC-decoded. So:
   chunked. Design it to feel intentional (e.g. a subtle "just decoded" highlight
   on the new chunk), not laggy.
 - Decode latency after a boundary is ~0.7 s wideband — effectively instant.
+
+**Olivia is continuous, and on no schedule at all.** A station keys up whenever
+it likes and types; text lands one FEC block at a time — 3 to 5 characters every
+one to two seconds, depending on mode. There is no cycle boundary to trigger on,
+so the live decoder re-scans a rolling window instead and dedupes what it has
+already reported. That makes Olivia text arrive in smaller, more frequent
+quanta than JS8's, and adds a few seconds of latency the operator cannot tune
+away — the price of a mode with nothing to sync to.
 - The decode loop is **cycle-aligned** to the system clock (:00/:15/:30/:45):
   buffer audio continuously, run one `decode_all` over the last ~15 s at each
   boundary, associate results to channels, append text.
 
-## 12. Submodes & future
+## 12. Modes & future
 
-- **Normal (15 s) only** for v1. Fast (10 s) / Turbo (6 s) / Slow (30 s) share
-  the same FEC but different timing; decoding all simultaneously multiplies work
-  and needs the codec extended — deferred.
+- **Done:** all four JS8 submodes decoded simultaneously, each signal's mode
+  detected per-signal rather than configured; the common Olivia modes likewise.
+- Every mode scanned costs time, so what to listen for is an operator control
+  (the toolbar mode menus), not a fixed list. Defaulting to everything is right
+  for a monitor; a busy machine watching one calling frequency should narrow it.
 - Later: transmit, per-channel focus/mute, click-a-streak-to-pin, logging,
-  waterfall color themes, persistence of the session.
+  waterfall color themes, persistence of the session, more protocols (the
+  `protocol` layer exists so that is an additive change).
 
 ## 13. Architecture
 
@@ -202,21 +224,21 @@ LDPC-decoded. So:
                      │
                      ├──▶ [waterfall builder]  hop-FFT columns ──▶ spectrogram ring
                      │
- 15 s boundary ─────▶ [decode worker]  decode_all over last cycle
+ cycle boundary ────▶ [JS8 worker]     decode_all over the finished cycle
+ every few seconds ─▶ [Olivia worker]  decode_all over a rolling window
                      │                     └─▶ Channel model (associate, append)
                      ▼
                  [egui UI thread]  reads spectrogram ring + channel model,
                                    renders waterfall texture + text + leaders
 ```
 
-- **Crates:** `js8` (done) · `eframe`/`egui` (UI) · `cpal` (audio) · a small app
-  crate wiring them. Add these to a new `[[bin]]` or a separate workspace member
-  so the library stays UI-free.
+- **Crates:** `ragchew` (done) · `eframe`/`egui` (UI) · `cpal` (audio) · the
+  `ragchew-gui` workspace member wiring them, so the library stays UI-free.
 - **Threading:** capture and decode off the UI thread; the UI reads snapshots
   (channel list + spectrogram ring) behind a mutex/`arc-swap`. Decode of a cycle
   (~0.7 s) must never block rendering.
 - **Offline mode:** the same pipeline driven from a WAV file (as `examples/
-  js8_tool decode` already does) for development without a radio.
+  ragchew_tool decode` already does) for development without a radio.
 
 ## 14. Data model (sketch)
 

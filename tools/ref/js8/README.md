@@ -14,7 +14,7 @@ Links the reference pack/unpack/ldpc/crc and prints, per message:
 Build & regenerate `tests/vectors/reference_vectors.txt`:
 
     g++ -O2 -std=c++17 -I. harness.cc pack.cc unpack.cc libldpc.cc -o js8ref
-    ./js8ref > ../../tests/vectors/reference_vectors.txt   # run where words.txt lives
+    ./js8ref > ../../../tests/vectors/reference_vectors.txt   # run where words.txt lives
 
 ## Reference decoder (`decode_harness.cc`)
 
@@ -30,4 +30,4 @@ Needs `libfftw3-dev` and `libsndfile1-dev`.
 
 ## Regenerate the LDPC / Costas tables
 
-`../gen_tables.py` parses `arrays.h` + `pack.cc` here into `src/tables.rs`.
+`../../gen_tables.py` parses `arrays.h` + `pack.cc` here into `src/js8/tables.rs`.

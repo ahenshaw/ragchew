@@ -6,23 +6,23 @@
 //! the payload chain (LDPC/CRC/varicode) is shared. The public no-suffix
 //! functions ([`encode_audio`], [`decode_all`], …) default to **Normal**.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::sync::Arc;
+use rustfft::num_complex::Complex32;
 
-use rustfft::{num_complex::Complex32, Fft, FftPlanner};
-
-use crate::ldpc;
-use crate::submode::{self, Mode, Submode};
+use crate::js8::ldpc;
+use crate::js8::submode::{self, Mode, Submode};
 
 /// Samples per second for JS8.
-pub const SAMPLE_RATE: u32 = 12000;
+pub const SAMPLE_RATE: u32 = crate::SAMPLE_RATE;
 /// Samples per symbol for **Normal** (kept for display/back-compat).
 pub const SAMPLES_PER_SYMBOL: usize = 1920;
 /// Tone spacing (Hz) for **Normal**.
 pub const TONE_SPACING: f64 = 6.25;
 /// Total symbols per transmission (all submodes).
 pub const N_SYMBOLS: usize = 79;
+
+/// Costas sync strength noise floor: what [`DecodeResult::sync`] reads when
+/// there is nothing but noise at a candidate. Real frames sit well above it.
+pub const NOISE_SYNC: f64 = 0.14;
 
 /// Symbol positions carrying data (i.e. not Costas sync), in order.
 fn data_positions() -> [usize; 58] {
@@ -96,44 +96,10 @@ pub fn encode_audio(a87: &[u8; 87], base_hz: f64) -> Vec<f32> {
 
 // ---- demodulation ----
 
-thread_local! {
-    static PLANNER: RefCell<FftPlanner<f32>> = RefCell::new(FftPlanner::<f32>::new());
-    static PLANS: RefCell<HashMap<usize, Arc<dyn Fft<f32>>>> = RefCell::new(HashMap::new());
-}
-
-/// A cached forward FFT plan of length `n`.
-fn plan(n: usize) -> Arc<dyn Fft<f32>> {
-    PLANS.with(|plans| {
-        if let Some(p) = plans.borrow().get(&n) {
-            return p.clone();
-        }
-        let p = PLANNER.with(|pl| pl.borrow_mut().plan_fft_forward(n));
-        plans.borrow_mut().insert(n, p.clone());
-        p
-    })
-}
-
 /// Forward FFT of one `n`-sample symbol window at `start` (zero-padded), after
 /// mixing down by `delta_hz` so a between-bins carrier lands on an integer bin.
 fn symbol_fft_shift(samples: &[f32], start: usize, delta_hz: f64, n: usize) -> Vec<Complex32> {
-    let mut buf = vec![Complex32::new(0.0, 0.0); n];
-    if delta_hz == 0.0 {
-        for (i, b) in buf.iter_mut().enumerate() {
-            if let Some(&s) = samples.get(start + i) {
-                b.re = s;
-            }
-        }
-    } else {
-        let w = -2.0 * std::f64::consts::PI * delta_hz / SAMPLE_RATE as f64;
-        for (i, b) in buf.iter_mut().enumerate() {
-            if let Some(&s) = samples.get(start + i) {
-                let ang = w * i as f64;
-                *b = Complex32::new(s * ang.cos() as f32, s * ang.sin() as f32);
-            }
-        }
-    }
-    plan(n).process(&mut buf);
-    buf
+    crate::dsp::fft_window(samples, start, delta_hz, SAMPLE_RATE, n, None)
 }
 
 /// Tone magnitudes (8 tones) for every symbol, for carrier `bin0 + delta/spacing`.
@@ -355,7 +321,7 @@ fn decode_search(
                     ldpc_ok: dec.ok(),
                     ldpc_score: dec.score,
                 };
-                if r.ldpc_ok && crate::message::crc_ok(&r.a87) {
+                if r.ldpc_ok && crate::js8::message::crc_ok(&r.a87) {
                     return DecodeResult { sync: costas_strength_frac(samples, bin0, delta, off, sm), ..r };
                 }
                 if best.as_ref().map_or(true, |b| r.ldpc_score > b.ldpc_score) {
@@ -578,7 +544,7 @@ pub fn decode_all_sm(
         let dec = ldpc::decode(&soft_llrs(&mags), iters);
         if dec.ok() {
             let a87 = dec.message_bits();
-            if crate::message::crc_ok(&a87) {
+            if crate::js8::message::crc_ok(&a87) {
                 out.push(DecodeResult {
                     mode: sm.mode,
                     hz: *bin0 as f64 * spacing,
@@ -648,7 +614,7 @@ pub fn decode_all_sm(
                         break 'pass2;
                     }
                     let r = decode_search(samples, bin0, f * spec.hop, off_span, 12, iters, sm);
-                    if r.ldpc_ok && crate::message::crc_ok(&r.a87) {
+                    if r.ldpc_ok && crate::js8::message::crc_ok(&r.a87) {
                         out.push(r);
                         break;
                     }
