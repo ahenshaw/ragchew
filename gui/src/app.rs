@@ -887,10 +887,35 @@ impl eframe::App for App {
                     });
                 }
                 ui.separator();
-                if !live && !self.frames_ready {
-                    ui.label("⏳ decoding…");
-                } else {
-                    ui.label(format!("{} channels", channels.channels().len()));
+                {
+                    // A counting readout that sets its own width drags the rest
+                    // of the bar along every time a station appears, so the slot
+                    // is sized once for the widest thing it will ever hold.
+                    // Measured rather than guessed, so it survives text scaling.
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    let width = ["⏳ decoding…", "8888 channels"]
+                        .iter()
+                        .map(|s| {
+                            ui.painter()
+                                .layout_no_wrap(
+                                    (*s).to_owned(),
+                                    font.clone(),
+                                    Color32::PLACEHOLDER,
+                                )
+                                .size()
+                                .x
+                        })
+                        .fold(0.0f32, f32::max);
+                    let text = if !live && !self.frames_ready {
+                        "⏳ decoding…".to_owned()
+                    } else {
+                        format!("{} channels", channels.channels().len())
+                    };
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, ui.spacing().interact_size.y),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| ui.label(text),
+                    );
                 }
                 ui.separator();
                 match &self.status {
