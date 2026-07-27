@@ -11,7 +11,7 @@
 use ragchew::js8::message::{self, IType};
 use ragchew::js8::modem;
 use ragchew::olivia;
-use ragchew::protocol::{self, ModeId};
+use ragchew::protocol::{self, parse_mode, ModeId};
 use ragchew::{wav, SAMPLE_RATE};
 
 fn main() {
@@ -30,22 +30,6 @@ fn main() {
     }
 }
 
-/// Accepts `js8`, `js8:fast`, `olivia:16/500`, or a bare `16/500`.
-fn parse_mode(s: &str) -> Option<ModeId> {
-    let lower = s.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("js8") {
-        use ragchew::js8::Mode::*;
-        return Some(ModeId::Js8(match rest.trim_start_matches(':') {
-            "" | "normal" => Normal,
-            "slow" => Slow,
-            "fast" => Fast,
-            "turbo" => Turbo,
-            _ => return None,
-        }));
-    }
-    olivia::parse(&lower).map(ModeId::Olivia)
-}
-
 fn modes() {
     println!("{:<16} {:>12} {:>9}  timing", "mode", "bandwidth", "chars/s");
     for m in protocol::default_modes() {
@@ -62,7 +46,7 @@ fn modes() {
 }
 
 fn encode(args: &[String]) {
-    let Some(mode) = args.get(2).and_then(|s| parse_mode(s)) else {
+    let Some(mode) = args.get(2).map(|s| s.as_str()).and_then(parse_mode) else {
         eprintln!("unknown mode {:?} — try `ragchew_tool modes`", args.get(2));
         std::process::exit(2);
     };

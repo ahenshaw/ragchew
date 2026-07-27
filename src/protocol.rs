@@ -133,6 +133,26 @@ pub struct Decode {
     pub text: String,
 }
 
+/// Parse a mode name.
+///
+/// Accepts what [`ModeId::name`] produces (`"JS8 Normal"`, `"Olivia 32/1000"`)
+/// so a mode can round-trip through a config file or a command line, plus the
+/// terser forms a person would actually type: `js8`, `js8:fast`, `16/500`.
+pub fn parse_mode(s: &str) -> Option<ModeId> {
+    let s = s.trim().to_ascii_lowercase();
+    if let Some(rest) = s.strip_prefix("js8") {
+        use js8::Mode::*;
+        return Some(ModeId::Js8(match rest.trim().trim_start_matches(':').trim() {
+            "" | "normal" => Normal,
+            "slow" => Slow,
+            "fast" => Fast,
+            "turbo" => Turbo,
+            _ => return None,
+        }));
+    }
+    olivia::parse(&s).map(ModeId::Olivia)
+}
+
 /// The modes a band scan tries by default: all four JS8 submodes and the common
 /// Olivia modes.
 ///
@@ -199,6 +219,27 @@ mod tests {
         for p in Protocol::ALL {
             assert!(modes.iter().any(|m| m.protocol() == p), "{} missing", p.name());
         }
+    }
+
+    /// Every mode survives a trip through its own name, which is what lets a
+    /// settings file or a command line store one.
+    #[test]
+    fn mode_names_round_trip() {
+        for m in default_modes() {
+            assert_eq!(parse_mode(&m.name()), Some(m), "{} did not round-trip", m.name());
+        }
+    }
+
+    #[test]
+    fn parses_the_terse_forms_too() {
+        assert_eq!(parse_mode("js8"), Some(ModeId::Js8(js8::Mode::Normal)));
+        assert_eq!(parse_mode("js8:fast"), Some(ModeId::Js8(js8::Mode::Fast)));
+        assert_eq!(parse_mode("JS8 Turbo"), Some(ModeId::Js8(js8::Mode::Turbo)));
+        assert_eq!(parse_mode("16/500"), Some(ModeId::Olivia(olivia::OL_16_500)));
+        assert_eq!(parse_mode("olivia:8/250"), Some(ModeId::Olivia(olivia::OL_8_250)));
+        assert_eq!(parse_mode("js8:sideways"), None);
+        assert_eq!(parse_mode("7/1000"), None);
+        assert_eq!(parse_mode(""), None);
     }
 
     #[test]

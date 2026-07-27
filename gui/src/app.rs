@@ -99,7 +99,17 @@ pub fn run() -> eframe::Result<()> {
     };
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+        // The inner size is only the first-run default; after that eframe
+        // restores the window's own geometry.
+        //
+        // The app id has to be pinned: eframe derives the settings folder from
+        // it, and it otherwise falls back to the window title — which varies
+        // with the mode, so `--demo` and `--live` would each keep their own
+        // separate settings and none of them would agree.
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_app_id("ragchew"),
+        persist_window: true,
         ..Default::default()
     };
     // Build the app inside the creator so a non-Send audio stream never crosses
@@ -107,8 +117,13 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         title,
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
             let mut app = App::base((0.0, 4000.0));
+            if let Some(saved) =
+                cc.storage.and_then(|s| eframe::get_value::<Settings>(s, eframe::APP_KEY))
+            {
+                app.apply(saved);
+            }
             if args.live {
                 app.go_live();
             } else if args.weak {
@@ -150,6 +165,44 @@ fn mode_color(m: ModeId) -> Color32 {
     }
 }
 
+/// What survives a restart.
+///
+/// Deliberately only the *settings* — how the window is arranged and what it is
+/// listening for. Not the viewport, which is navigation rather than preference
+/// and would have the app reopen mysteriously zoomed into 50 Hz of nothing; and
+/// not the loaded file, since starting up decoding something the operator has
+/// forgotten about is worse than starting up empty.
+///
+/// Modes are stored by name rather than by deriving `serde` down through the
+/// codec crate. Names are stable, they are already round-tripped by
+/// [`protocol::parse_mode`], and an unrecognised one — from an older build, or a
+/// newer one — is simply skipped instead of failing the whole file.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Settings {
+    text_px: f32,
+    waterfall_w: f32,
+    span_s: f32,
+    scroll_secs: f32,
+    speed: f32,
+    modes: Vec<String>,
+    input_device: Option<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            text_px: 14.0,
+            waterfall_w: 300.0,
+            span_s: 45.0,
+            scroll_secs: 1.0,
+            speed: 8.0,
+            modes: protocol::default_modes().iter().map(|m| m.name()).collect(),
+            input_device: None,
+        }
+    }
+}
+
 /// A round tick spacing for a `span` Hz view, aiming for roughly six labels.
 ///
 /// The old scale was fixed at whole kilohertz, which is fine for the whole band
@@ -185,7 +238,7 @@ struct LiveMode {
 }
 
 impl LiveMode {
-    fn start(band: (f64, f64), modes: Vec<ModeId>) -> LiveMode {
+    fn start(band: (f64, f64), modes: Vec<ModeId>, device: Option<String>) -> LiveMode {
         let mut lm = LiveMode {
             band,
             modes,
@@ -201,7 +254,7 @@ impl LiveMode {
             devices: crate::audio::input_devices(),
             selected: None,
         };
-        lm.open(None);
+        lm.open(device);
         lm
     }
 
@@ -219,7 +272,12 @@ impl LiveMode {
         self.cols_since_norm = 0;
         self.t_now = 0.0;
         self.devices = crate::audio::input_devices();
-        match crate::audio::LiveAudio::start(name.as_deref()) {
+        // A remembered device may be gone — a USB interface unplugged, or
+        // settings carried to another machine. Falling back to the default
+        // input beats refusing to listen at all.
+        let started = crate::audio::LiveAudio::start(name.as_deref())
+            .or_else(|e| if name.is_some() { crate::audio::LiveAudio::start(None) } else { Err(e) });
+        match started {
             Ok(audio) => {
                 self.frames_rx =
                     Some(crate::audio::spawn_decoder(audio.buf.clone(), self.modes.clone()));
@@ -343,6 +401,8 @@ struct App {
     source: String,
     /// Why the last open failed, if it did.
     status: Option<String>,
+    /// Audio input to prefer when going live, remembered across restarts.
+    preferred_input: Option<String>,
 
     /// True while a drag that began on the band bar is in progress, and the
     /// frequency offset between where it was grabbed and the view centre — so
@@ -388,11 +448,44 @@ impl App {
             samples: Arc::new(Vec::new()),
             source: String::new(),
             status: None,
+            preferred_input: None,
             bar_drag: false,
             bar_grab_hz: 0.0,
             split_drag: false,
             split_grab_dx: 0.0,
             live: None,
+        }
+    }
+
+    /// The current state of everything that persists.
+    fn settings(&self) -> Settings {
+        Settings {
+            text_px: self.text_px,
+            waterfall_w: self.waterfall_w,
+            span_s: self.span_s,
+            scroll_secs: self.scroll_secs,
+            speed: self.speed,
+            modes: self.enabled_modes().iter().map(|m| m.name()).collect(),
+            input_device: self.preferred_input.clone(),
+        }
+    }
+
+    /// Restore saved settings over the defaults.
+    fn apply(&mut self, s: Settings) {
+        self.text_px = s.text_px.clamp(8.0, 22.0);
+        self.waterfall_w = s.waterfall_w;
+        self.span_s = s.span_s.clamp(10.0, 120.0);
+        self.scroll_secs = s.scroll_secs.clamp(0.0, 2.0);
+        self.speed = s.speed.clamp(1.0, 20.0);
+        self.preferred_input = s.input_device;
+
+        let wanted: Vec<ModeId> = s.modes.iter().filter_map(|n| protocol::parse_mode(n)).collect();
+        // An empty or wholly unrecognisable list would leave the app scanning
+        // for nothing and looking broken, so it falls back to everything.
+        if !wanted.is_empty() {
+            for (m, on) in self.modes.iter_mut() {
+                *on = wanted.contains(m);
+            }
         }
     }
 
@@ -409,7 +502,8 @@ impl App {
         self.frames_ready = true;
         self.status = None;
         self.source = "live input".to_string();
-        self.live = Some(LiveMode::start(self.band, self.enabled_modes()));
+        self.live =
+            Some(LiveMode::start(self.band, self.enabled_modes(), self.preferred_input.clone()));
     }
 
     /// Load an audio file, replacing whatever is on screen.
@@ -593,6 +687,11 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Called by eframe periodically and on exit.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, &self.settings());
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // eframe hands the app a `Ui` and panels nest inside it, so `ui` is
         // borrowed mutably for most of this function. A cloned handle to the
@@ -784,6 +883,7 @@ impl eframe::App for App {
         // switch input device if the user picked a different one
         if let Some(name) = chosen_device {
             if live_selected.as_deref() != Some(name.as_str()) {
+                self.preferred_input = Some(name.clone());
                 if let Some(lm) = self.live.as_mut() {
                     lm.open(Some(name));
                 }
@@ -1131,6 +1231,54 @@ mod tests {
     fn split_is_respected_when_there_is_room() {
         assert_eq!(clamp_waterfall_w(1280.0, 35.0, 420.0), 420.0);
         assert_eq!(clamp_waterfall_w(1280.0, 35.0, 5000.0), 1280.0 - 35.0 - MIN_TEXT_W);
+    }
+
+    /// Settings survive the trip through the file eframe writes.
+    #[test]
+    fn settings_round_trip_through_json() {
+        let mut app = App::base((0.0, 4000.0));
+        app.text_px = 17.0;
+        app.waterfall_w = 480.0;
+        app.span_s = 90.0;
+        app.speed = 3.0;
+        app.preferred_input = Some("USB Audio CODEC".to_string());
+        for (m, on) in app.modes.iter_mut() {
+            *on = m.protocol() == Protocol::Olivia;
+        }
+
+        let text = serde_json::to_string(&app.settings()).unwrap();
+        let mut restored = App::base((0.0, 4000.0));
+        restored.apply(serde_json::from_str(&text).unwrap());
+
+        assert_eq!(restored.text_px, 17.0);
+        assert_eq!(restored.waterfall_w, 480.0);
+        assert_eq!(restored.span_s, 90.0);
+        assert_eq!(restored.speed, 3.0);
+        assert_eq!(restored.preferred_input.as_deref(), Some("USB Audio CODEC"));
+        assert_eq!(restored.enabled_modes(), app.enabled_modes());
+        assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
+    }
+
+    /// A settings file from another build must not be able to brick startup.
+    #[test]
+    fn unusable_saved_settings_fall_back() {
+        let mut app = App::base((0.0, 4000.0));
+        let all = app.enabled_modes().len();
+
+        // every mode name unrecognised — scanning for nothing would look like a
+        // broken app, so the default set stands
+        app.apply(Settings { modes: vec!["Hellschreiber".into()], ..Settings::default() });
+        assert_eq!(app.enabled_modes().len(), all);
+
+        // and an empty list likewise
+        app.apply(Settings { modes: Vec::new(), ..Settings::default() });
+        assert_eq!(app.enabled_modes().len(), all);
+
+        // absurd values are clamped rather than trusted
+        app.apply(Settings { text_px: 1e6, span_s: -3.0, speed: 0.0, ..Settings::default() });
+        assert!((8.0..=22.0).contains(&app.text_px), "text_px {}", app.text_px);
+        assert!((10.0..=120.0).contains(&app.span_s), "span_s {}", app.span_s);
+        assert!((1.0..=20.0).contains(&app.speed), "speed {}", app.speed);
     }
 
     /// Every step is a round number a reader can do arithmetic with.

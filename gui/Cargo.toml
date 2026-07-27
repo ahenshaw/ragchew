@@ -18,17 +18,21 @@ default = ["desktop"]
 # The interactive eframe app + live audio. Disable (`--no-default-features`) to
 # build just the pure rendering pieces (e.g. the render_png example) without the
 # windowing/audio stack.
-desktop = ["dep:eframe", "dep:cpal", "dep:clap", "dep:rfd"]
+desktop = ["dep:eframe", "dep:cpal", "dep:clap", "dep:rfd", "dep:serde"]
 
 [dependencies]
 ragchew = { path = ".." }
-eframe = { version = "0.35", optional = true, default-features = true }
+eframe = { version = "0.35", optional = true, default-features = true, features = [
+    "persistence",
+] }
 cpal = { version = "0.15", optional = true }
 clap = { version = "4", optional = true, features = ["derive"] }
 # Native file dialogs. The default backend wants GTK3 development headers; on a
 # machine without them, `default-features = false, features = ["xdg-portal",
 # "async-std"]` uses the desktop portal instead.
 rfd = { version = "0.17", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
 
 [dev-dependencies]
 png = "0.17"
+serde_json = "1"

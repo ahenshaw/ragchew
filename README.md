@@ -30,6 +30,12 @@ Run it with no arguments and it opens empty, with everything reachable from the
 **File** menu: *Open audio file…* for a native file picker, or straight to the
 demo bands or live input. `--help` lists the lot.
 
+Window size and position, the panel split, text size, playback and waterfall
+settings, the modes being scanned and the chosen audio input all persist between
+runs (`~/.local/share/ragchew/app.ron` on Linux). The viewport is deliberately
+not saved — that is navigation, not preference, and reopening zoomed into 50 Hz
+of nothing helps nobody.
+
 `--weak` is the one that shows what Olivia is *for*: five stations across four
 modes, every one of them **below the noise floor**, and several stacked inside
 each other's bandwidth.
