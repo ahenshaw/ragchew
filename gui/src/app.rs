@@ -906,7 +906,11 @@ impl eframe::App for App {
                                 .x
                         })
                         .fold(0.0f32, f32::max);
-                    let text = if !live && !self.frames_ready {
+                    let text = if !live && self.samples.is_empty() {
+                        // Nothing loaded is not the same state as something
+                        // still decoding: the slot stays reserved but empty.
+                        String::new()
+                    } else if !live && !self.frames_ready {
                         "⏳ decoding…".to_owned()
                     } else {
                         format!("{} channels", channels.channels().len())
