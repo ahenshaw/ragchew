@@ -45,6 +45,10 @@ const MIN_THUMB_H: f32 = 10.0;
 /// splitter.
 const SPLIT_GRAB: f32 = 3.0;
 
+/// Narrowest slice of band the waterfall will zoom into, and the floor a
+/// restored view is held to. Below this the labels have nothing to attach to.
+const MIN_SPAN_HZ: f64 = 50.0;
+
 /// Neither panel may be dragged smaller than this.
 const MIN_WATERFALL_W: f32 = 80.0;
 const MIN_TEXT_W: f32 = 160.0;
@@ -168,11 +172,14 @@ fn mode_color(m: ModeId) -> Color32 {
 
 /// What survives a restart.
 ///
-/// Deliberately only the *settings* — how the window is arranged and what it is
-/// listening for. Not the viewport, which is navigation rather than preference
-/// and would have the app reopen mysteriously zoomed into 50 Hz of nothing; and
-/// not the loaded file, since starting up decoding something the operator has
-/// forgotten about is worse than starting up empty.
+/// How the window is arranged, what it is listening for, and where in the band
+/// it is pointed. Not the loaded file, since starting up decoding something the
+/// operator has forgotten about is worse than starting up empty.
+///
+/// The view is kept because an operator who works one corner of the band wants
+/// to come back to it, not to the whole 4 kHz every time. What it must not do
+/// is reopen somewhere unusable, so a restored view is fitted to the band on
+/// the way in — see [`App::set_view`].
 ///
 /// Modes are stored by name rather than by deriving `serde` down through the
 /// codec crate. Names are stable, they are already round-tripped by
@@ -189,6 +196,10 @@ struct Settings {
     modes: Vec<String>,
     input_device: Option<String>,
     show_all_inputs: bool,
+    /// Frequency bounds of the waterfall view, low then high. `None` — which is
+    /// also what a settings file written before this existed deserialises to —
+    /// means the whole band.
+    view_hz: Option<(f64, f64)>,
 }
 
 impl Default for Settings {
@@ -202,6 +213,7 @@ impl Default for Settings {
             modes: protocol::default_modes().iter().map(|m| m.name()).collect(),
             input_device: None,
             show_all_inputs: false,
+            view_hz: None,
         }
     }
 }
@@ -488,6 +500,7 @@ impl App {
             modes: self.enabled_modes().iter().map(|m| m.name()).collect(),
             input_device: self.preferred_input.clone(),
             show_all_inputs: self.show_all_inputs,
+            view_hz: Some((self.vp.f_lo, self.vp.f_hi)),
         }
     }
 
@@ -500,6 +513,8 @@ impl App {
         self.speed = s.speed.clamp(1.0, 20.0);
         self.preferred_input = s.input_device;
         self.show_all_inputs = s.show_all_inputs;
+        let (lo, hi) = s.view_hz.unwrap_or(self.band);
+        self.set_view(lo, hi);
 
         let wanted: Vec<ModeId> = s.modes.iter().filter_map(|n| protocol::parse_mode(n)).collect();
         // An empty or wholly unrecognisable list would leave the app scanning
@@ -694,8 +709,28 @@ impl App {
         self.tex.clone().unwrap()
     }
 
+    /// Point the view at `lo..hi`, fitted to the band.
+    ///
+    /// Every restored view goes through here, so a settings file from a build
+    /// with a different band — or one that has been edited by hand, or written
+    /// by a crash mid-drag — cannot reopen the app somewhere it cannot be
+    /// navigated out of: nothing wider than the band, nothing narrower than the
+    /// zoom limit, nothing hanging off either end, and nothing inverted or
+    /// non-finite.
+    fn set_view(&mut self, lo: f64, hi: f64) {
+        let full = self.band.1 - self.band.0;
+        if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+            self.vp = Viewport { f_lo: self.band.0, f_hi: self.band.1 };
+            return;
+        }
+        let span = (hi - lo).clamp(MIN_SPAN_HZ.min(full), full);
+        let lo = lo.clamp(self.band.0, self.band.1 - span);
+        self.vp = Viewport { f_lo: lo, f_hi: lo + span };
+    }
+
     fn zoom(&mut self, focus_hz: f64, factor: f64) {
-        let span = ((self.vp.f_hi - self.vp.f_lo) * factor).clamp(50.0, self.band.1 - self.band.0);
+        let span =
+            ((self.vp.f_hi - self.vp.f_lo) * factor).clamp(MIN_SPAN_HZ, self.band.1 - self.band.0);
         let t = (focus_hz - self.vp.f_lo) / (self.vp.f_hi - self.vp.f_lo);
         let mut lo = focus_hz - t * span;
         let mut hi = lo + span;
@@ -1377,6 +1412,7 @@ mod tests {
         app.span_s = 90.0;
         app.speed = 3.0;
         app.preferred_input = Some("USB Audio CODEC".to_string());
+        app.set_view(1200.0, 1400.0);
         for (m, on) in app.modes.iter_mut() {
             *on = m.protocol() == Protocol::Olivia;
         }
@@ -1390,8 +1426,47 @@ mod tests {
         assert_eq!(restored.span_s, 90.0);
         assert_eq!(restored.speed, 3.0);
         assert_eq!(restored.preferred_input.as_deref(), Some("USB Audio CODEC"));
+        assert_eq!((restored.vp.f_lo, restored.vp.f_hi), (1200.0, 1400.0));
         assert_eq!(restored.enabled_modes(), app.enabled_modes());
         assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
+    }
+
+    /// A settings file written before the view was saved leaves it alone: the
+    /// whole band, as it always opened.
+    #[test]
+    fn settings_without_a_saved_view_open_on_the_whole_band() {
+        let json = r#"{"text_px":14.0,"waterfall_w":300.0,"span_s":45.0,"scroll_secs":1.0,
+                       "speed":8.0,"modes":[],"input_device":null,"show_all_inputs":false}"#;
+        let mut app = App::base((0.0, 4000.0));
+        app.set_view(1000.0, 1100.0);
+        app.apply(serde_json::from_str(json).unwrap());
+        assert_eq!((app.vp.f_lo, app.vp.f_hi), (0.0, 4000.0));
+    }
+
+    /// Whatever is in the settings file, the app opens somewhere it can be
+    /// navigated out of: inside the band, and wide enough to see.
+    #[test]
+    fn a_restored_view_is_fitted_to_the_band() {
+        let band = (0.0, 4000.0);
+        let mut app = App::base(band);
+        for (lo, hi) in [
+            (1200.0, 1400.0),        // the ordinary case, kept as-is
+            (-5000.0, 9000.0),       // wider than the band
+            (3900.0, 4600.0),        // hanging off the top
+            (-600.0, 200.0),         // hanging off the bottom
+            (1500.0, 1500.5),        // narrower than the zoom limit
+            (2000.0, 1000.0),        // inverted
+            (f64::NAN, f64::NAN),    // and not a number at all
+            (0.0, f64::INFINITY),    //
+        ] {
+            app.set_view(lo, hi);
+            let (l, h) = (app.vp.f_lo, app.vp.f_hi);
+            assert!(l >= band.0 && h <= band.1, "{lo}..{hi} restored as {l}..{h}, outside the band");
+            assert!(h - l >= MIN_SPAN_HZ, "{lo}..{hi} restored as {l}..{h}, too narrow to use");
+        }
+        // a view that was already sane is not "fixed"
+        app.set_view(1200.0, 1400.0);
+        assert_eq!((app.vp.f_lo, app.vp.f_hi), (1200.0, 1400.0));
     }
 
     /// A settings file from another build must not be able to brick startup.
