@@ -233,7 +233,7 @@ struct LiveMode {
     norm: (f32, f32),
     cols_since_norm: usize,
     t_now: f64,
-    devices: Vec<String>,
+    devices: Vec<crate::audio::InputDevice>,
     selected: Option<String>, // current device name
 }
 
@@ -281,7 +281,7 @@ impl LiveMode {
             Ok(audio) => {
                 self.frames_rx =
                     Some(crate::audio::spawn_decoder(audio.buf.clone(), self.modes.clone()));
-                self.selected = Some(audio.device_name.clone());
+                self.selected = Some(audio.device_id.clone());
                 self.err = None;
                 self.audio = Some(audio);
             }
@@ -401,7 +401,8 @@ struct App {
     source: String,
     /// Why the last open failed, if it did.
     status: Option<String>,
-    /// Audio input to prefer when going live, remembered across restarts.
+    /// Identifier of the audio input to prefer when going live, remembered
+    /// across restarts.
     preferred_input: Option<String>,
 
     /// True while a drag that began on the band bar is in progress, and the
@@ -705,7 +706,7 @@ impl eframe::App for App {
         let mut live_t = 0.0;
         let mut live_norm = self.norm;
         let mut live_label = String::new();
-        let mut live_devices: Vec<String> = Vec::new();
+        let mut live_devices: Vec<crate::audio::InputDevice> = Vec::new();
         let mut live_selected: Option<String> = None;
         if let Some(lm) = self.live.as_mut() {
             lm.tick();
@@ -799,18 +800,19 @@ impl eframe::App for App {
                 if live {
                     ui.strong(&live_label);
                     ui.separator();
-                    egui::ComboBox::from_label("input")
-                        .selected_text(live_selected.clone().unwrap_or_else(|| "—".to_string()))
-                        .show_ui(ui, |ui| {
-                            for d in &live_devices {
-                                if ui
-                                    .selectable_label(live_selected.as_deref() == Some(d.as_str()), d)
-                                    .clicked()
-                                {
-                                    chosen_device = Some(d.clone());
-                                }
+                    let shown = live_devices
+                        .iter()
+                        .find(|d| Some(&d.id) == live_selected.as_ref())
+                        .map(|d| d.label.clone())
+                        .unwrap_or_else(|| "—".to_string());
+                    egui::ComboBox::from_label("input").selected_text(shown).show_ui(ui, |ui| {
+                        for d in &live_devices {
+                            let on = live_selected.as_ref() == Some(&d.id);
+                            if ui.selectable_label(on, &d.label).clicked() {
+                                chosen_device = Some(d.id.clone());
                             }
-                        });
+                        }
+                    });
                 } else {
                     ui.add_enabled_ui(self.frames_ready, |ui| {
                         if ui.button(if self.playing { "⏸ pause" } else { "▶ play" }).clicked() {

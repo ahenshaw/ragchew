@@ -170,37 +170,77 @@ impl Resampler {
 /// A running capture: keeps the cpal stream alive and exposes the rolling buffer.
 pub struct LiveAudio {
     pub buf: Arc<Mutex<AudioBuf>>,
+    /// Stable identifier of the device in use, for remembering the choice.
+    pub device_id: String,
+    /// Human name of the device in use, for showing it.
     pub device_name: String,
     pub in_rate: u32,
     _stream: cpal::Stream,
 }
 
-/// Names of available input devices (best-effort).
-pub fn input_devices() -> Vec<String> {
+/// An audio input, as offered to the operator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputDevice {
+    /// Stable identifier. cpal documents `DeviceId` as safe to persist, which
+    /// a device *name* is not: a machine here offers twenty inputs all called
+    /// "sof-hda-dsp", and picking one by name would be a coin toss.
+    pub id: String,
+    /// What to show in the picker.
+    pub label: String,
+}
+
+/// Available input devices (best-effort).
+///
+/// Labels that would otherwise be indistinguishable get their identifier
+/// appended, so the picker never offers the same string twice.
+pub fn input_devices() -> Vec<InputDevice> {
     let host = cpal::default_host();
-    match host.input_devices() {
-        Ok(devs) => devs.filter_map(|d| d.name().ok()).collect(),
-        Err(_) => Vec::new(),
+    let Ok(devs) = host.input_devices() else { return Vec::new() };
+    let mut out: Vec<InputDevice> = devs
+        .filter_map(|d| {
+            Some(InputDevice { id: d.id().ok()?.to_string(), label: d.to_string() })
+        })
+        .collect();
+    disambiguate(&mut out);
+    out
+}
+
+/// Make every label distinct by appending the identifier where two would
+/// otherwise read the same.
+///
+/// Only the host prefix is stripped from the identifier: what distinguishes
+/// `alsa:hw:CARD=x,DEV=0` from `alsa:plughw:CARD=x,DEV=0` is the part in the
+/// middle, so trimming to the last colon would leave the labels identical again.
+fn disambiguate(devs: &mut [InputDevice]) {
+    let dupes: Vec<String> = devs
+        .iter()
+        .filter(|a| devs.iter().filter(|b| b.label == a.label).count() > 1)
+        .map(|d| d.label.clone())
+        .collect();
+    for d in devs.iter_mut().filter(|d| dupes.contains(&d.label)) {
+        let tail = d.id.split_once(':').map_or(d.id.as_str(), |(_, rest)| rest);
+        d.label = format!("{} [{}]", d.label.trim().trim_end_matches(','), tail);
     }
 }
 
 impl LiveAudio {
-    /// Start capturing from `name` (by device name) or the default input.
-    pub fn start(name: Option<&str>) -> Result<LiveAudio, String> {
+    /// Start capturing from the device with this id, or the default input.
+    pub fn start(id: Option<&str>) -> Result<LiveAudio, String> {
         let host = cpal::default_host();
-        let device = match name {
-            Some(n) => host
+        let device = match id {
+            Some(want) => host
                 .input_devices()
                 .map_err(|e| e.to_string())?
-                .find(|d| d.name().map(|dn| dn == n).unwrap_or(false))
-                .ok_or_else(|| format!("input device not found: {n}"))?,
+                .find(|d| d.id().map(|i| i.to_string()).as_deref() == Ok(want))
+                .ok_or_else(|| format!("input device not found: {want}"))?,
             None => host
                 .default_input_device()
                 .ok_or_else(|| "no default input device".to_string())?,
         };
-        let device_name = device.name().unwrap_or_else(|_| "?".to_string());
+        let device_id = device.id().map(|i| i.to_string()).unwrap_or_default();
+        let device_name = device.to_string();
         let supported = device.default_input_config().map_err(|e| e.to_string())?;
-        let in_rate = supported.sample_rate().0;
+        let in_rate = supported.sample_rate();
         let channels = supported.channels() as usize;
         let fmt = supported.sample_format();
         let config: cpal::StreamConfig = supported.config();
@@ -213,7 +253,7 @@ impl LiveAudio {
                 let mut rs = Resampler::new(in_rate, channels);
                 let b = buf.clone();
                 device.build_input_stream(
-                    &config,
+                    config,
                     move |data: &[f32], _: &_| {
                         let out = rs.process(data);
                         b.lock().unwrap().append(&out);
@@ -226,7 +266,7 @@ impl LiveAudio {
                 let mut rs = Resampler::new(in_rate, channels);
                 let b = buf.clone();
                 device.build_input_stream(
-                    &config,
+                    config,
                     move |data: &[i16], _: &_| {
                         let f: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                         let out = rs.process(&f);
@@ -240,7 +280,7 @@ impl LiveAudio {
                 let mut rs = Resampler::new(in_rate, channels);
                 let b = buf.clone();
                 device.build_input_stream(
-                    &config,
+                    config,
                     move |data: &[u16], _: &_| {
                         let f: Vec<f32> =
                             data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).collect();
@@ -256,7 +296,7 @@ impl LiveAudio {
         .map_err(|e| e.to_string())?;
 
         stream.play().map_err(|e| e.to_string())?;
-        Ok(LiveAudio { buf, device_name, in_rate, _stream: stream })
+        Ok(LiveAudio { buf, device_id, device_name, in_rate, _stream: stream })
     }
 }
 
@@ -418,4 +458,38 @@ fn shift_times(decodes: Vec<protocol::Decode>, win_start: f64) -> Vec<protocol::
             d
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dev(id: &str, label: &str) -> InputDevice {
+        InputDevice { id: id.to_string(), label: label.to_string() }
+    }
+
+    /// A picker that offers the same string twice is a picker you cannot use.
+    /// Real hardware here presents twenty inputs all called "sof-hda-dsp".
+    #[test]
+    fn duplicate_labels_are_made_distinct() {
+        let mut devs = vec![
+            dev("alsa:hw:CARD=sofhdadsp,DEV=0", "sof-hda-dsp, "),
+            dev("alsa:plughw:CARD=sofhdadsp,DEV=0", "sof-hda-dsp, "),
+            dev("alsa:hw:CARD=sofhdadsp,DEV=6", "sof-hda-dsp, "),
+            dev("alsa:pipewire", "PipeWire Sound Server"),
+        ];
+        disambiguate(&mut devs);
+
+        let mut labels: Vec<&String> = devs.iter().map(|d| &d.label).collect();
+        let n = labels.len();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(labels.len(), n, "labels still collide: {devs:#?}");
+
+        // the one that was already unique is left alone
+        assert_eq!(devs[3].label, "PipeWire Sound Server");
+        // and hw/plughw stay apart, which trimming to the last colon would lose
+        assert!(devs[0].label.contains("hw:CARD"));
+        assert!(devs[1].label.contains("plughw:CARD"));
+    }
 }

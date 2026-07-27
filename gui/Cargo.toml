@@ -25,7 +25,7 @@ ragchew = { path = ".." }
 eframe = { version = "0.35", optional = true, default-features = true, features = [
     "persistence",
 ] }
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.18", optional = true }
 clap = { version = "4", optional = true, features = ["derive"] }
 # Native file dialogs. The default backend wants GTK3 development headers; on a
 # machine without them, `default-features = false, features = ["xdg-portal",
