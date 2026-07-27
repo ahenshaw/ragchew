@@ -593,7 +593,12 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe hands the app a `Ui` and panels nest inside it, so `ui` is
+        // borrowed mutably for most of this function. A cloned handle to the
+        // context — cheap, it is an `Arc` — keeps repaints, the cursor and
+        // texture uploads reachable meanwhile.
+        let ctx = &ui.ctx().clone();
         // ---- LIVE: pull audio into the rolling spectrogram + channels ----
         let mut live = false;
         let mut live_spec: Option<Arc<Spectrogram>> = None;
@@ -659,7 +664,7 @@ impl eframe::App for App {
         let mut open_file: Option<PathBuf> = None;
         let mut demo_request: Option<bool> = None; // Some(weak?)
         let mut go_live = false;
-        egui::TopBottomPanel::top("bar").show(ctx, |ui| {
+        egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open audio file…").clicked() {
@@ -671,20 +676,20 @@ impl eframe::App for App {
                             .add_filter("audio", &["wav"])
                             .set_title("Open a 12 kHz mono WAV")
                             .pick_file();
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Demo band").clicked() {
                         demo_request = Some(false);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Weak-signal band").clicked() {
                         demo_request = Some(true);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Live input").clicked() {
                         go_live = true;
-                        ui.close_menu();
+                        ui.close();
                     }
                     ui.separator();
                     if ui.button("Quit").clicked() {
@@ -795,7 +800,7 @@ impl eframe::App for App {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let spec = match &spec {
                 Some(s) => s.clone(),
                 // Nothing loaded at all is a different state from something
