@@ -365,10 +365,13 @@ impl LiveMode {
         }
     }
 
+    /// Short status for the toolbar. The device name is deliberately left out:
+    /// the picker sitting next to this already shows it, and the bar has one
+    /// line to work with.
     fn device_label(&self) -> String {
         match (&self.err, &self.audio) {
             (Some(e), _) => format!("audio error: {e}"),
-            (None, Some(a)) => format!("● LIVE — {} @ {} Hz", a.device_name, a.in_rate),
+            (None, Some(a)) => format!("● LIVE {:.1} kHz", a.in_rate as f32 / 1000.0),
             _ => "● LIVE".to_string(),
         }
     }
@@ -787,6 +790,48 @@ impl eframe::App for App {
         let mut go_live = false;
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
+                // Settings live behind the hamburger: they are set once and
+                // then left alone, so they do not deserve permanent space on a
+                // bar that has to stay on one line.
+                ui.menu_button("☰", |ui| {
+                    ui.set_min_width(240.0);
+                    ui.style_mut().spacing.slider_width = 150.0;
+                    ui.add(egui::Slider::new(&mut self.text_px, 8.0..=22.0).text("text size"));
+                    ui.add(egui::Slider::new(&mut self.span_s, 10.0..=120.0).text("window (s)"));
+                    ui.add(
+                        egui::Slider::new(&mut self.scroll_secs, 0.0..=2.0).text("scroll (s)"),
+                    );
+                    if !live {
+                        ui.add(egui::Slider::new(&mut self.speed, 1.0..=20.0).text("speed ×"));
+                    }
+                    if live {
+                        ui.separator();
+                        ui.menu_button("Audio input", |ui| {
+                            ui.set_min_width(280.0);
+                            for d in &live_devices {
+                                let on = live_selected.as_ref() == Some(&d.id);
+                                if ui.selectable_label(on, &d.label).clicked() {
+                                    chosen_device = Some(d.id.clone());
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            // ALSA advertises far more PCMs than there are
+                            // devices; the escape hatch matters for whoever
+                            // needs the one that got winnowed out.
+                            if ui.checkbox(&mut show_all, "show every ALSA PCM").changed() {
+                                all_inputs_toggled = true;
+                            }
+                        });
+                    }
+                    ui.separator();
+                    if ui.button("Reset view").clicked() {
+                        self.vp = Viewport { f_lo: self.band.0, f_hi: self.band.1 };
+                        ui.close();
+                    }
+                })
+                .response
+                .on_hover_text("Settings");
                 ui.menu_button("File", |ui| {
                     if ui.button("Open audio file…").clicked() {
                         // Blocks the UI thread while the dialog is up, which is
@@ -819,31 +864,17 @@ impl eframe::App for App {
                 });
                 ui.separator();
                 if live {
+                    // The device itself is chosen from the hamburger; the bar
+                    // only reports that capture is running, and at what rate.
                     ui.strong(&live_label);
-                    ui.separator();
-                    let shown = live_devices
-                        .iter()
-                        .find(|d| Some(&d.id) == live_selected.as_ref())
-                        .map(|d| d.label.clone())
-                        .unwrap_or_else(|| "—".to_string());
-                    egui::ComboBox::from_label("input").selected_text(shown).show_ui(ui, |ui| {
-                        for d in &live_devices {
-                            let on = live_selected.as_ref() == Some(&d.id);
-                            if ui.selectable_label(on, &d.label).clicked() {
-                                chosen_device = Some(d.id.clone());
-                            }
-                        }
-                        ui.separator();
-                        // ALSA advertises far more PCMs than there are devices;
-                        // the escape hatch matters for whoever needs the one
-                        // that got winnowed out.
-                        if ui.checkbox(&mut show_all, "show every ALSA PCM").changed() {
-                            all_inputs_toggled = true;
-                        }
-                    });
                 } else {
                     ui.add_enabled_ui(self.frames_ready, |ui| {
-                        if ui.button(if self.playing { "⏸ pause" } else { "▶ play" }).clicked() {
+                        // Fixed width: "⏸ pause" and "▶ play" do not measure the
+                        // same, and a button that resizes as you click it drags
+                        // the whole bar left and right with it.
+                        let h = ui.spacing().interact_size.y;
+                        let label = if self.playing { "⏸ pause" } else { "▶ play" };
+                        if ui.add_sized([78.0, h], egui::Button::new(label)).clicked() {
                             if self.t_now >= self.duration_s {
                                 self.t_now = 0.0;
                             }
@@ -854,25 +885,7 @@ impl eframe::App for App {
                             self.playing = true;
                         }
                     });
-                    ui.add(egui::Slider::new(&mut self.speed, 1.0..=20.0).text("speed×"));
-                    ui.separator();
-                    ui.style_mut().spacing.slider_width = 240.0;
-                    if ui
-                        .add(egui::Slider::new(&mut self.t_now, 0.0..=self.duration_s.max(0.001)).text("t (s)"))
-                        .dragged()
-                    {
-                        self.playing = false;
-                    }
                 }
-            });
-            ui.horizontal(|ui| {
-                ui.label(format!("view {:.0}–{:.0} Hz", self.vp.f_lo, self.vp.f_hi));
-                if ui.button("reset view").clicked() {
-                    self.vp = Viewport { f_lo: self.band.0, f_hi: self.band.1 };
-                }
-                ui.add(egui::Slider::new(&mut self.text_px, 8.0..=22.0).text("text"));
-                ui.add(egui::Slider::new(&mut self.span_s, 10.0..=120.0).text("window s"));
-                ui.add(egui::Slider::new(&mut self.scroll_secs, 0.0..=2.0).text("scroll s"));
                 ui.separator();
                 if !live && !self.frames_ready {
                     ui.label("⏳ decoding…");
@@ -891,11 +904,23 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 modes_changed = self.modes_menu(ui);
-                ui.separator();
-                ui.weak(
-                    "scroll: pan · pinch or ctrl+scroll: zoom · shift+scroll: text · \
-                     drag: pan · right edge: whole band",
-                );
+
+                // Last on the bar, deliberately. Its readout gains and loses
+                // digits as playback runs, and anything to its right would be
+                // shoved back and forth for the whole recording.
+                if !live {
+                    ui.separator();
+                    ui.style_mut().spacing.slider_width = 170.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.t_now, 0.0..=self.duration_s.max(0.001))
+                                .text("s"),
+                        )
+                        .dragged()
+                    {
+                        self.playing = false;
+                    }
+                }
             });
         });
 

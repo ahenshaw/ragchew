@@ -60,12 +60,16 @@ further: 4/125 at a leisurely 0.98 char/s copies at −12 dB while 8/500, three
 times faster, is already breaking up. The FEC does not degrade gently either —
 the window between clean copy and nothing at all is about a decibel wide.
 
-The mode menus in the toolbar control what is scanned for; each protocol's
-channels are coloured by mode. Scroll to pan, pinch (or ctrl+scroll) to zoom,
-shift+scroll to size the text. The frequency axis — scale and band position —
-is overlaid on the waterfall's right edge; drag the bar there to move around the
-whole band whatever the zoom. Drag the gutter between the text and the waterfall
-to give either side more room.
+The toolbar is one line: **☰** holds the display settings, the audio input and
+*Reset view*; **File** opens a recording or switches source; the mode menus on
+the right control what is scanned for, and each protocol's channels are coloured
+by mode.
+
+Everything else is done on the canvas. Scroll to pan, pinch (or ctrl+scroll) to
+zoom, shift+scroll to size the text. The frequency axis — scale and band
+position — is overlaid on the waterfall's right edge; drag the bar there to move
+around the whole band whatever the zoom. Drag the gutter between the text and
+the waterfall to give either side more room.
 
 Headless, without the windowing/audio stack — renders straight to PNG:
 
