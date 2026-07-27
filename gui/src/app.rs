@@ -6,8 +6,9 @@
 //! validator (`scene`, `layout`, `waterfall`).
 //!
 //! Loading is off the UI thread: the window opens immediately, the waterfall
-//! appears as soon as the (fast) spectrogram is ready, and decoded text streams
-//! in once the (slower) full-band decode finishes.
+//! appears and starts playing as soon as the (fast) spectrogram is ready, and
+//! decoded text streams in behind it as the (much slower) scan reports mode by
+//! mode — one thread each, so the wait is the slowest mode rather than the sum.
 //!
 //! Playback: decodes are *revealed* as a simulated clock advances (each appears
 //! when its audio would have finished), so text streams into channels in the
@@ -385,7 +386,9 @@ struct App {
     spec: Option<Arc<Spectrogram>>,
     norm: (f32, f32),
     frames: Vec<Frame>,
-    frames_ready: bool,
+    /// Scan jobs still to report. The file scan is split by mode across
+    /// threads, so text arrives in batches while playback is already running.
+    pending_scans: usize,
     spec_rx: Receiver<(Arc<Spectrogram>, (f32, f32))>,
     frames_rx: Receiver<Vec<Frame>>,
 
@@ -446,7 +449,7 @@ impl App {
             spec: None,
             norm: (0.0, 1.0),
             frames: Vec::new(),
-            frames_ready: false,
+            pending_scans: 0,
             spec_rx,
             frames_rx,
             t_now: 0.0,
@@ -518,7 +521,7 @@ impl App {
         self.samples = Arc::new(Vec::new());
         self.spec = None;
         self.frames = Vec::new();
-        self.frames_ready = true;
+        self.pending_scans = 0;
         self.status = None;
         self.source = "live input".to_string();
         self.live = Some(LiveMode::start(
@@ -580,26 +583,38 @@ impl App {
     }
 
     /// (Re)decode the loaded file with the currently enabled modes.
+    ///
+    /// Scanning a minute of band costs seconds per mode, which is far longer
+    /// than the operator is willing to look at a blank pane — so the scan is
+    /// split one job per mode and each job's text is shown the moment it lands,
+    /// while playback runs off the (much faster) spectrogram. Any batch that
+    /// arrives after the clock has already passed it simply appears in place.
     fn rescan(&mut self) {
-        if self.samples.is_empty() {
-            self.frames_ready = true; // nothing to wait for
-            return;
-        }
         let (frames_tx, frames_rx) = channel();
         self.frames_rx = frames_rx;
         self.frames = Vec::new();
-        self.frames_ready = false;
-        self.playing = false;
-        let samples = self.samples.clone();
+        self.pending_scans = 0;
+        if self.samples.is_empty() {
+            return;
+        }
+        // One thread per mode. Every mode's scan is independent of every other —
+        // nothing arbitrates between them afterwards, a signal is kept out of a
+        // neighbouring mode's results by that mode's own threshold — so this
+        // reports exactly what one pass over all of them would, in about the
+        // time of the slowest single mode.
         let modes = self.enabled_modes();
-        thread::spawn(move || {
-            let mut frames: Vec<Frame> = protocol::decode_all(&samples, 300.0, 2600.0, &modes)
-                .into_iter()
-                .map(|d| Frame { reveal_s: d.time_s + d.mode.chunk_secs(), decode: d })
-                .collect();
-            frames.sort_by(|a, b| a.reveal_s.partial_cmp(&b.reveal_s).unwrap());
-            let _ = frames_tx.send(frames);
-        });
+        self.pending_scans = modes.len();
+        for m in modes {
+            let samples = self.samples.clone();
+            let tx = frames_tx.clone();
+            thread::spawn(move || {
+                let frames: Vec<Frame> = protocol::decode_all(&samples, 300.0, 2600.0, &[m])
+                    .into_iter()
+                    .map(|d| Frame { reveal_s: d.time_s + d.mode.chunk_secs(), decode: d })
+                    .collect();
+                let _ = tx.send(frames);
+            });
+        }
     }
 
     /// The mode legend, doubling as the on/off control for what is scanned.
@@ -751,18 +766,19 @@ impl eframe::App for App {
                 if let Ok((s, n)) = self.spec_rx.try_recv() {
                     self.spec = Some(s);
                     self.norm = n;
-                    // hold at t=0 until decode is done
-                }
-            }
-            if !self.frames_ready {
-                if let Ok(f) = self.frames_rx.try_recv() {
-                    self.frames = f;
-                    self.frames_ready = true;
+                    // The spectrogram is the whole picture as far as the
+                    // waterfall is concerned, so play from the top as soon as
+                    // it lands rather than sitting on a blank pane until the
+                    // scan — an order of magnitude slower — has finished.
                     self.t_now = 0.0;
-                    self.playing = true; // play cleanly from the start
+                    self.playing = true;
                 }
             }
-            if self.spec.is_none() || !self.frames_ready {
+            while let Ok(f) = self.frames_rx.try_recv() {
+                self.frames.extend(f);
+                self.pending_scans = self.pending_scans.saturating_sub(1);
+            }
+            if self.spec.is_none() || self.pending_scans > 0 {
                 ctx.request_repaint();
             }
             if self.playing {
@@ -868,7 +884,9 @@ impl eframe::App for App {
                     // only reports that capture is running, and at what rate.
                     ui.strong(&live_label);
                 } else {
-                    ui.add_enabled_ui(self.frames_ready, |ui| {
+                    // Playable as soon as there is a waterfall to play; the scan
+                    // catches up on its own.
+                    ui.add_enabled_ui(self.spec.is_some(), |ui| {
                         // Fixed width: "⏸ pause" and "▶ play" do not measure the
                         // same, and a button that resizes as you click it drags
                         // the whole bar left and right with it.
@@ -893,27 +911,22 @@ impl eframe::App for App {
                     // is sized once for the widest thing it will ever hold.
                     // Measured rather than guessed, so it survives text scaling.
                     let font = egui::TextStyle::Body.resolve(ui.style());
-                    let width = ["⏳ decoding…", "8888 channels"]
-                        .iter()
-                        .map(|s| {
-                            ui.painter()
-                                .layout_no_wrap(
-                                    (*s).to_owned(),
-                                    font.clone(),
-                                    Color32::PLACEHOLDER,
-                                )
-                                .size()
-                                .x
-                        })
-                        .fold(0.0f32, f32::max);
+                    let width = ui
+                        .painter()
+                        .layout_no_wrap("⏳ 8888 channels".to_owned(), font, Color32::PLACEHOLDER)
+                        .size()
+                        .x;
+                    let n = channels.channels().len();
                     let text = if !live && self.samples.is_empty() {
                         // Nothing loaded is not the same state as something
                         // still decoding: the slot stays reserved but empty.
                         String::new()
-                    } else if !live && !self.frames_ready {
-                        "⏳ decoding…".to_owned()
+                    } else if !live && self.pending_scans > 0 {
+                        // Counting while the scan is still running: the count is
+                        // real, it is just not final yet.
+                        format!("⏳ {n} channels")
                     } else {
-                        format!("{} channels", channels.channels().len())
+                        format!("{n} channels")
                     };
                     ui.allocate_ui_with_layout(
                         egui::vec2(width, ui.spacing().interact_size.y),
