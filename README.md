@@ -30,11 +30,13 @@ Run it with no arguments and it opens empty, with everything reachable from the
 **File** menu: *Open audio file…* for a native file picker, or straight to the
 demo bands or live input. `--help` lists the lot.
 
-Window size and position, the panel split, text size, playback and waterfall
-settings, the modes being scanned and the chosen audio input all persist between
-runs (`~/.local/share/ragchew/app.ron` on Linux). The viewport is deliberately
-not saved — that is navigation, not preference, and reopening zoomed into 50 Hz
-of nothing helps nobody.
+Window size and position, the panel splits, text size, playback and waterfall
+settings, the modes being scanned, the chosen audio input and output, and where
+in the band the view is pointed all persist between runs
+(`~/.local/share/ragchew/app.ron` on Linux). A saved view is fitted to the band
+on the way in, so a settings file from another build — or one edited by hand —
+cannot reopen the app zoomed into 50 Hz of nothing. Conversations are not saved:
+a log is a record, and writing one is a logging program's job.
 
 `--weak` is the one that shows what Olivia is *for*: five stations across four
 modes, every one of them **below the noise floor**, and several stacked inside
@@ -61,15 +63,34 @@ times faster, is already breaking up. The FEC does not degrade gently either —
 the window between clean copy and nothing at all is about a decibel wide.
 
 The toolbar is one line: **☰** holds the display settings, the audio input and
-*Reset view*; **File** opens a recording or switches source; the mode menus on
-the right control what is scanned for, and each protocol's channels are coloured
-by mode.
+output and *Reset view*; **File** opens a recording or switches source; the mode
+menus on the right control what is scanned for, and each protocol's channels are
+coloured by mode.
 
 Everything else is done on the canvas. Scroll to pan, pinch (or ctrl+scroll) to
 zoom, shift+scroll to size the text. The frequency axis — scale and band
 position — is overlaid on the waterfall's right edge; drag the bar there to move
 around the whole band whatever the zoom. Drag the gutter between the text and
 the waterfall to give either side more room.
+
+## Working a station
+
+Click a station's text and it opens as a **QSO** in the panel on the left, one
+tab per conversation, labelled with the other operator's call as soon as the
+text says what it is. A tab carries the usual information — call, name, QTH,
+grid, signal reports — over a log of the exchange, each line stamped with how
+far into the QSO it landed and marked `RX` or `TX`. The log fills itself: a QSO
+follows the channel it was opened on, so whatever that station decodes next
+appears whether or not its tab is the one on top. **＋** opens a blank tab for a
+station not heard yet.
+
+Under the log is a reply box, one per QSO, so you can leave a half-written
+transmission in one tab and come back to it. **Send** modulates what is in it at
+the QSO's carrier and mode and plays it out of the chosen audio output. Olivia
+goes immediately, being continuous; JS8 waits for the next boundary of its
+submode's UTC cycle, and a message too long for one frame goes out as several,
+one per cycle. There is no PTT and no CAT control here — the audio goes to the
+device you point it at, which is what a rig on a USB codec (or VOX) wants.
 
 Headless, without the windowing/audio stack — renders straight to PNG:
 
@@ -181,9 +202,13 @@ separates the two sides of the QSO.
 | `olivia::fec` | Walsh spreading, scrambling, interleaving, soft block decode |
 | `olivia::modem` | Overlapped MFSK synthesis; tone demod, frequency/timing search |
 
-The GUI (`ragchew-gui`) keeps its pure rendering and layout pieces (`waterfall`,
-`layout`, `scene`, `colormap`, `channels`) free of any windowing dependency, so
-they are unit-tested and validated by rendering to PNG without a display.
+The GUI (`ragchew-gui`) keeps its pure rendering, layout and conversation pieces
+(`waterfall`, `layout`, `scene`, `colormap`, `channels`, `qso`) free of any
+windowing dependency, so they are unit-tested and validated by rendering to PNG
+without a display. `audio` and `tx` are the sound card either way round, and the
+whole interface lays itself out headlessly in a test — egui is pure layout until
+something rasterises it — so the panels are exercised in CI even though the app
+cannot run there.
 
 ## Performance
 

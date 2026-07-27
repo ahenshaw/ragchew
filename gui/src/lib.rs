@@ -8,6 +8,7 @@ pub mod channels;
 pub mod colormap;
 pub mod demo;
 pub mod layout;
+pub mod qso;
 pub mod scene;
 pub mod waterfall;
 
@@ -15,3 +16,5 @@ pub mod waterfall;
 pub mod app;
 #[cfg(feature = "desktop")]
 pub mod audio;
+#[cfg(feature = "desktop")]
+pub mod tx;

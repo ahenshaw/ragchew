@@ -29,7 +29,9 @@ use ragchew::{wav, Spectrogram, SAMPLE_RATE};
 
 use crate::channels::{Channel, ChannelSet};
 use crate::layout;
+use crate::qso::{Dir, QsoSet};
 use crate::scene::{self, Geometry};
+use crate::tx::{self, Tx};
 use crate::waterfall::{self, Viewport};
 
 const HIGHLIGHT_SECS: f64 = 2.5;
@@ -52,6 +54,10 @@ const MIN_SPAN_HZ: f64 = 50.0;
 /// Neither panel may be dragged smaller than this.
 const MIN_WATERFALL_W: f32 = 80.0;
 const MIN_TEXT_W: f32 = 160.0;
+
+/// Narrowest the QSO panel goes. Below this the info fields are unreadable and
+/// the log wraps every other word.
+const MIN_QSO_W: f32 = 240.0;
 
 /// Clamp a wanted waterfall width so both panels stay usable in a window this
 /// wide.
@@ -195,7 +201,12 @@ struct Settings {
     speed: f32,
     modes: Vec<String>,
     input_device: Option<String>,
+    output_device: Option<String>,
     show_all_inputs: bool,
+    /// Width of the QSO panel. The conversations themselves are not kept: a log
+    /// is a record, and writing one belongs to a logging program, not to a
+    /// monitor that would be silently reopening half-finished contacts.
+    qso_w: f32,
     /// Frequency bounds of the waterfall view, low then high. `None` — which is
     /// also what a settings file written before this existed deserialises to —
     /// means the whole band.
@@ -212,7 +223,9 @@ impl Default for Settings {
             speed: 8.0,
             modes: protocol::default_modes().iter().map(|m| m.name()).collect(),
             input_device: None,
+            output_device: None,
             show_all_inputs: false,
+            qso_w: 340.0,
             view_hz: None,
         }
     }
@@ -226,6 +239,21 @@ fn tick_step(span: f64) -> f64 {
     const STEPS: [f64; 9] = [5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0];
     let target = span / 6.0;
     STEPS.iter().copied().find(|&s| s >= target).unwrap_or(*STEPS.last().unwrap())
+}
+
+/// Audio-clock seconds as `m:ss`.
+///
+/// Minutes are not wrapped at an hour: this counts from the start of a file or
+/// of a capture, and "83:20" is a clearer answer to "how far in?" than "1:23:20"
+/// is, at the lengths anyone actually monitors for.
+fn clock(s: f64) -> String {
+    let s = s.max(0.0);
+    format!("{}:{:02}", (s / 60.0) as u64, (s % 60.0) as u64)
+}
+
+/// The log's offset column: how long into the QSO a line landed.
+fn offset(s: f64) -> String {
+    format!("+{:>6}", clock(s))
 }
 
 /// A decode plus the playback time at which it should appear.
@@ -250,7 +278,7 @@ struct LiveMode {
     norm: (f32, f32),
     cols_since_norm: usize,
     t_now: f64,
-    devices: Vec<crate::audio::InputDevice>,
+    devices: Vec<crate::audio::AudioDevice>,
     selected: Option<String>, // current device name
 }
 
@@ -432,8 +460,18 @@ struct App {
     /// Identifier of the audio input to prefer when going live, remembered
     /// across restarts.
     preferred_input: Option<String>,
-    /// Offer every ALSA PCM in the input picker, not just the winnowed set.
+    /// Offer every ALSA PCM in the device pickers, not just the winnowed set.
     show_all_inputs: bool,
+
+    /// Open conversations, and the width of the panel they live in.
+    qsos: QsoSet,
+    qso_w: f32,
+    /// Where transmissions go. Opened on the first send rather than at startup,
+    /// so a monitor that is never used to transmit never takes an output device
+    /// off anything else.
+    tx: Option<Tx>,
+    /// Identifier of the output to transmit on, remembered across restarts.
+    preferred_output: Option<String>,
 
     /// True while a drag that began on the band bar is in progress, and the
     /// frequency offset between where it was grabbed and the view centre — so
@@ -481,6 +519,10 @@ impl App {
             status: None,
             preferred_input: None,
             show_all_inputs: false,
+            qsos: QsoSet::new(),
+            qso_w: 340.0,
+            tx: None,
+            preferred_output: None,
             bar_drag: false,
             bar_grab_hz: 0.0,
             split_drag: false,
@@ -499,7 +541,9 @@ impl App {
             speed: self.speed,
             modes: self.enabled_modes().iter().map(|m| m.name()).collect(),
             input_device: self.preferred_input.clone(),
+            output_device: self.preferred_output.clone(),
             show_all_inputs: self.show_all_inputs,
+            qso_w: self.qso_w,
             view_hz: Some((self.vp.f_lo, self.vp.f_hi)),
         }
     }
@@ -512,7 +556,9 @@ impl App {
         self.scroll_secs = s.scroll_secs.clamp(0.0, 2.0);
         self.speed = s.speed.clamp(1.0, 20.0);
         self.preferred_input = s.input_device;
+        self.preferred_output = s.output_device;
         self.show_all_inputs = s.show_all_inputs;
+        self.qso_w = s.qso_w.clamp(MIN_QSO_W, 900.0);
         let (lo, hi) = s.view_hz.unwrap_or(self.band);
         self.set_view(lo, hi);
 
@@ -671,6 +717,226 @@ impl App {
         changed
     }
 
+    /// The QSO panel: a tab per conversation, and for the one on top an info
+    /// block, the log, a reply being composed, and the button that sends it.
+    ///
+    /// `now_s` is the audio clock the log's offsets are measured against — the
+    /// playback clock for a file, capture time when live.
+    fn qso_panel(&mut self, ui: &mut egui::Ui, now_s: f64) {
+        // Tab strip. A conversation is opened by clicking a station in the
+        // waterfall's text panel; the button is for one that has not been heard
+        // yet — calling first, or logging a contact made elsewhere.
+        ui.horizontal_wrapped(|ui| {
+            let mut want_active = self.qsos.active();
+            let mut close: Option<usize> = None;
+            for (i, q) in self.qsos.qsos().iter().enumerate() {
+                let on = i == self.qsos.active();
+                let label = egui::RichText::new(q.label()).color(mode_color(q.mode));
+                if ui.selectable_label(on, label).clicked() {
+                    want_active = i;
+                }
+                if on && ui.small_button("✕").on_hover_text("close this QSO").clicked() {
+                    close = Some(i);
+                }
+            }
+            if ui.button("＋").on_hover_text("new QSO").clicked() {
+                let hz = (self.vp.f_lo + self.vp.f_hi) / 2.0;
+                let mode = self.enabled_modes().first().copied().unwrap_or(ModeId::Js8(
+                    ragchew::js8::Mode::Normal,
+                ));
+                self.qsos.open_blank(hz, mode, now_s);
+                want_active = self.qsos.len() - 1;
+            }
+            self.qsos.set_active(want_active);
+            if let Some(i) = close {
+                self.qsos.close(i);
+            }
+        });
+        ui.separator();
+
+        if self.qsos.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No QSOs.\n\nClick a station's text to start one.");
+            });
+            return;
+        }
+
+        // Everything below is the active QSO. The carrier and mode of a QSO
+        // that is following a channel are that channel's, and are shown rather
+        // than offered: they are measurements, not choices. A QSO opened by
+        // hand has nothing to measure, so there they are the operator's to set.
+        let modes = self.enabled_modes();
+        let busy = self.tx.as_ref().map_or(0.0, |t| t.busy_for());
+        let Some(q) = self.qsos.active_qso_mut() else { return };
+        let bound = q.channel.is_some();
+
+        // Every widget below is scoped to this QSO's id, so each tab keeps its
+        // own text cursor and its own scroll position in the log. Without it
+        // egui identifies the widgets by where they sit in the layout, and all
+        // the tabs — being the same layout — would share one set.
+        let (send, abort) = ui.push_id(q.id, |ui| Self::qso_body(ui, q, &modes, bound, busy, now_s)).inner;
+
+        if abort {
+            if let Some(t) = self.tx.as_mut() {
+                t.abort();
+            }
+        }
+        if send {
+            self.send_active(now_s);
+        }
+    }
+
+    /// The active QSO's info, log, reply box and send button. Returns whether
+    /// the operator asked to send, and whether they asked to abort.
+    fn qso_body(
+        ui: &mut egui::Ui,
+        q: &mut crate::qso::Qso,
+        modes: &[ModeId],
+        bound: bool,
+        busy: f64,
+        now_s: f64,
+    ) -> (bool, bool) {
+        let (mut send, mut abort) = (false, false);
+        egui::Grid::new("qso_info").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            let field = |ui: &mut egui::Ui, label: &str, v: &mut String| {
+                ui.label(label);
+                ui.add(egui::TextEdit::singleline(v).desired_width(f32::INFINITY));
+                ui.end_row();
+            };
+            field(ui, "Call", &mut q.call);
+            field(ui, "Name", &mut q.name);
+            field(ui, "QTH", &mut q.qth);
+            field(ui, "Grid", &mut q.grid);
+            ui.label("RST");
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut q.rst_sent).desired_width(44.0))
+                    .on_hover_text("sent");
+                ui.label("/");
+                ui.add(egui::TextEdit::singleline(&mut q.rst_rcvd).desired_width(44.0))
+                    .on_hover_text("received");
+            });
+            ui.end_row();
+
+            ui.label("Signal");
+            if bound {
+                ui.label(format!(
+                    "{:.0} Hz  {:+.1} drift  ×{:.1}",
+                    q.hz,
+                    q.drift_hz,
+                    q.quality.max(0.0)
+                ))
+                .on_hover_text(
+                    "carrier, how far it has wandered since first heard, and the last \
+                     decode's confidence in multiples of the mode's noise floor",
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut q.hz).speed(1.0).range(0.0..=4000.0))
+                        .on_hover_text("carrier to transmit on");
+                    ui.label("Hz");
+                });
+            }
+            ui.end_row();
+
+            ui.label("Mode");
+            if bound {
+                ui.colored_label(mode_color(q.mode), q.mode.name());
+            } else {
+                egui::ComboBox::from_id_salt("qso_mode")
+                    .selected_text(q.mode.name())
+                    .show_ui(ui, |ui| {
+                        for m in modes {
+                            ui.selectable_value(&mut q.mode, *m, m.name());
+                        }
+                    });
+            }
+            ui.end_row();
+
+            ui.label("Started");
+            ui.label(format!("{}  ({} elapsed)", clock(q.started_s), clock(q.elapsed_s(now_s))));
+            ui.end_row();
+        });
+
+        ui.separator();
+
+        // The log takes whatever height is left over once the reply box and the
+        // send button have had theirs, so growing the window grows the part
+        // worth reading rather than the part being typed into.
+        let reserved = 96.0;
+        let log_h = (ui.available_height() - reserved).max(60.0);
+        egui::ScrollArea::vertical().stick_to_bottom(true).max_height(log_h).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            for e in &q.log {
+                let (color, tag) = match e.dir {
+                    Dir::Rx => (mode_color(q.mode), Dir::Rx.tag()),
+                    Dir::Tx => (Color32::from_gray(210), Dir::Tx.tag()),
+                };
+                ui.horizontal_top(|ui| {
+                    ui.monospace(offset(e.at_s - q.started_s));
+                    ui.colored_label(color, egui::RichText::new(tag).monospace().strong());
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&e.text).monospace().color(color))
+                            .wrap(),
+                    );
+                });
+            }
+        });
+
+        ui.separator();
+        ui.add(
+            egui::TextEdit::multiline(&mut q.draft)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("reply…"),
+        );
+        ui.horizontal(|ui| {
+            let ready = !q.draft.trim().is_empty();
+            send = ui
+                .add_enabled(ready && busy <= 0.0, egui::Button::new("Send"))
+                .on_hover_text(match q.mode.period_s() {
+                    Some(p) => format!("goes out on the next {p} s cycle"),
+                    None => "goes out immediately".to_string(),
+                })
+                .clicked();
+            if busy > 0.0 {
+                ui.colored_label(Color32::from_rgb(255, 190, 120), format!("● TX {busy:.0} s"));
+                abort = ui.small_button("abort").clicked();
+            }
+        });
+
+        (send, abort)
+    }
+
+    /// Modulate the active QSO's draft and put it on the air.
+    ///
+    /// The output device is opened here rather than at startup, so the failure
+    /// — no device, or one that will not take the format — arrives attached to
+    /// the thing the operator just asked for instead of as a mystery at launch.
+    fn send_active(&mut self, now_s: f64) {
+        if self.tx.is_none() {
+            match Tx::start(self.preferred_output.as_deref()) {
+                Ok(t) => self.tx = Some(t),
+                Err(e) => {
+                    self.status = Some(format!("cannot transmit: {e}"));
+                    return;
+                }
+            }
+        }
+        let Some(q) = self.qsos.active_qso_mut() else { return };
+        let text = q.draft.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let samples = tx::modulate(&text, q.hz, q.mode);
+        let at = tx::next_start(q.mode);
+        q.draft.clear();
+        q.push_tx(&text, now_s);
+        if let Some(t) = self.tx.as_mut() {
+            t.send(samples, at);
+        }
+        self.status = None;
+    }
+
     fn channels_now(&self) -> ChannelSet {
         ChannelSet::from_decodes(
             self.frames
@@ -766,6 +1032,17 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
+    }
+}
+
+impl App {
+    /// A frame of the whole interface.
+    ///
+    /// Split out of [`eframe::App::ui`] because nothing here needs the
+    /// `eframe::Frame` — and an `eframe::Frame` cannot be built outside eframe,
+    /// so a test that wanted to lay the app out headlessly could not call it.
+    fn draw(&mut self, ui: &mut egui::Ui) {
         // eframe hands the app a `Ui` and panels nest inside it, so `ui` is
         // borrowed mutably for most of this function. A cloned handle to the
         // context — cheap, it is an `Arc` — keeps repaints, the cursor and
@@ -778,7 +1055,7 @@ impl eframe::App for App {
         let mut live_t = 0.0;
         let mut live_norm = self.norm;
         let mut live_label = String::new();
-        let mut live_devices: Vec<crate::audio::InputDevice> = Vec::new();
+        let mut live_devices: Vec<crate::audio::AudioDevice> = Vec::new();
         let mut show_all = self.show_all_inputs;
         let mut all_inputs_toggled = false;
         let mut live_selected: Option<String> = None;
@@ -827,6 +1104,13 @@ impl eframe::App for App {
             }
         }
 
+        // A transmission counts itself down in the QSO panel. A paused file view
+        // is otherwise repainted only when something is clicked, which would
+        // leave that readout frozen at whatever it said when the send happened.
+        if self.tx.as_ref().is_some_and(|t| t.busy_for() > 0.0) {
+            ctx.request_repaint();
+        }
+
         if live {
             self.norm = live_norm;
         }
@@ -835,6 +1119,7 @@ impl eframe::App for App {
         let t_now = if live { live_t } else { self.t_now };
 
         let mut chosen_device: Option<String> = None;
+        let mut chosen_output: Option<Option<String>> = None; // Some(None) = default
         let mut modes_changed = false;
         let mut open_file: Option<PathBuf> = None;
         let mut demo_request: Option<bool> = None; // Some(weak?)
@@ -875,6 +1160,30 @@ impl eframe::App for App {
                             }
                         });
                     }
+                    // The output is where transmissions go — the rig's codec,
+                    // for anyone doing this for real — so it is offered whether
+                    // or not the app is listening to a live input.
+                    ui.separator();
+                    ui.menu_button("Audio output", |ui| {
+                        ui.set_min_width(280.0);
+                        let cur = self.tx.as_ref().map(|t| t.device_name.clone());
+                        if ui.selectable_label(self.preferred_output.is_none(), "default").clicked()
+                        {
+                            chosen_output = Some(None);
+                            ui.close();
+                        }
+                        for d in crate::audio::output_devices(show_all) {
+                            let on = self.preferred_output.as_ref() == Some(&d.id);
+                            if ui.selectable_label(on, &d.label).clicked() {
+                                chosen_output = Some(Some(d.id.clone()));
+                                ui.close();
+                            }
+                        }
+                        if let Some(name) = cur {
+                            ui.separator();
+                            ui.weak(format!("transmitting on {name}"));
+                        }
+                    });
                     ui.separator();
                     if ui.button("Reset view").clicked() {
                         self.vp = Viewport { f_lo: self.band.0, f_hi: self.band.1 };
@@ -1019,6 +1328,17 @@ impl eframe::App for App {
             self.go_live();
         }
 
+        // A different output takes effect on the next send: dropping the stream
+        // here would cut off a transmission in progress.
+        if let Some(id) = chosen_output {
+            if id != self.preferred_output {
+                self.preferred_output = id;
+                if self.tx.as_ref().is_none_or(|t| t.busy_for() <= 0.0) {
+                    self.tx = None;
+                }
+            }
+        }
+
         // switch input device if the user picked a different one
         if let Some(name) = chosen_device {
             if live_selected.as_deref() != Some(name.as_str()) {
@@ -1039,6 +1359,24 @@ impl eframe::App for App {
             }
         }
 
+        // Conversations sit to the left of the panorama, before the central
+        // panel claims what is left. New text reaches them here, so a QSO logs
+        // what its station said whether or not its tab is the one on top.
+        self.qsos.absorb(&channels);
+        let panel = egui::Panel::left("qsos")
+            .resizable(true)
+            .default_size(self.qso_w)
+            .min_size(MIN_QSO_W)
+            .show(ui, |ui| self.qso_panel(ui, t_now));
+        // The panel's own rect, not its contents': the contents are inset by
+        // the frame margin, and feeding that back as next launch's width would
+        // shave a few pixels off the panel every time the app was restarted.
+        self.qso_w = panel.response.rect.width().max(MIN_QSO_W);
+
+        // Clicking a station's text opens its conversation. The click is
+        // handled after the panel rather than inside it, where `self` is
+        // already borrowed for the drawing.
+        let mut open_qso: Option<Channel> = None;
         egui::CentralPanel::default().show(ui, |ui| {
             let spec = match &spec {
                 Some(s) => s.clone(),
@@ -1288,7 +1626,9 @@ impl eframe::App for App {
                     to_screen(0.0, y_row - line_h / 2.0),
                     to_screen(g.strip_x0(), y_row + line_h / 2.0),
                 );
-                ui.interact(row, ui.id().with(("channel", ch.id)), egui::Sense::hover())
+                let resp = ui
+                    .interact(row, ui.id().with(("channel", ch.id)), egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .on_hover_ui(|ui| {
                         ui.colored_label(color, ch.mode.name());
                         ui.label(format!(
@@ -1310,7 +1650,11 @@ impl eframe::App for App {
                             if ch.chunks == 1 { "" } else { "s" },
                             (ch.last_heard_s - ch.first_heard_s) + ch.mode.chunk_secs()
                         ));
+                        ui.weak("click to open a QSO");
                     });
+                if resp.clicked() {
+                    open_qso = Some((*ch).clone());
+                }
             }
 
             // The whole frequency axis lives on the right-hand edge of the
@@ -1365,6 +1709,10 @@ impl eframe::App for App {
                 hz += step;
             }
         });
+
+        if let Some(ch) = open_qso {
+            self.qsos.open_for_channel(&ch);
+        }
     }
 }
 
@@ -1412,6 +1760,8 @@ mod tests {
         app.span_s = 90.0;
         app.speed = 3.0;
         app.preferred_input = Some("USB Audio CODEC".to_string());
+        app.preferred_output = Some("alsa:plughw:CARD=Rig,DEV=0".to_string());
+        app.qso_w = 380.0;
         app.set_view(1200.0, 1400.0);
         for (m, on) in app.modes.iter_mut() {
             *on = m.protocol() == Protocol::Olivia;
@@ -1426,6 +1776,8 @@ mod tests {
         assert_eq!(restored.span_s, 90.0);
         assert_eq!(restored.speed, 3.0);
         assert_eq!(restored.preferred_input.as_deref(), Some("USB Audio CODEC"));
+        assert_eq!(restored.preferred_output.as_deref(), Some("alsa:plughw:CARD=Rig,DEV=0"));
+        assert_eq!(restored.qso_w, 380.0);
         assert_eq!((restored.vp.f_lo, restored.vp.f_hi), (1200.0, 1400.0));
         assert_eq!(restored.enabled_modes(), app.enabled_modes());
         assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
@@ -1489,6 +1841,86 @@ mod tests {
         assert!((8.0..=22.0).contains(&app.text_px), "text_px {}", app.text_px);
         assert!((10.0..=120.0).contains(&app.span_s), "span_s {}", app.span_s);
         assert!((1.0..=20.0).contains(&app.speed), "speed {}", app.speed);
+    }
+
+    /// Lay the whole interface out, QSO panel and all, with no window and no
+    /// GPU behind it.
+    ///
+    /// egui is pure layout until something rasterises it, so this runs in CI
+    /// where the app itself cannot. It is a smoke test, not a screenshot: what
+    /// it catches is a panic, a bad rect, or a widget id clash in a panel that
+    /// otherwise only gets exercised by someone sitting in front of it.
+    fn lay_out(app: &mut App) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        // `run_ui` hands the callback a `Ui` covering the whole window, which
+        // is exactly what eframe gives `App::ui`.
+        ctx.run_ui(input, |ui| app.draw(ui))
+    }
+
+    /// A band with two stations in it, revealed at `t`.
+    fn app_with_traffic(t: f64) -> App {
+        let mut app = App::base((0.0, 4000.0));
+        let d = |hz: f64, at: f64, text: &str| protocol::Decode {
+            mode: ModeId::Js8(ragchew::js8::Mode::Normal),
+            hz,
+            time_s: at,
+            quality: 4.2,
+            text: text.to_string(),
+        };
+        app.frames = [
+            d(1000.0, 1.0, "CQ CQ DE K2N "),
+            d(1000.0, 16.0, "FN20 5W "),
+            d(2000.0, 3.0, "DE VE3XYZ "),
+        ]
+        .into_iter()
+        .map(|d| Frame { reveal_s: d.time_s + d.mode.chunk_secs(), decode: d })
+        .collect();
+        app.duration_s = 60.0;
+        app.t_now = t;
+        app.samples = Arc::new(vec![0.0; 12_000]);
+        app
+    }
+
+    /// The interface lays out with nothing loaded, with a band up, and with a
+    /// conversation open on a station in it.
+    #[test]
+    fn the_interface_lays_out_headlessly() {
+        lay_out(&mut App::base((0.0, 4000.0)));
+
+        let mut app = app_with_traffic(30.0);
+        lay_out(&mut app);
+
+        let channels = app.channels_now();
+        assert_eq!(channels.channels().len(), 2, "expected two stations");
+        app.qsos.open_for_channel(&channels.channels()[0]);
+        app.qsos.open_blank(1500.0, ModeId::Olivia(ragchew::olivia::OL_8_250), 30.0);
+        lay_out(&mut app);
+        assert_eq!(app.qsos.len(), 2);
+    }
+
+    /// A QSO opened on a station follows it: text decoded after the tab was
+    /// opened arrives in its log, and the tab takes the station's call.
+    #[test]
+    fn an_open_qso_follows_its_station() {
+        // Far enough in for the station's first frame to have been revealed,
+        // and not far enough for its second.
+        let mut app = app_with_traffic(20.0);
+        lay_out(&mut app);
+        let early = app.channels_now();
+        app.qsos.open_for_channel(&early.channels()[0]);
+        assert_eq!(app.qsos.qsos()[0].label(), "K2N");
+        assert_eq!(app.qsos.qsos()[0].log.len(), 1);
+
+        // let the clock run past the station's second transmission
+        app.t_now = 40.0;
+        lay_out(&mut app);
+        let q = &app.qsos.qsos()[0];
+        assert_eq!(q.log.len(), 2, "second decode did not reach the log");
+        assert!(q.log[1].text.contains("FN20"), "logged {:?}", q.log[1].text);
     }
 
     /// Every step is a round number a reader can do arithmetic with.

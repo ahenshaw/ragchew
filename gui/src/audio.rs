@@ -178,9 +178,9 @@ pub struct LiveAudio {
     _stream: cpal::Stream,
 }
 
-/// An audio input, as offered to the operator.
+/// An audio endpoint — capture or playback — as offered to the operator.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InputDevice {
+pub struct AudioDevice {
     /// Stable identifier. cpal documents `DeviceId` as safe to persist, which
     /// a device *name* is not: a machine here offers twenty inputs all called
     /// "sof-hda-dsp", and picking one by name would be a coin toss.
@@ -211,13 +211,26 @@ const HW_PREFIXES: &[&str] = &["plughw", "hw", "dsnoop", "sysdefault", "front"];
 ///
 /// Labels that would still be indistinguishable get their identifier appended,
 /// so the picker never offers the same string twice.
-pub fn input_devices(all: bool) -> Vec<InputDevice> {
+pub fn input_devices(all: bool) -> Vec<AudioDevice> {
     let host = cpal::default_host();
     let Ok(devs) = host.input_devices() else { return Vec::new() };
-    let mut out: Vec<InputDevice> = devs
-        .filter_map(|d| {
-            Some(InputDevice { id: d.id().ok()?.to_string(), label: d.to_string() })
-        })
+    offer(devs, all)
+}
+
+/// Available output devices, winnowed the same way as the inputs.
+///
+/// ALSA is no tidier about playback PCMs than it is about capture ones, and the
+/// operator picking where a transmission goes is choosing between the same
+/// handful of real endpoints — the rig's codec, or the speakers.
+pub fn output_devices(all: bool) -> Vec<AudioDevice> {
+    let host = cpal::default_host();
+    let Ok(devs) = host.output_devices() else { return Vec::new() };
+    offer(devs, all)
+}
+
+fn offer(devs: impl Iterator<Item = cpal::Device>, all: bool) -> Vec<AudioDevice> {
+    let mut out: Vec<AudioDevice> = devs
+        .filter_map(|d| Some(AudioDevice { id: d.id().ok()?.to_string(), label: d.to_string() }))
         .collect();
     if !all {
         out = winnow(out);
@@ -238,7 +251,7 @@ pub fn input_devices(all: bool) -> Vec<InputDevice> {
 /// 3. Of the several ways one `(card, device)` is exposed, keep the most
 ///    useful — see [`HW_PREFIXES`]. `sysdefault:CARD=x` carries no device
 ///    number and means device 0, so it competes there.
-fn winnow(devs: Vec<InputDevice>) -> Vec<InputDevice> {
+fn winnow(devs: Vec<AudioDevice>) -> Vec<AudioDevice> {
     let pcm = |id: &str| id.split_once(':').map_or(id, |(_, rest)| rest).to_string();
     let field = |s: &str, key: &str| {
         s.split(',').find_map(|f| f.trim().strip_prefix(key)).map(|v| v.to_string())
@@ -255,8 +268,8 @@ fn winnow(devs: Vec<InputDevice>) -> Vec<InputDevice> {
         .filter_map(|d| card_of(&d.id))
         .any(|c| !c.chars().all(|ch| ch.is_ascii_digit()));
 
-    let mut best: Vec<(String, String, usize, InputDevice)> = Vec::new(); // card, dev, rank
-    let mut routes: Vec<InputDevice> = Vec::new();
+    let mut best: Vec<(String, String, usize, AudioDevice)> = Vec::new(); // card, dev, rank
+    let mut routes: Vec<AudioDevice> = Vec::new();
     for d in devs {
         let pcm = pcm(&d.id);
         let Some((prefix, rest)) = pcm.split_once(':') else {
@@ -288,7 +301,7 @@ fn winnow(devs: Vec<InputDevice>) -> Vec<InputDevice> {
 /// Only the host prefix is stripped from the identifier: what distinguishes
 /// `alsa:hw:CARD=x,DEV=0` from `alsa:plughw:CARD=x,DEV=0` is the part in the
 /// middle, so trimming to the last colon would leave the labels identical again.
-fn disambiguate(devs: &mut [InputDevice]) {
+fn disambiguate(devs: &mut [AudioDevice]) {
     let dupes: Vec<String> = devs
         .iter()
         .filter(|a| devs.iter().filter(|b| b.label == a.label).count() > 1)
@@ -541,13 +554,13 @@ fn shift_times(decodes: Vec<protocol::Decode>, win_start: f64) -> Vec<protocol::
 mod tests {
     use super::*;
 
-    fn dev(id: &str, label: &str) -> InputDevice {
-        InputDevice { id: id.to_string(), label: label.to_string() }
+    fn dev(id: &str, label: &str) -> AudioDevice {
+        AudioDevice { id: id.to_string(), label: label.to_string() }
     }
 
     /// Every PCM a real Linux box advertised for input: thirty entries that
     /// are, in truth, three capture endpoints on one card plus a few routes.
-    fn real_alsa_listing() -> Vec<InputDevice> {
+    fn real_alsa_listing() -> Vec<AudioDevice> {
         [
             ("alsa:null", "Discard all samples"),
             ("alsa:lavrate", "Rate Converter Plugin Using Libav/FFmpeg Library"),

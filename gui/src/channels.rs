@@ -120,6 +120,13 @@ impl ChannelSet {
         &self.channels
     }
 
+    /// The channel with this id, if it is still in the set. A QSO holds an id
+    /// rather than a reference because the file view rebuilds its channels from
+    /// scratch on every frame.
+    pub fn by_id(&self, id: u64) -> Option<&Channel> {
+        self.channels.iter().find(|c| c.id == id)
+    }
+
     /// Build a channel set from a batch of decodes (sorted by time first).
     pub fn from_decodes(decodes: impl IntoIterator<Item = Decode>, tol_hz: f64) -> ChannelSet {
         let mut ds: Vec<Decode> = decodes.into_iter().collect();
