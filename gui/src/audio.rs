@@ -189,11 +189,29 @@ pub struct InputDevice {
     pub label: String,
 }
 
-/// Available input devices (best-effort).
+/// ALSA plugin PCMs that are genuine capture routes. The rest of what ALSA
+/// advertises — `null`, `lavrate`, `samplerate`, `speexrate`, `speex`, `upmix`,
+/// `vdownmix`, `oss` — are format converters and routers with no source of
+/// their own, and offering them as recording inputs is just noise.
+const ROUTE_PCMS: &[&str] = &["default", "pipewire", "pulse", "jack"];
+
+/// Ways ALSA exposes a hardware PCM, best first.
 ///
-/// Labels that would otherwise be indistinguishable get their identifier
-/// appended, so the picker never offers the same string twice.
-pub fn input_devices() -> Vec<InputDevice> {
+/// `plughw` leads because it converts rate and format, so it opens at the
+/// config we ask for where raw `hw` often refuses.
+const HW_PREFIXES: &[&str] = &["plughw", "hw", "dsnoop", "sysdefault", "front"];
+
+/// Available input devices.
+///
+/// `all` lists every PCM the host advertises. The default is the winnowed set,
+/// because ALSA advertises an enormous number of aliases: on the machine this
+/// was written on, thirty entries turned out to be three real capture endpoints,
+/// each visible five ways and under two different card names, plus eleven
+/// plugins. See [`winnow`].
+///
+/// Labels that would still be indistinguishable get their identifier appended,
+/// so the picker never offers the same string twice.
+pub fn input_devices(all: bool) -> Vec<InputDevice> {
     let host = cpal::default_host();
     let Ok(devs) = host.input_devices() else { return Vec::new() };
     let mut out: Vec<InputDevice> = devs
@@ -201,8 +219,67 @@ pub fn input_devices() -> Vec<InputDevice> {
             Some(InputDevice { id: d.id().ok()?.to_string(), label: d.to_string() })
         })
         .collect();
+    if !all {
+        out = winnow(out);
+    }
     disambiguate(&mut out);
     out
+}
+
+/// Reduce ALSA's advertised PCMs to the ones worth offering.
+///
+/// Three rules, all working off the PCM name because cpal's device description
+/// cannot tell these apart — it reports every one of them as an input-capable
+/// device of unknown type:
+///
+/// 1. Plugin PCMs survive only if they are in [`ROUTE_PCMS`].
+/// 2. A card addressed by number is dropped when any card is addressed by name,
+///    since ALSA advertises every card both ways and they are the same hardware.
+/// 3. Of the several ways one `(card, device)` is exposed, keep the most
+///    useful — see [`HW_PREFIXES`]. `sysdefault:CARD=x` carries no device
+///    number and means device 0, so it competes there.
+fn winnow(devs: Vec<InputDevice>) -> Vec<InputDevice> {
+    let pcm = |id: &str| id.split_once(':').map_or(id, |(_, rest)| rest).to_string();
+    let field = |s: &str, key: &str| {
+        s.split(',').find_map(|f| f.trim().strip_prefix(key)).map(|v| v.to_string())
+    };
+    // The card lives after the PCM prefix — `plughw:CARD=x,DEV=0` — so the
+    // prefix has to come off before looking for it.
+    let card_of = |id: &str| {
+        let p = pcm(id);
+        p.split_once(':').and_then(|(_, rest)| field(rest, "CARD="))
+    };
+
+    let named_card_exists = devs
+        .iter()
+        .filter_map(|d| card_of(&d.id))
+        .any(|c| !c.chars().all(|ch| ch.is_ascii_digit()));
+
+    let mut best: Vec<(String, String, usize, InputDevice)> = Vec::new(); // card, dev, rank
+    let mut routes: Vec<InputDevice> = Vec::new();
+    for d in devs {
+        let pcm = pcm(&d.id);
+        let Some((prefix, rest)) = pcm.split_once(':') else {
+            if ROUTE_PCMS.contains(&pcm.as_str()) {
+                routes.push(d);
+            }
+            continue;
+        };
+        let Some(rank) = HW_PREFIXES.iter().position(|p| *p == prefix) else { continue };
+        let Some(card) = field(rest, "CARD=") else { continue };
+        if named_card_exists && card.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let dev = field(rest, "DEV=").unwrap_or_else(|| "0".to_string());
+        match best.iter_mut().find(|(c, v, ..)| *c == card && *v == dev) {
+            Some(slot) if rank < slot.2 => *slot = (card, dev, rank, d),
+            Some(_) => {}
+            None => best.push((card, dev, rank, d)),
+        }
+    }
+
+    routes.extend(best.into_iter().map(|(.., d)| d));
+    routes
 }
 
 /// Make every label distinct by appending the identifier where two would
@@ -466,6 +543,93 @@ mod tests {
 
     fn dev(id: &str, label: &str) -> InputDevice {
         InputDevice { id: id.to_string(), label: label.to_string() }
+    }
+
+    /// Every PCM a real Linux box advertised for input: thirty entries that
+    /// are, in truth, three capture endpoints on one card plus a few routes.
+    fn real_alsa_listing() -> Vec<InputDevice> {
+        [
+            ("alsa:null", "Discard all samples"),
+            ("alsa:lavrate", "Rate Converter Plugin Using Libav/FFmpeg Library"),
+            ("alsa:samplerate", "Rate Converter Plugin Using Samplerate Library"),
+            ("alsa:speexrate", "Rate Converter Plugin Using Speex Resampler"),
+            ("alsa:jack", "JACK Audio Connection Kit"),
+            ("alsa:oss", "Open Sound System"),
+            ("alsa:pipewire", "PipeWire Sound Server"),
+            ("alsa:pulse", "PulseAudio Sound Server"),
+            ("alsa:speex", "Plugin using Speex DSP"),
+            ("alsa:upmix", "Plugin for channel upmix (4,6,8)"),
+            ("alsa:vdownmix", "Plugin for channel downmix (stereo)"),
+            ("alsa:default", "Default ALSA Output"),
+            ("alsa:usbstream:CARD=NVidia", "HDA NVidia"),
+            ("alsa:hw:CARD=sofhdadsp,DEV=0", "sof-hda-dsp, "),
+            ("alsa:hw:CARD=sofhdadsp,DEV=6", "sof-hda-dsp, "),
+            ("alsa:hw:CARD=sofhdadsp,DEV=7", "sof-hda-dsp, "),
+            ("alsa:plughw:CARD=sofhdadsp,DEV=0", "sof-hda-dsp, "),
+            ("alsa:plughw:CARD=sofhdadsp,DEV=6", "sof-hda-dsp, "),
+            ("alsa:plughw:CARD=sofhdadsp,DEV=7", "sof-hda-dsp, "),
+            ("alsa:sysdefault:CARD=sofhdadsp", "sof-hda-dsp"),
+            ("alsa:dsnoop:CARD=sofhdadsp,DEV=0", "sof-hda-dsp, "),
+            ("alsa:dsnoop:CARD=sofhdadsp,DEV=6", "sof-hda-dsp, "),
+            ("alsa:dsnoop:CARD=sofhdadsp,DEV=7", "sof-hda-dsp, "),
+            ("alsa:usbstream:CARD=sofhdadsp", "sof-hda-dsp"),
+            ("alsa:hw:CARD=1,DEV=0", "sof-hda-dsp, "),
+            ("alsa:plughw:CARD=1,DEV=0", "sof-hda-dsp, "),
+            ("alsa:hw:CARD=1,DEV=6", "sof-hda-dsp, "),
+            ("alsa:plughw:CARD=1,DEV=6", "sof-hda-dsp, "),
+            ("alsa:hw:CARD=1,DEV=7", "sof-hda-dsp, "),
+            ("alsa:plughw:CARD=1,DEV=7", "sof-hda-dsp, "),
+        ]
+        .iter()
+        .map(|(id, label)| dev(id, label))
+        .collect()
+    }
+
+    /// Thirty advertised PCMs come down to the handful a person would
+    /// recognise — the same set another recorder on this machine offers.
+    #[test]
+    fn winnowing_matches_what_a_person_would_expect() {
+        let kept = winnow(real_alsa_listing());
+        let ids: Vec<&str> = kept.iter().map(|d| d.id.as_str()).collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                "alsa:jack",
+                "alsa:pipewire",
+                "alsa:pulse",
+                "alsa:default",
+                "alsa:plughw:CARD=sofhdadsp,DEV=0",
+                "alsa:plughw:CARD=sofhdadsp,DEV=6",
+                "alsa:plughw:CARD=sofhdadsp,DEV=7",
+            ]
+        );
+    }
+
+    /// The individual rules, so a failure says which one broke.
+    #[test]
+    fn winnowing_rules() {
+        let kept = winnow(real_alsa_listing());
+        let has = |s: &str| kept.iter().any(|d| d.id.contains(s));
+
+        assert!(!has("lavrate") && !has("upmix") && !has("null"), "kept a converter plugin");
+        assert!(!has("CARD=1"), "kept a card addressed by number as well as by name");
+        assert!(!has("hw:CARD=sofhdadsp,DEV=0") || has("plughw:CARD=sofhdadsp,DEV=0"));
+        assert!(!has("dsnoop") && !has("sysdefault"), "kept a lesser view of a device");
+        assert!(!has("usbstream"), "kept a usbstream alias");
+        // one entry per real capture endpoint
+        assert_eq!(kept.iter().filter(|d| d.id.contains("sofhdadsp")).count(), 3);
+    }
+
+    /// With nothing named, cards addressed by number are all there is.
+    #[test]
+    fn numeric_cards_survive_when_they_are_the_only_ones() {
+        let kept = winnow(vec![
+            dev("alsa:plughw:CARD=0,DEV=0", "Card zero"),
+            dev("alsa:hw:CARD=0,DEV=0", "Card zero"),
+        ]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "alsa:plughw:CARD=0,DEV=0");
     }
 
     /// A picker that offers the same string twice is a picker you cannot use.

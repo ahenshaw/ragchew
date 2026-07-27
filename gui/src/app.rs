@@ -187,6 +187,7 @@ struct Settings {
     speed: f32,
     modes: Vec<String>,
     input_device: Option<String>,
+    show_all_inputs: bool,
 }
 
 impl Default for Settings {
@@ -199,6 +200,7 @@ impl Default for Settings {
             speed: 8.0,
             modes: protocol::default_modes().iter().map(|m| m.name()).collect(),
             input_device: None,
+            show_all_inputs: false,
         }
     }
 }
@@ -224,6 +226,8 @@ struct Frame {
 struct LiveMode {
     band: (f64, f64),
     modes: Vec<ModeId>,
+    /// List every PCM the host advertises rather than the winnowed set.
+    show_all_inputs: bool,
     audio: Option<crate::audio::LiveAudio>,
     err: Option<String>,
     frames_rx: Option<std::sync::mpsc::Receiver<Vec<protocol::Decode>>>,
@@ -238,10 +242,16 @@ struct LiveMode {
 }
 
 impl LiveMode {
-    fn start(band: (f64, f64), modes: Vec<ModeId>, device: Option<String>) -> LiveMode {
+    fn start(
+        band: (f64, f64),
+        modes: Vec<ModeId>,
+        device: Option<String>,
+        show_all_inputs: bool,
+    ) -> LiveMode {
         let mut lm = LiveMode {
             band,
             modes,
+            show_all_inputs,
             audio: None,
             err: None,
             frames_rx: None,
@@ -251,7 +261,7 @@ impl LiveMode {
             norm: (0.0, 1.0),
             cols_since_norm: 0,
             t_now: 0.0,
-            devices: crate::audio::input_devices(),
+            devices: Vec::new(),
             selected: None,
         };
         lm.open(device);
@@ -271,7 +281,7 @@ impl LiveMode {
         self.norm = (0.0, 1.0);
         self.cols_since_norm = 0;
         self.t_now = 0.0;
-        self.devices = crate::audio::input_devices();
+        self.devices = crate::audio::input_devices(self.show_all_inputs);
         // A remembered device may be gone — a USB interface unplugged, or
         // settings carried to another machine. Falling back to the default
         // input beats refusing to listen at all.
@@ -404,6 +414,8 @@ struct App {
     /// Identifier of the audio input to prefer when going live, remembered
     /// across restarts.
     preferred_input: Option<String>,
+    /// Offer every ALSA PCM in the input picker, not just the winnowed set.
+    show_all_inputs: bool,
 
     /// True while a drag that began on the band bar is in progress, and the
     /// frequency offset between where it was grabbed and the view centre — so
@@ -450,6 +462,7 @@ impl App {
             source: String::new(),
             status: None,
             preferred_input: None,
+            show_all_inputs: false,
             bar_drag: false,
             bar_grab_hz: 0.0,
             split_drag: false,
@@ -468,6 +481,7 @@ impl App {
             speed: self.speed,
             modes: self.enabled_modes().iter().map(|m| m.name()).collect(),
             input_device: self.preferred_input.clone(),
+            show_all_inputs: self.show_all_inputs,
         }
     }
 
@@ -479,6 +493,7 @@ impl App {
         self.scroll_secs = s.scroll_secs.clamp(0.0, 2.0);
         self.speed = s.speed.clamp(1.0, 20.0);
         self.preferred_input = s.input_device;
+        self.show_all_inputs = s.show_all_inputs;
 
         let wanted: Vec<ModeId> = s.modes.iter().filter_map(|n| protocol::parse_mode(n)).collect();
         // An empty or wholly unrecognisable list would leave the app scanning
@@ -503,8 +518,12 @@ impl App {
         self.frames_ready = true;
         self.status = None;
         self.source = "live input".to_string();
-        self.live =
-            Some(LiveMode::start(self.band, self.enabled_modes(), self.preferred_input.clone()));
+        self.live = Some(LiveMode::start(
+            self.band,
+            self.enabled_modes(),
+            self.preferred_input.clone(),
+            self.show_all_inputs,
+        ));
     }
 
     /// Load an audio file, replacing whatever is on screen.
@@ -707,6 +726,8 @@ impl eframe::App for App {
         let mut live_norm = self.norm;
         let mut live_label = String::new();
         let mut live_devices: Vec<crate::audio::InputDevice> = Vec::new();
+        let mut show_all = self.show_all_inputs;
+        let mut all_inputs_toggled = false;
         let mut live_selected: Option<String> = None;
         if let Some(lm) = self.live.as_mut() {
             lm.tick();
@@ -812,6 +833,13 @@ impl eframe::App for App {
                                 chosen_device = Some(d.id.clone());
                             }
                         }
+                        ui.separator();
+                        // ALSA advertises far more PCMs than there are devices;
+                        // the escape hatch matters for whoever needs the one
+                        // that got winnowed out.
+                        if ui.checkbox(&mut show_all, "show every ALSA PCM").changed() {
+                            all_inputs_toggled = true;
+                        }
                     });
                 } else {
                     ui.add_enabled_ui(self.frames_ready, |ui| {
@@ -871,6 +899,13 @@ impl eframe::App for App {
             });
         });
 
+        if all_inputs_toggled {
+            self.show_all_inputs = show_all;
+            if let Some(lm) = self.live.as_mut() {
+                lm.show_all_inputs = show_all;
+                lm.devices = crate::audio::input_devices(show_all);
+            }
+        }
         if let Some(path) = open_file {
             self.open_file(&path);
         }
