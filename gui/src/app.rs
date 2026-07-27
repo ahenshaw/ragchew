@@ -1228,6 +1228,37 @@ impl eframe::App for App {
                     );
                 }
                 painter.circle_filled(to_screen(g.waterfall_x0(), y_freq), 2.5, color);
+
+                // Hovering a row reports what the waterfall cannot: how well
+                // the station is being heard, and how far its carrier has
+                // wandered since it was first found.
+                let row = Rect::from_min_max(
+                    to_screen(0.0, y_row - line_h / 2.0),
+                    to_screen(g.strip_x0(), y_row + line_h / 2.0),
+                );
+                ui.interact(row, ui.id().with(("channel", ch.id)), egui::Sense::hover())
+                    .on_hover_ui(|ui| {
+                        ui.colored_label(color, ch.mode.name());
+                        ui.label(format!(
+                            "{:.1} Hz   {:+.1} Hz drift",
+                            ch.hz,
+                            ch.drift_hz()
+                        ));
+                        // `quality` is normalised to the protocol's own noise
+                        // floor, so it is a ratio rather than a dB figure — see
+                        // protocol::Decode. Saying "x4.4" is honest where "13 dB"
+                        // would imply a channel SNR this is not.
+                        ui.label(format!(
+                            "SNR ×{:.1} above noise (best ×{:.1})",
+                            ch.quality, ch.best_quality
+                        ));
+                        ui.weak(format!(
+                            "{} decode{} · {:.1} s of audio",
+                            ch.chunks,
+                            if ch.chunks == 1 { "" } else { "s" },
+                            (ch.last_heard_s - ch.first_heard_s) + ch.mode.chunk_secs()
+                        ));
+                    });
             }
 
             // The whole frequency axis lives on the right-hand edge of the

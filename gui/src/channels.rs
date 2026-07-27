@@ -26,6 +26,27 @@ pub struct Channel {
     pub last_heard_s: f64,
     /// Audio time (s) of the first decode.
     pub first_heard_s: f64,
+    /// Confidence of the most recent decode, in multiples of the protocol's
+    /// noise floor — see [`ragchew::protocol::Decode::quality`].
+    pub quality: f32,
+    /// Best confidence seen on this channel, which is a fairer summary than the
+    /// last one when a station is fading in and out.
+    pub best_quality: f32,
+    /// Number of decodes accumulated.
+    pub chunks: usize,
+}
+
+impl Channel {
+    /// How far the carrier has moved since the channel was first heard.
+    ///
+    /// Real signals wander: the off-air JS8 recording in this repository drifts
+    /// about 10 Hz over two minutes.
+    pub fn drift_hz(&self) -> f64 {
+        match self.hz_history.first() {
+            Some((_, first)) => self.hz - first,
+            None => 0.0,
+        }
+    }
 }
 
 /// Tracks channels as decodes arrive (in time order).
@@ -71,6 +92,9 @@ impl ChannelSet {
                 ch.last_chunk_chars = d.text.chars().count();
                 ch.text.push_str(&d.text);
                 ch.last_heard_s = d.time_s;
+                ch.quality = d.quality;
+                ch.best_quality = ch.best_quality.max(d.quality);
+                ch.chunks += 1;
             }
             None => {
                 let id = self.next_id;
@@ -84,6 +108,9 @@ impl ChannelSet {
                     text: d.text,
                     last_heard_s: d.time_s,
                     first_heard_s: d.time_s,
+                    quality: d.quality,
+                    best_quality: d.quality,
+                    chunks: 1,
                 });
             }
         }
@@ -118,6 +145,28 @@ mod tests {
             mode: ModeId::Js8(js8::Mode::Normal),
             quality: 1.0,
         }
+    }
+
+    /// A hovering operator wants to know how well a station is being heard and
+    /// how far it has wandered, so the channel has to carry both.
+    #[test]
+    fn tracks_quality_and_drift() {
+        let q = |hz: f64, t: f64, quality: f32| Decode {
+            hz,
+            time_s: t,
+            text: "x".to_string(),
+            mode: ModeId::Js8(js8::Mode::Normal),
+            quality,
+        };
+        let set = ChannelSet::from_decodes(
+            [q(1000.0, 0.0, 3.0), q(1004.0, 15.0, 9.5), q(1006.0, 30.0, 5.0)],
+            15.0,
+        );
+        let c = &set.channels()[0];
+        assert_eq!(c.chunks, 3);
+        assert_eq!(c.quality, 5.0, "quality is the most recent");
+        assert_eq!(c.best_quality, 9.5, "best survives a fade");
+        assert_eq!(c.drift_hz(), 6.0, "drift is measured from where it started");
     }
 
     #[test]
