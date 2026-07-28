@@ -27,7 +27,7 @@ cargo run -p ragchew-gui --release                    # the same, live: it is th
 ```
 
 Run it with no arguments and it starts listening to the default audio input —
-monitoring is what it is for. Everything else is reachable from the **File**
+monitoring is what it is for. Everything else is reachable from the **Source**
 menu: *Open audio file…* for a native file picker, or straight to the demo
 bands. `--help` lists the lot.
 
@@ -65,7 +65,8 @@ times faster, is already breaking up. The FEC does not degrade gently either —
 the window between clean copy and nothing at all is about a decibel wide.
 
 The toolbar is one line: **☰** holds the display settings, the audio input and
-output and *Reset view*; **File** opens a recording or switches source; the mode
+output, *Reset view* and *Quit*; **Source** opens a recording or switches what
+is being listened to; the mode
 menus on the right control what is scanned for, and each protocol's channels are
 coloured by mode.
 

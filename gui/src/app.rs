@@ -1724,10 +1724,20 @@ impl App {
                         self.vp = Viewport { f_lo: self.band.0, f_hi: self.band.1 };
                         ui.close();
                     }
+                    // Quitting is not a source of audio. It sits at the foot of
+                    // the settings menu instead, where the other things that act
+                    // on the application rather than on the band already are.
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 })
                 .response
                 .on_hover_text("Settings");
-                ui.menu_button("File", |ui| {
+                // "Source", not "File": every item under it answers "what is
+                // this listening to" — a recording, a synthetic band, the sound
+                // card — and only one of the three is a file.
+                ui.menu_button("Source", |ui| {
                     if ui.button("Open audio file…").clicked() {
                         // Blocks the UI thread while the dialog is up, which is
                         // what you want: there is nothing to interact with
@@ -1751,10 +1761,6 @@ impl App {
                     if ui.button("Live input").clicked() {
                         go_live = true;
                         ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 });
                 ui.separator();
@@ -1952,7 +1958,7 @@ impl App {
                 None if !live && self.samples.is_empty() => {
                     ui.centered_and_justified(|ui| {
                         ui.label(
-                            "Nothing loaded.\n\n                             File ▸ Open audio file…   for a 12 kHz mono WAV\n                             File ▸ Demo band          for a synthetic band\n                             File ▸ Live input         to decode the sound card",
+                            "Nothing loaded.\n\n                             Source ▸ Open audio file…   for a 12 kHz mono WAV\n                             Source ▸ Demo band          for a synthetic band\n                             Source ▸ Live input         to decode the sound card",
                         );
                     });
                     return;
