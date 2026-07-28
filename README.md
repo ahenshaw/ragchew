@@ -23,12 +23,13 @@ cargo run -p ragchew-gui --release -- --demo          # synthetic multi-protocol
 cargo run -p ragchew-gui --release -- --weak          # Olivia under the noise floor
 cargo run -p ragchew-gui --release -- --live          # decode the default audio input
 cargo run -p ragchew-gui --release -- recording.wav   # decode a recording
-cargo run -p ragchew-gui --release                    # start empty; File ▸ Open…
+cargo run -p ragchew-gui --release                    # the same, live: it is the default
 ```
 
-Run it with no arguments and it opens empty, with everything reachable from the
-**File** menu: *Open audio file…* for a native file picker, or straight to the
-demo bands or live input. `--help` lists the lot.
+Run it with no arguments and it starts listening to the default audio input —
+monitoring is what it is for. Everything else is reachable from the **File**
+menu: *Open audio file…* for a native file picker, or straight to the demo
+bands. `--help` lists the lot.
 
 Window size and position, the panel splits, text size, playback and waterfall
 settings, the modes being scanned, the chosen audio input and output, and where

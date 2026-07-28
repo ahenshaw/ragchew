@@ -83,7 +83,9 @@ struct Args {
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
 
-    /// Decode live from an audio input device.
+    /// Decode live from an audio input device. This is what happens with no
+    /// arguments at all, so the flag is only worth typing for the sake of
+    /// saying so.
     #[arg(long, conflicts_with_all = ["file", "demo", "weak"])]
     live: bool,
 
@@ -99,7 +101,12 @@ struct Args {
 pub fn run() -> eframe::Result<()> {
     let args = <Args as clap::Parser>::parse();
 
-    let title = if args.live {
+    // A monitor with nothing on the command line should be monitoring: opening
+    // deaf and waiting to be told to listen is a worse default than the one
+    // thing the program is for. A file, a demo, or an explicit --live still win.
+    let live = args.live || (args.file.is_none() && !args.demo && !args.weak);
+
+    let title = if live {
         "ragchew — live"
     } else if args.weak {
         "ragchew — weak-signal demo"
