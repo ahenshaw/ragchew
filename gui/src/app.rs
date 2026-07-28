@@ -251,6 +251,37 @@ fn clock(s: f64) -> String {
     format!("{}:{:02}", (s / 60.0) as u64, (s % 60.0) as u64)
 }
 
+/// A wall-clock instant as `YYYY-MM-DD hh:mm:ssZ`.
+///
+/// UTC, because that is what a contact is logged in: a QSO spans operators in
+/// as many time zones as it has stations, and only one clock is common to them.
+/// Nothing here needs a time zone database, so nothing here pulls one in.
+fn utc_stamp(t: std::time::SystemTime) -> String {
+    let secs = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        // A clock set before 1970 is a broken clock, not a time to print.
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let tod = secs.rem_euclid(86_400);
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z", tod / 3600, (tod / 60) % 60, tod % 60)
+}
+
+/// Civil date from a count of days since 1970-01-01, by Howard Hinnant's
+/// `civil_from_days`: shift the era to start on 1 March so the leap day falls
+/// at the end of a year, then it is all exact integer arithmetic.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468; // days since 0000-03-01
+    let era = z.div_euclid(146_097); // 400 years, the leap-rule period
+    let doe = z.rem_euclid(146_097); // day of era, [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of March-based year
+    let mp = (5 * doy + 2) / 153; // March-based month, [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
 /// The log's offset column: how long into the QSO a line landed.
 fn offset(s: f64) -> String {
     format!("+{:>6}", clock(s))
@@ -939,7 +970,19 @@ impl App {
             ui.end_row();
 
             ui.label("Started");
-            ui.label(format!("{}  ({} elapsed)", clock(q.started_s), clock(q.elapsed_s(now_s))));
+            // The elapsed time rides along as a "+m:ss" offset rather than a
+            // phrase, both to match the log's offset column and to keep the row
+            // inside a panel narrow enough to sit beside the waterfall.
+            ui.label(format!(
+                "{}  +{}",
+                utc_stamp(q.started_utc),
+                clock(q.elapsed_s(now_s))
+            ))
+            .on_hover_text(format!(
+                "started (UTC, as a contact is logged), and how long ago that was\n\
+                 {} on the audio clock",
+                clock(q.started_s),
+            ));
             ui.end_row();
         });
 
@@ -1797,7 +1840,7 @@ impl App {
         });
 
         if let Some(ch) = open_qso {
-            self.qsos.open_for_channel(&ch);
+            self.qsos.open_for_channel(&ch, t_now);
         }
     }
 }
@@ -1982,7 +2025,7 @@ mod tests {
 
         let channels = app.channels_now();
         assert_eq!(channels.channels().len(), 2, "expected two stations");
-        app.qsos.open_for_channel(&channels.channels()[0]);
+        app.qsos.open_for_channel(&channels.channels()[0], app.t_now);
         app.qsos.open_blank(1500.0, ModeId::Olivia(ragchew::olivia::OL_8_250), 30.0);
         lay_out(&mut app);
         assert_eq!(app.qsos.len(), 2);
@@ -1997,7 +2040,7 @@ mod tests {
         let mut app = app_with_traffic(20.0);
         lay_out(&mut app);
         let early = app.channels_now();
-        app.qsos.open_for_channel(&early.channels()[0]);
+        app.qsos.open_for_channel(&early.channels()[0], app.t_now);
         assert_eq!(app.qsos.qsos()[0].label(), "K2N");
         assert_eq!(app.qsos.qsos()[0].log.len(), 1);
 
@@ -2020,5 +2063,28 @@ mod tests {
                 "step {step} is not a 1/2/5 multiple"
             );
         }
+    }
+
+    /// A logged time that is wrong is worse than no logged time, and the date
+    /// arithmetic is the only place here that can be quietly wrong: leap years,
+    /// the century rule, and the 400-year exception.
+    #[test]
+    fn utc_stamps_are_right() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let at = |s: u64| utc_stamp(UNIX_EPOCH + Duration::from_secs(s));
+        assert_eq!(at(0), "1970-01-01 00:00:00Z");
+        assert_eq!(at(86_399), "1970-01-01 23:59:59Z");
+        assert_eq!(at(86_400), "1970-01-02 00:00:00Z");
+        // 2000 is a leap year (the 400-year exception), 1900 was not.
+        assert_eq!(at(951_782_400), "2000-02-29 00:00:00Z");
+        assert_eq!(at(951_868_800), "2000-03-01 00:00:00Z");
+        // 2100 is not a leap year (the century rule).
+        assert_eq!(at(4_107_456_000), "2100-02-28 00:00:00Z");
+        assert_eq!(at(4_107_542_400), "2100-03-01 00:00:00Z");
+        // an ordinary leap day, and the last second of a year
+        assert_eq!(at(1_709_164_800), "2024-02-29 00:00:00Z");
+        assert_eq!(at(1_767_225_599), "2025-12-31 23:59:59Z");
+        // a clock set before the epoch still prints a date rather than panicking
+        assert_eq!(utc_stamp(UNIX_EPOCH - Duration::from_secs(1)), "1969-12-31 23:59:59Z");
     }
 }

@@ -10,6 +10,8 @@
 //! Nothing here draws anything or touches the radio; the panel is in `app`, the
 //! modulator in `tx`.
 
+use std::time::{Duration, SystemTime};
+
 use ragchew::protocol::ModeId;
 
 use crate::channels::{Channel, ChannelSet};
@@ -71,6 +73,15 @@ pub struct Qso {
     /// a blank one), and when it was last heard from.
     pub started_s: f64,
     pub last_s: f64,
+    /// Wall-clock instant of `started_s`, for the log: a contact is logged in
+    /// UTC, and the audio clock counts from the start of a capture or a file.
+    ///
+    /// Live, the audio clock runs at wall-clock rate, so backdating by the age
+    /// of the channel puts this at the moment the station was actually first
+    /// heard. Reviewing a recording there is nothing to be faithful to — a WAV
+    /// carries no start time — so a QSO opened there is stamped with the time
+    /// it was opened.
+    pub started_utc: SystemTime,
     pub log: Vec<Entry>,
     /// The reply being composed. Per QSO, so switching tabs and coming back
     /// finds it as you left it.
@@ -179,8 +190,9 @@ impl QsoSet {
     /// The QSO starts with everything already heard on the channel as its first
     /// received line, and counts its offsets from when the station was first
     /// heard rather than from the click — the exchange did not begin when you
-    /// happened to notice it.
-    pub fn open_for_channel(&mut self, ch: &Channel) -> usize {
+    /// happened to notice it. Its UTC stamp is backdated the same way, from the
+    /// audio clock's `now_s`.
+    pub fn open_for_channel(&mut self, ch: &Channel, now_s: f64) -> usize {
         if let Some(i) = self.qsos.iter().position(|q| q.channel == Some(ch.id)) {
             self.active = i;
             return i;
@@ -202,6 +214,7 @@ impl QsoSet {
             quality: ch.quality,
             started_s: ch.first_heard_s,
             last_s: ch.last_heard_s,
+            started_utc: backdated(now_s - ch.first_heard_s),
             log: Vec::new(),
             draft: String::new(),
             absorbed: 0,
@@ -238,6 +251,7 @@ impl QsoSet {
             quality: 0.0,
             started_s: now_s,
             last_s: now_s,
+            started_utc: SystemTime::now(),
             log: Vec::new(),
             draft: String::new(),
             absorbed: 0,
@@ -274,6 +288,19 @@ impl QsoSet {
 /// stricter than "has a digit in it". Amateur text is full of tokens that would
 /// pass a loose test and are not calls: grids (`EM73`), power (`400W`, `5W`),
 /// reports (`579`), and the whole of the Q code.
+/// Now, less `age_s` seconds of audio clock. A negative age (a channel heard
+/// "after" now, which the file view can produce mid-seek) and a clock too near
+/// the epoch to subtract from both fall back to now.
+fn backdated(age_s: f64) -> SystemTime {
+    let now = SystemTime::now();
+    if !age_s.is_finite() || age_s <= 0.0 {
+        return now;
+    }
+    // from_secs_f64 panics on anything it cannot represent, so cap the age at
+    // a century rather than trust an audio clock that has gone strange.
+    now.checked_sub(Duration::from_secs_f64(age_s.min(3.2e9))).unwrap_or(now)
+}
+
 pub fn callsign_in(text: &str) -> Option<String> {
     let tokens: Vec<&str> = text.split_whitespace().collect();
     fn clean(t: &str) -> &str {
@@ -403,7 +430,7 @@ mod tests {
             15.0,
         );
         let mut qsos = QsoSet::new();
-        qsos.open_for_channel(&set.channels()[0]);
+        qsos.open_for_channel(&set.channels()[0], 60.0);
         let q = &qsos.qsos()[0];
         assert_eq!(q.call, "K2N");
         assert_eq!(q.started_s, 5.0);
@@ -421,6 +448,24 @@ mod tests {
         assert_eq!(q.log[1].at_s, 35.0);
     }
 
+    /// The UTC stamp is the moment the station was first heard, not the moment
+    /// the tab was opened: a QSO on a channel heard 55 s ago is stamped 55 s
+    /// ago, and one opened by hand is stamped now.
+    #[test]
+    fn a_qso_is_stamped_when_the_station_was_first_heard() {
+        let set = ChannelSet::from_decodes([js8_decode(1000.0, 5.0, "CQ DE K2N ")], 15.0);
+        let mut qsos = QsoSet::new();
+        let before = SystemTime::now();
+        qsos.open_for_channel(&set.channels()[0], 60.0); // first heard at 5 s, now 60 s
+        qsos.open_blank(1500.0, ModeId::Js8(ragchew::js8::Mode::Normal), 60.0);
+        let after = SystemTime::now();
+
+        let age = |t: SystemTime| before.duration_since(t).unwrap_or_default().as_secs_f64();
+        assert!((age(qsos.qsos()[0].started_utc) - 55.0).abs() < 1.0, "not backdated 55 s");
+        let blank = qsos.qsos()[1].started_utc;
+        assert!(blank >= before && blank <= after, "a blank QSO is stamped now");
+    }
+
     /// Clicking the same channel again returns to its tab instead of opening a
     /// second one; a different channel gets its own.
     #[test]
@@ -430,11 +475,11 @@ mod tests {
             15.0,
         );
         let mut qsos = QsoSet::new();
-        let a = qsos.open_for_channel(&set.channels()[0]);
-        let b = qsos.open_for_channel(&set.channels()[1]);
+        let a = qsos.open_for_channel(&set.channels()[0], 60.0);
+        let b = qsos.open_for_channel(&set.channels()[1], 60.0);
         assert_ne!(a, b);
         assert_eq!(qsos.len(), 2);
-        assert_eq!(qsos.open_for_channel(&set.channels()[0]), a);
+        assert_eq!(qsos.open_for_channel(&set.channels()[0], 60.0), a);
         assert_eq!(qsos.len(), 2);
         assert_eq!(qsos.active(), a);
     }
@@ -448,7 +493,7 @@ mod tests {
             15.0,
         );
         let mut qsos = QsoSet::new();
-        qsos.open_for_channel(&full.channels()[0]);
+        qsos.open_for_channel(&full.channels()[0], 60.0);
         let rewound = ChannelSet::from_decodes([js8_decode(1000.0, 1.0, "DE K2N ")], 15.0);
         qsos.absorb(&rewound);
         assert_eq!(qsos.qsos()[0].log.len(), 1);
