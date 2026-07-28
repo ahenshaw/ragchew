@@ -32,8 +32,9 @@ menu: *Open audio file…* for a native file picker, or straight to the demo
 bands. `--help` lists the lot.
 
 Window size and position, the panel splits, text size, playback and waterfall
-settings, the modes being scanned, the chosen audio input and output, and where
-in the band the view is pointed all persist between runs
+settings, the modes being scanned, the chosen audio input and output, the
+palette (dark, light, or following the desktop), and where in the band the view
+is pointed all persist between runs
 (`~/.local/share/ragchew/app.ron` on Linux). A saved view is fitted to the band
 on the way in, so a settings file from another build — or one edited by hand —
 cannot reopen the app zoomed into 50 Hz of nothing. Conversations are not saved:

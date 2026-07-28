@@ -142,7 +142,10 @@ pub fn run() -> eframe::Result<()> {
             {
                 app.apply(saved);
             }
-            if args.live {
+            // The saved palette has to reach egui before the first frame, or
+            // the window flashes the system theme on the way to the wanted one.
+            cc.egui_ctx.set_theme(app.theme.preference());
+            if live {
                 app.go_live();
             } else if args.weak {
                 app.set_source(crate::demo::synth_weak(), "weak-signal demo");
@@ -151,11 +154,55 @@ pub fn run() -> eframe::Result<()> {
             } else if let Some(path) = &args.file {
                 app.open_file(path);
             }
-            // With no argument at all it opens empty, and the File menu is
-            // right there — better than silently loading something.
             Ok(Box::new(app))
         }),
     )
+}
+
+/// Which palette the window uses.
+///
+/// Stored and restored by name for the same reason the mode list is: a name
+/// from a build that knew one more theme than this one is skipped, where an
+/// enum that failed to deserialise would take every other setting down with it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Theme {
+    /// Whatever the desktop asks for, and it follows changes to that.
+    #[default]
+    Auto,
+    Dark,
+    Light,
+}
+
+impl Theme {
+    const ALL: [Theme; 3] = [Theme::Auto, Theme::Dark, Theme::Light];
+
+    fn name(self) -> &'static str {
+        match self {
+            Theme::Auto => "auto",
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Theme> {
+        Theme::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Theme::Auto => "Auto",
+            Theme::Dark => "Dark",
+            Theme::Light => "Light",
+        }
+    }
+
+    fn preference(self) -> egui::ThemePreference {
+        match self {
+            Theme::Auto => egui::ThemePreference::System,
+            Theme::Dark => egui::ThemePreference::Dark,
+            Theme::Light => egui::ThemePreference::Light,
+        }
+    }
 }
 
 /// Per-mode colour, so a channel's colour tells you what it is.
@@ -181,6 +228,34 @@ fn mode_color(m: ModeId) -> Color32 {
             _ => Color32::from_rgb(200, 190, 230),
         },
     }
+}
+
+/// The mode's colour, legible as text on the panel background.
+///
+/// The palette above is pitched to sit on a dark panel, and on a light one
+/// those pastels are all but white. Scaling them towards black keeps the hue —
+/// which is the part that identifies the mode — while restoring the contrast.
+fn mode_text_color(dark: bool, m: ModeId) -> Color32 {
+    legible(dark, mode_color(m))
+}
+
+/// A colour picked for a dark panel, made to hold up on a light one.
+///
+/// Every accent here is a light tint, which is right on the dark background
+/// this started life with and nearly invisible on a white one. Scaling towards
+/// black preserves the hue, and the hue is what carries the meaning.
+fn legible(dark: bool, c: Color32) -> Color32 {
+    if dark {
+        return c;
+    }
+    // Not `gamma_multiply`: that scales alpha too, and a translucent tint on a
+    // white panel is exactly the problem being fixed.
+    const K: f32 = 0.45;
+    Color32::from_rgb(
+        (c.r() as f32 * K) as u8,
+        (c.g() as f32 * K) as u8,
+        (c.b() as f32 * K) as u8,
+    )
 }
 
 /// What survives a restart.
@@ -218,6 +293,8 @@ struct Settings {
     /// also what a settings file written before this existed deserialises to —
     /// means the whole band.
     view_hz: Option<(f64, f64)>,
+    /// Palette, by [`Theme::name`].
+    theme: String,
 }
 
 impl Default for Settings {
@@ -234,6 +311,7 @@ impl Default for Settings {
             show_all_inputs: false,
             qso_w: 340.0,
             view_hz: None,
+            theme: Theme::default().name().to_string(),
         }
     }
 }
@@ -500,6 +578,10 @@ struct App {
     preferred_input: Option<String>,
     /// Offer every ALSA PCM in the device pickers, not just the winnowed set.
     show_all_inputs: bool,
+    /// Palette the operator asked for. egui holds the same preference, but this
+    /// is what gets written to the settings file — and under Auto, egui's
+    /// resolved light/dark cannot tell us what was asked for.
+    theme: Theme,
 
     /// Open conversations, and the width of the panel they live in.
     qsos: QsoSet,
@@ -557,6 +639,7 @@ impl App {
             status: None,
             preferred_input: None,
             show_all_inputs: false,
+            theme: Theme::default(),
             qsos: QsoSet::new(),
             qso_w: 340.0,
             tx: None,
@@ -583,6 +666,7 @@ impl App {
             show_all_inputs: self.show_all_inputs,
             qso_w: self.qso_w,
             view_hz: Some((self.vp.f_lo, self.vp.f_hi)),
+            theme: self.theme.name().to_string(),
         }
     }
 
@@ -597,6 +681,9 @@ impl App {
         self.preferred_output = s.output_device;
         self.show_all_inputs = s.show_all_inputs;
         self.qso_w = s.qso_w.clamp(MIN_QSO_W, 900.0);
+        // An unknown name leaves the theme at Auto rather than at whatever the
+        // last build happened to write.
+        self.theme = Theme::parse(&s.theme).unwrap_or_default();
         let (lo, hi) = s.view_hz.unwrap_or(self.band);
         self.set_view(lo, hi);
 
@@ -747,7 +834,8 @@ impl App {
                         if ui.checkbox(enabled, "").changed() {
                             changed = true;
                         }
-                        ui.colored_label(mode_color(*m), m.short_name());
+                        let c = mode_text_color(ui.visuals().dark_mode, *m);
+                        ui.colored_label(c, m.short_name());
                     });
                 }
             });
@@ -770,7 +858,8 @@ impl App {
             let mut close: Option<usize> = None;
             for (i, q) in self.qsos.qsos().iter().enumerate() {
                 let on = i == self.qsos.active();
-                let (picked, closed) = Self::qso_tab(ui, &q.label(), mode_color(q.mode), on);
+                let c = mode_text_color(ui.visuals().dark_mode, q.mode);
+                let (picked, closed) = Self::qso_tab(ui, &q.label(), c, on);
                 if picked {
                     want_active = i;
                 }
@@ -996,7 +1085,8 @@ impl App {
 
             ui.label("Mode");
             if bound {
-                ui.colored_label(mode_color(q.mode), q.mode.name());
+                let c = mode_text_color(ui.visuals().dark_mode, q.mode);
+                ui.colored_label(c, q.mode.name());
             } else {
                 egui::ComboBox::from_id_salt("qso_mode")
                     .selected_text(q.mode.name())
@@ -1032,12 +1122,15 @@ impl App {
         // worth reading rather than the part being typed into.
         let reserved = 96.0;
         let log_h = (ui.available_height() - reserved).max(60.0);
+        let dark = ui.visuals().dark_mode;
         egui::ScrollArea::vertical().stick_to_bottom(true).max_height(log_h).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             for e in &q.log {
                 let (color, tag) = match e.dir {
-                    Dir::Rx => (mode_color(q.mode), Dir::Rx.tag()),
-                    Dir::Tx => (Color32::from_gray(210), Dir::Tx.tag()),
+                    Dir::Rx => (mode_text_color(dark, q.mode), Dir::Rx.tag()),
+                    // Our own text takes the theme's own strong colour: it
+                    // is us talking, not a station with a mode colour.
+                    Dir::Tx => (ui.visuals().strong_text_color(), Dir::Tx.tag()),
                 };
                 ui.horizontal_top(|ui| {
                     ui.monospace(offset(e.at_s - q.started_s));
@@ -1067,7 +1160,8 @@ impl App {
                 })
                 .clicked();
             if busy > 0.0 {
-                ui.colored_label(Color32::from_rgb(255, 190, 120), format!("● TX {busy:.0} s"));
+                let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 190, 120));
+                ui.colored_label(c, format!("● TX {busy:.0} s"));
                 abort = ui.small_button("abort").clicked();
             }
         });
@@ -1353,6 +1447,21 @@ impl App {
                         }
                     });
                     ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Theme");
+                        for t in Theme::ALL {
+                            let pick = ui.selectable_label(self.theme == t, t.label());
+                            let pick = match t {
+                                Theme::Auto => pick.on_hover_text("follow the desktop"),
+                                _ => pick,
+                            };
+                            if pick.clicked() {
+                                self.theme = t;
+                                ui.ctx().set_theme(t.preference());
+                            }
+                        }
+                    });
+                    ui.separator();
                     if ui.button("Reset view").clicked() {
                         self.vp = Viewport { f_lo: self.band.0, f_hi: self.band.1 };
                         ui.close();
@@ -1449,7 +1558,8 @@ impl App {
                 ui.separator();
                 match &self.status {
                     Some(err) => {
-                        ui.colored_label(Color32::from_rgb(255, 150, 150), format!("⚠ {err}"));
+                        let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 150, 150));
+                        ui.colored_label(c, format!("⚠ {err}"));
                     }
                     None if !live && !self.source.is_empty() => {
                         ui.weak(&self.source);
@@ -1722,6 +1832,7 @@ impl App {
             let rows = layout::place(&ideals, line_h, line_h, g.height - line_h);
 
             let font = FontId::monospace(self.text_px);
+            let dark = ui.visuals().dark_mode;
             let char_w = self.text_px * 0.6;
             let max_chars = ((g.strip_x0() - 8.0) / char_w).max(1.0) as usize;
             // clip text to the text panel so a chunk sliding in from behind the
@@ -1732,7 +1843,7 @@ impl App {
             ));
 
             for (i, ch) in visible.iter().enumerate() {
-                let color = mode_color(ch.mode);
+                let color = mode_text_color(dark, ch.mode);
                 let y_row = rows[i];
                 let y_freq = g.hz_to_y(&self.vp, ch.hz);
 
@@ -1930,6 +2041,7 @@ mod tests {
         app.preferred_input = Some("USB Audio CODEC".to_string());
         app.preferred_output = Some("alsa:plughw:CARD=Rig,DEV=0".to_string());
         app.qso_w = 380.0;
+        app.theme = Theme::Light;
         app.set_view(1200.0, 1400.0);
         for (m, on) in app.modes.iter_mut() {
             *on = m.protocol() == Protocol::Olivia;
@@ -1946,9 +2058,54 @@ mod tests {
         assert_eq!(restored.preferred_input.as_deref(), Some("USB Audio CODEC"));
         assert_eq!(restored.preferred_output.as_deref(), Some("alsa:plughw:CARD=Rig,DEV=0"));
         assert_eq!(restored.qso_w, 380.0);
+        assert_eq!(restored.theme, Theme::Light);
         assert_eq!((restored.vp.f_lo, restored.vp.f_hi), (1200.0, 1400.0));
         assert_eq!(restored.enabled_modes(), app.enabled_modes());
         assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
+    }
+
+    /// A theme name this build does not know — from a settings file written by
+    /// a later one — falls back to Auto and leaves the rest of the file intact.
+    /// A file written before the theme existed does the same.
+    #[test]
+    fn an_unknown_theme_falls_back_without_taking_the_settings_with_it() {
+        for theme in [r#""aubergine""#, r#""""#] {
+            let json = format!(
+                r#"{{"text_px":17.0,"qso_w":380.0,"modes":["JS8 Normal"],"theme":{theme}}}"#
+            );
+            let mut app = App::base((0.0, 4000.0));
+            app.theme = Theme::Dark;
+            app.apply(serde_json::from_str(&json).unwrap());
+            assert_eq!(app.theme, Theme::Auto, "{theme} should not have been honoured");
+            assert_eq!(app.text_px, 17.0, "{theme} took the other settings down with it");
+        }
+
+        // and a file from before the setting existed
+        let mut app = App::base((0.0, 4000.0));
+        app.theme = Theme::Dark;
+        app.apply(serde_json::from_str(r#"{"text_px":17.0}"#).unwrap());
+        assert_eq!(app.theme, Theme::Auto);
+    }
+
+    /// The palette is pitched for a dark panel, so on a light one every accent
+    /// has to come down far enough to read against near-white.
+    #[test]
+    fn light_mode_darkens_what_would_otherwise_wash_out() {
+        for (m, _) in App::base((0.0, 4000.0)).modes {
+            let dark = mode_text_color(true, m);
+            let light = mode_text_color(false, m);
+            assert_eq!(dark, mode_color(m), "the dark palette must be left alone");
+            // Rec. 601 luma is enough to say "this is not nearly white".
+            let luma = |c: Color32| {
+                0.299 * c.r() as f32 + 0.587 * c.g() as f32 + 0.114 * c.b() as f32
+            };
+            assert!(
+                luma(light) < 128.0,
+                "{} stays at luma {:.0} in light mode",
+                m.name(),
+                luma(light)
+            );
+        }
     }
 
     /// A settings file written before the view was saved leaves it alone: the
