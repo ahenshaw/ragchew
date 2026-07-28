@@ -1353,12 +1353,12 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         spec: &Spectrogram,
-        px_w: usize,
-        px_h: usize,
+        size: [usize; 2],
         col_hi: i64,
         col_travel: i64,
         span_cols: usize,
     ) -> egui::TextureHandle {
+        let [px_w, px_h] = size;
         // A waterfall gains one column at a time and drops one off the far end:
         // the picture is the same picture, moved. Redrawing it whole cost a
         // logarithm and a colour-map lookup for every one of half a million
@@ -2109,8 +2109,7 @@ impl App {
             let tex = self.waterfall_texture(
                 ctx,
                 &spec,
-                (self.waterfall_w * ppp) as usize,
-                (g.height * ppp) as usize,
+                [(self.waterfall_w * ppp) as usize, (g.height * ppp) as usize],
                 col_hi,
                 col_travel,
                 span_cols,
@@ -2634,16 +2633,16 @@ mod tests {
         // A full spectrogram: the index of the newest column never changes.
         let col_hi = spec.columns.len() as i64;
         let travel = 100_000i64;
-        app.waterfall_texture(&ctx, &spec, w, h, col_hi, travel, span);
+        let _ = app.waterfall_texture(&ctx, &spec, [w, h], col_hi, travel, span);
         let first = app.wf_img.as_ref().expect("an image").rgba.clone();
 
         // Nothing has travelled: the picture is already right.
-        app.waterfall_texture(&ctx, &spec, w, h, col_hi, travel, span);
+        let _ = app.waterfall_texture(&ctx, &spec, [w, h], col_hi, travel, span);
         assert_eq!(app.wf_img.as_ref().unwrap().rgba, first, "redrawn for no reason");
 
         // A pixel's worth of data has gone by, with the index still standing
         // still. The picture has to move.
-        app.waterfall_texture(&ctx, &spec, w, h, col_hi, travel + per_px as i64, span);
+        let _ = app.waterfall_texture(&ctx, &spec, [w, h], col_hi, travel + per_px as i64, span);
         assert_ne!(
             app.wf_img.as_ref().unwrap().rgba,
             first,
