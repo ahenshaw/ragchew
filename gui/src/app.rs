@@ -457,6 +457,24 @@ fn snap_to_pixels(t: f64, span: f64, track_w: f32, points_per_px: f32) -> f64 {
     (t / per_px).round() * per_px
 }
 
+/// The waterfall texture's width, and how many spectrogram columns each of its
+/// pixels pools, for a panel `px_w` pixels wide showing `span_cols` of history.
+///
+/// The columns per pixel is an integer on purpose. A scrolled image is only
+/// identical to a redrawn one when a new column of data is a whole pixel of
+/// travel — at 1.6 columns per pixel there is no whole-pixel shift, and a third
+/// of the image comes out wrong. So the texture is sized to divide the span
+/// exactly and the GPU scales it the rest of the way to the panel, which costs
+/// a little sharpness and buys an image that can be scrolled.
+///
+/// Pooling stays a maximum over whole columns either way, so a narrow carrier
+/// still survives into the picture rather than being averaged away.
+fn texture_geometry(span_cols: usize, px_w: usize) -> (usize, usize) {
+    let per_px = ((span_cols as f64 / px_w.max(1) as f64).round() as usize).max(1);
+    let tex_w = (span_cols / per_px).max(1);
+    (per_px, tex_w)
+}
+
 /// The log's offset column: how long into the QSO a line landed.
 fn offset(s: f64) -> String {
     format!("+{:>6}", clock(s))
@@ -652,7 +670,13 @@ struct App {
     strip_w: f32,
 
     tex: Option<egui::TextureHandle>,
-    tex_key: (usize, usize, i64, i64, i64, i64),
+    tex_key: (usize, usize, i64, i64, usize, i64),
+    /// The waterfall image on the CPU, kept between frames so new columns can
+    /// be scrolled into it instead of the whole picture being redrawn, with the
+    /// column and contrast bounds it currently shows.
+    wf_img: Option<waterfall::Image>,
+    wf_col: i64,
+    wf_norm: (f32, f32),
 
     /// Every mode the app knows about, and whether it is being listened for.
     /// Scanning costs time per mode, so this is the app's main speed control.
@@ -723,6 +747,9 @@ impl App {
             strip_w: 35.0,
             tex: None,
             tex_key: (0, 0, 0, 0, 0, 0),
+            wf_img: None,
+            wf_col: i64::MIN,
+            wf_norm: (0.0, 1.0),
             modes: protocol::default_modes().into_iter().map(|m| (m, true)).collect(),
             samples: Arc::new(Vec::new()),
             source: String::new(),
@@ -1322,22 +1349,81 @@ impl App {
         col_hi: i64,
         span_cols: usize,
     ) -> egui::TextureHandle {
+        // A waterfall gains one column at a time and drops one off the far end:
+        // the picture is the same picture, moved. Redrawing it whole cost a
+        // logarithm and a colour-map lookup for every one of half a million
+        // pixels, 25 times a second, which was the interface's entire frame.
+        //
+        // So the image is kept and scrolled, and only the new columns drawn.
+        // Everything else a pixel depends on — the view, the size, the span,
+        // the contrast bounds — must be unchanged for that to be valid; when
+        // any of it moves, the image is rendered afresh.
+        let (per_px, tex_w) = texture_geometry(span_cols, px_w);
+        let span_used = tex_w * per_px;
         let key = (
-            px_w,
+            tex_w,
             px_h,
             (self.vp.f_lo * 16.0) as i64,
             (self.vp.f_hi * 16.0) as i64,
-            col_hi,
-            span_cols as i64,
+            per_px,
+            span_used as i64,
         );
-        if self.tex.is_none() || self.tex_key != key {
-            let img = waterfall::render_window(
-                spec, &self.vp, px_w.max(1), px_h.max(1), col_hi, span_cols.max(1), Some(self.norm),
-            );
+
+        // The contrast bounds are re-estimated as the noise floor drifts. A
+        // small move leaves the picture honest; a large one means every pixel
+        // already drawn is on the wrong scale, so the image is redrawn.
+        let scale = (self.wf_norm.1 - self.wf_norm.0).abs().max(1e-6);
+        let norm_moved = (self.norm.0 - self.wf_norm.0).abs() > scale * 0.02
+            || (self.norm.1 - self.wf_norm.1).abs() > scale * 0.02;
+
+        // Saturating: before anything has been drawn `wf_col` is the floor of
+        // the range, and a plain subtraction overflows.
+        // Saturating: before anything has been drawn `wf_col` is the floor of
+        // the range, and a plain subtraction overflows.
+        let advanced = col_hi.saturating_sub(self.wf_col);
+        let reusable = self.tex.is_some() && self.tex_key == key && !norm_moved;
+
+        // Nothing new, or not yet a whole pixel of it: what is on screen is
+        // still exactly what a redraw would produce. `wf_col` deliberately
+        // stays put, so the columns keep accumulating towards the next pixel.
+        if reusable && (advanced == 0 || advanced % per_px as i64 != 0) {
+            return self.tex.clone().unwrap();
+        }
+
+        let shift = advanced / per_px.max(1) as i64;
+        let scrolled = reusable
+            && shift > 0
+            && shift < tex_w as i64
+            && self.wf_img.as_mut().is_some_and(|img| {
+                waterfall::scroll_window(
+                    img,
+                    spec,
+                    &self.vp,
+                    col_hi,
+                    span_used,
+                    self.norm,
+                    shift as usize,
+                )
+            });
+
+        if !scrolled {
+            self.wf_img = Some(waterfall::render_window(
+                spec,
+                &self.vp,
+                tex_w,
+                px_h.max(1),
+                col_hi,
+                span_used.max(1),
+                Some(self.norm),
+            ));
+        }
+        if let Some(img) = &self.wf_img {
             let color = egui::ColorImage::from_rgba_unmultiplied([img.width, img.height], &img.rgba);
             self.tex = Some(ctx.load_texture("waterfall", color, egui::TextureOptions::LINEAR));
-            self.tex_key = key;
         }
+        self.tex_key = key;
+        self.wf_col = col_hi;
+        self.wf_norm = self.norm;
         self.tex.clone().unwrap()
     }
 
@@ -2470,6 +2556,38 @@ mod tests {
         // Degenerate spans are passed through rather than dividing by zero.
         assert_eq!(snap_to_pixels(3.0, 0.0, TRACK_W, 1.0), 3.0);
         assert_eq!(snap_to_pixels(3.0, f64::NAN, TRACK_W, 1.0), 3.0);
+    }
+
+    /// The waterfall texture must divide its span into a whole number of
+    /// columns per pixel, because that is the only arrangement in which a new
+    /// column of data is a whole pixel of travel and the image can be scrolled
+    /// rather than redrawn.
+    #[test]
+    fn the_waterfall_texture_divides_its_span_exactly() {
+        // 45 s of span at 25 columns a second, against a range of panels
+        for px_w in [37usize, 80, 300, 700, 1125, 4000] {
+            for span in [250usize, 1000, 1125, 3000] {
+                let (per_px, tex_w) = texture_geometry(span, px_w);
+                assert!(per_px >= 1 && tex_w >= 1, "degenerate geometry for {px_w}/{span}");
+                assert_eq!(
+                    (tex_w * per_px) % per_px,
+                    0,
+                    "the span shown must be whole pixels at {px_w}/{span}"
+                );
+                // The window shown is short of the one asked for by less than a
+                // single pixel of time.
+                let shown = tex_w * per_px;
+                assert!(
+                    span - shown < per_px,
+                    "{px_w}/{span}: showing {shown} of {span} columns loses more than a pixel"
+                );
+                // And the texture stays within sight of the panel it fills.
+                assert!(tex_w <= span.max(1), "texture wider than the data at {px_w}/{span}");
+            }
+        }
+        // Degenerate sizes must not divide by zero.
+        assert_eq!(texture_geometry(0, 0), (1, 1));
+        assert_eq!(texture_geometry(1125, 0), (1125, 1));
     }
 
     /// A band with two stations in it, revealed at `t`.
