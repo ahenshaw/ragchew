@@ -123,6 +123,103 @@ fn column_step(cols: usize, bins: usize) -> usize {
     (total / SAMPLE_TARGET).max(1).min(cols)
 }
 
+/// Scroll a rendered waterfall right by `shift_px` pixels and draw the columns
+/// that have arrived since, into the space that opens at the left edge.
+///
+/// Time runs newest-at-the-left, so new data enters there and everything else
+/// moves right: the image is a memmove per row plus a strip of new pixels,
+/// where a full render is a logarithm and a colour-map lookup for every pixel
+/// of it. At a 45-second span in a 700-pixel panel that is 800 pixels of work
+/// instead of 560,000.
+///
+/// The caller must have kept everything else identical — the same viewport,
+/// size, span and contrast bounds — because each of those remaps pixels the
+/// scroll leaves untouched. Returns `false` without touching the image when the
+/// shift is too large to have anything left to keep, and the caller should
+/// render afresh.
+///
+/// `col_hi` is the newest column *after* the advance, as [`render_window`]
+/// takes it.
+pub fn scroll_window(
+    img: &mut Image,
+    spec: &Spectrogram,
+    vp: &Viewport,
+    col_hi: i64,
+    span_cols: usize,
+    norm: (f32, f32),
+    shift_px: usize,
+) -> bool {
+    let (width, height) = (img.width, img.height);
+    if width == 0 || height == 0 || spec.columns.is_empty() || span_cols == 0 {
+        return false;
+    }
+    if shift_px >= width {
+        return false; // nothing worth keeping
+    }
+    if shift_px == 0 {
+        return true;
+    }
+
+    // Everything moves right by `shift_px`, oldest falling off the right edge.
+    // Rows are contiguous, so each is its own memmove.
+    let stride = width * 4;
+    for y in 0..height {
+        let row = y * stride;
+        img.rgba.copy_within(row..row + (width - shift_px) * 4, row + shift_px * 4);
+    }
+
+    let n_cols = spec.columns.len() as i64;
+    let n_bins = spec.n_bins;
+    let span = span_cols as i64;
+    let to_bin = |hz: f64| ((hz - spec.hz_lo()) / spec.bin_hz).round();
+    let b0 = to_bin(vp.f_lo).clamp(0.0, (n_bins - 1) as f64) as usize;
+    let b1 = to_bin(vp.f_hi).clamp(0.0, (n_bins - 1) as f64) as usize;
+    let (b0, b1) = (b0.min(b1), b0.max(b1));
+    let vb = (b1 - b0 + 1) as i64;
+
+    let (lo, hi) = norm;
+    let span_v = (hi - lo).max(1e-6);
+    for oy in 0..height {
+        let top = b1 as i64 - (oy as i64 * vb) / height as i64;
+        let bot = b1 as i64 - ((oy + 1) as i64 * vb) / height as i64;
+        let (blo, bhi) = (bot.max(0) as usize, top.max(0) as usize);
+        for ox in 0..shift_px {
+            // The same mapping `render_window` uses, so a scrolled pixel and a
+            // rendered one are the same pixel.
+            let chi = col_hi - (ox as i64 * span) / width as i64;
+            let clo = col_hi - ((ox + 1) as i64 * span) / width as i64;
+            let c = match cell(spec, clo.max(0), chi.max(clo + 1).min(n_cols), blo, bhi) {
+                Some(lm) => colormap::magma(((lm - lo) / span_v).clamp(0.0, 1.0)),
+                None => BG,
+            };
+            img.put(ox, oy, c);
+        }
+    }
+    true
+}
+
+/// The log-magnitude behind one output pixel: the loudest bin in the block of
+/// spectrogram it covers. `None` where that block falls outside the recording.
+///
+/// Shared by the full render and the scroll so the two cannot disagree about
+/// what a pixel is — which is the whole basis of scrolling instead of redrawing.
+#[inline]
+fn cell(spec: &Spectrogram, clo: i64, chi: i64, blo: usize, bhi: usize) -> Option<f32> {
+    if clo >= chi {
+        return None;
+    }
+    let mut mx = 0.0f32;
+    for j in clo..chi {
+        let col = &spec.columns[j as usize];
+        for b in blo..=bhi.min(spec.n_bins - 1) {
+            if col[b] > mx {
+                mx = col[b];
+            }
+        }
+    }
+    Some((mx + 1e-9).ln())
+}
+
 /// Render the whole recording (contrast stretched to its own percentiles).
 pub fn render(spec: &Spectrogram, vp: &Viewport, width: usize, height: usize) -> Image {
     let n = spec.columns.len() as i64;
@@ -179,21 +276,9 @@ pub fn render_window(
         let (blo, bhi) = bin_range(oy);
         for ox in 0..width {
             let (clo, chi) = col_range(ox);
-            let clo = clo.max(0);
-            let chi = chi.min(n_cols);
-            if clo >= chi {
+            let Some(lm) = cell(spec, clo.max(0), chi.min(n_cols), blo, bhi) else {
                 continue; // outside the recording -> stays -inf (bg)
-            }
-            let mut mx = 0.0f32;
-            for j in clo..chi {
-                let col = &spec.columns[j as usize];
-                for b in blo..=bhi.min(n_bins - 1) {
-                    if col[b] > mx {
-                        mx = col[b];
-                    }
-                }
-            }
-            let lm = (mx + 1e-9).ln();
+            };
             grid[oy * width + ox] = lm;
             if norm.is_none() {
                 vals.push(lm);
@@ -224,4 +309,86 @@ pub fn render_window(
         }
     }
     img
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use ragchew::spectrogram::WINDOW;
+
+    /// Scrolling must be indistinguishable from redrawing.
+    ///
+    /// The whole justification for the scroll is that it produces the image a
+    /// full render would have produced, so this walks a rendered waterfall
+    /// forward one pixel at a time and compares every step against a fresh
+    /// render at the same column — across panel widths that divide the span
+    /// evenly and widths that do not, which is where an off-by-one in the
+    /// pixel-to-column mapping would show.
+    #[test]
+    fn scrolling_matches_redrawing() {
+        let hop = WINDOW / 4;
+        let samples = crate::demo::synth();
+        let mut spec = Spectrogram::compute(&samples, 0.0, 4000.0, hop);
+        // Long enough to scroll through: the band repeated, which is fine here
+        // because what is being compared is two renderings of the same data.
+        while spec.columns.len() < 4000 {
+            let more = Spectrogram::compute(&samples, 0.0, 4000.0, hop);
+            spec.columns.extend(more.columns);
+        }
+        let full_band = Viewport { f_lo: 0.0, f_hi: 4000.0 };
+        let zoomed = Viewport { f_lo: 1200.0, f_hi: 1800.0 };
+        let norm = percentiles(&spec);
+
+        // Every width here divides its span exactly, which is the condition
+        // under which a column of new data is a whole pixel of travel.
+        for (w, h, span) in [
+            (375usize, 200usize, 1125usize), // 3 columns per pixel
+            (225, 120, 1125),                // 5
+            (125, 100, 1125),                // 9
+            (80, 120, 1120),                 // 14, the panel at its narrowest
+            (256, 128, 1024),                // a power-of-two ratio
+            (250, 100, 1000),                // 4
+        ] {
+            for vp in [&full_band, &zoomed] {
+                let step = (span / w).max(1) as i64;
+                let base = 2000i64;
+                let mut img = render_window(&spec, vp, w, h, base, span, Some(norm));
+                for k in 1..=6i64 {
+                    let col = base + k * step;
+                    assert!(
+                        scroll_window(&mut img, &spec, vp, col, span, norm, 1),
+                        "scroll refused at w={w} span={span}"
+                    );
+                    let fresh = render_window(&spec, vp, w, h, col, span, Some(norm));
+                    let differing = img
+                        .rgba
+                        .chunks(4)
+                        .zip(fresh.rgba.chunks(4))
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    assert_eq!(
+                        differing, 0,
+                        "w={w} h={h} span={span} step {k}: {differing} pixels differ from a redraw"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A shift with nothing left to keep is refused rather than silently
+    /// leaving a stale image behind.
+    #[test]
+    fn an_oversized_scroll_is_refused() {
+        let spec = Spectrogram::compute(&crate::demo::synth(), 0.0, 4000.0, WINDOW / 4);
+        let vp = Viewport { f_lo: 0.0, f_hi: 4000.0 };
+        let norm = percentiles(&spec);
+        let mut img = render_window(&spec, &vp, 64, 32, 2000, 500, Some(norm));
+        let before = img.rgba.clone();
+        assert!(!scroll_window(&mut img, &spec, &vp, 2600, 500, norm, 64));
+        assert!(!scroll_window(&mut img, &spec, &vp, 2600, 500, norm, 999));
+        assert_eq!(img.rgba, before, "a refused scroll must not touch the image");
+        // and a zero-pixel scroll is a no-op that succeeds
+        assert!(scroll_window(&mut img, &spec, &vp, 2000, 500, norm, 0));
+        assert_eq!(img.rgba, before);
+    }
 }
