@@ -24,6 +24,11 @@ fn unix_now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
 }
 
+/// How far past its capacity the audio buffer is allowed to run before it is
+/// cut back. Thirty seconds of slack costs 1.4 MB and turns a memmove on every
+/// audio callback into one every thirty seconds.
+const TRIM_BLOCK: usize = RATE as usize * 30;
+
 /// A rolling buffer of 12 kHz mono samples with absolute (global) indexing and
 /// a wall-clock anchor, so any UTC time maps to a sample range.
 pub struct AudioBuf {
@@ -44,7 +49,14 @@ impl AudioBuf {
             self.started = true;
         }
         self.samples.extend_from_slice(s);
-        if self.samples.len() > self.cap {
+        // Trimming moves every sample that survives, so cutting back to exactly
+        // `cap` on the callback that first exceeds it means moving the whole
+        // buffer on *every* callback from then on — 14 MB a time, tens to
+        // hundreds of times a second, inside the audio callback and holding the
+        // lock the UI thread and both decoders need. The buffer is allowed to
+        // overshoot and is then cut in one block, which is the same memmove a
+        // few thousand times less often.
+        if self.samples.len() > self.cap + TRIM_BLOCK {
             let drop = self.samples.len() - self.cap;
             self.samples.drain(0..drop);
             self.global_start += drop as u64;
@@ -596,6 +608,44 @@ mod tests {
         .iter()
         .map(|(id, label)| dev(id, label))
         .collect()
+    }
+
+    /// Appending to a full buffer must not cost what the buffer is big.
+    ///
+    /// Cutting back to exactly `cap` means moving every surviving sample on
+    /// every callback once full — 14 MB a time, inside the audio callback,
+    /// holding the lock the interface and both decoders need. It measured
+    /// 970 us per callback; the whole app stopped answering five minutes in,
+    /// which is exactly when a five-minute buffer fills.
+    #[test]
+    fn appending_to_a_full_buffer_stays_cheap() {
+        use std::time::Instant;
+        let cap = RATE as usize * 300;
+        let mut b = AudioBuf::new(cap);
+        let chunk = vec![0.0f32; 512];
+        // Up to and through the first trim. Not `while len < cap + TRIM_BLOCK`:
+        // the append that crosses the line cuts back to `cap`, so that
+        // condition is true again immediately and the loop never ends.
+        while b.global_start == 0 {
+            b.append(&chunk);
+        }
+        // Long enough to cross several trim blocks, so the amortised cost is
+        // what is being measured rather than the gap between two of them.
+        let n = 20_000;
+        let t = Instant::now();
+        for _ in 0..n {
+            b.append(&chunk);
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        assert!(us < 50.0, "{us:.1} us per append, moving the buffer too often");
+        // And the bound still holds: it rolls, it does not grow.
+        assert!(
+            b.samples.len() <= cap + TRIM_BLOCK,
+            "buffer grew to {} past its {} cap",
+            b.samples.len(),
+            cap
+        );
+        assert!(b.global_start > 0, "nothing was ever trimmed");
     }
 
     /// Thirty advertised PCMs come down to the handful a person would
