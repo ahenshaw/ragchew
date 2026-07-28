@@ -26,3 +26,19 @@ rustfft = "6"
 
 [profile.release]
 opt-level = 3
+
+# A debug build decodes far too slowly to keep up with live audio: one Olivia
+# pass over its 24-second window across six modes measured 41 s unoptimised
+# against 3.5 s optimised, and the decode threads then never sleep. Since
+# `cargo run` gives a debug build, that is what most people meet first.
+#
+# So the codec and its dependencies are optimised even in dev, while the GUI
+# crate itself stays unoptimised and debuggable. The DSP is not where anyone
+# sets a breakpoint; the interface is.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Named as well as globbed: the `*` selector covers dependencies, and this
+# crate is a workspace member as well as a path dependency of the GUI.
+[profile.dev.package.ragchew]
+opt-level = 3
