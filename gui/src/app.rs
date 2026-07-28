@@ -475,6 +475,59 @@ fn texture_geometry(span_cols: usize, px_w: usize) -> (usize, usize) {
     (per_px, tex_w)
 }
 
+/// One numeric setting: a track to drag and a box to type into.
+///
+/// The slider's own readout is turned off and a `DragValue` put in its place,
+/// because a slider can only be aimed — for anything you know the number for,
+/// eleven pixels of text or a forty-five second window, typing it is the
+/// shorter path. The box drags too, so the pair covers both habits, and the
+/// range is enforced on the typed value as much as the dragged one.
+fn setting(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &str,
+    speed: f32,
+    decimals: usize,
+) {
+    // One row: name, track, value. The slider stacks its own label above its
+    // track, so the name is drawn here instead, and its readout is replaced by
+    // a box that can be typed into as well as dragged.
+    ui.horizontal(|ui| {
+        ui.add_sized([64.0, ui.spacing().interact_size.y], egui::Label::new(
+            egui::RichText::new(label).weak(),
+        ));
+        ui.add(elegance::Slider::new(value, range.clone()).show_value(false).desired_width(140.0));
+        ui.add(
+            egui::DragValue::new(value)
+                .range(range)
+                .suffix(suffix)
+                .speed(speed)
+                .max_decimals(decimals),
+        );
+    });
+}
+
+/// A menu that stays open while its contents are used.
+///
+/// egui closes a menu on any click inside it by default, which is right for a
+/// list of commands and wrong for a panel of settings: it swallowed the click
+/// that would have put a value box into text entry, and shut the mode menu on
+/// every checkbox. The items that should dismiss the menu — commands, device
+/// choices — call `ui.close()` themselves and still do.
+fn settings_menu<R>(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::Response {
+    use egui::containers::menu::{MenuButton, MenuConfig};
+    MenuButton::from_button(egui::Button::new(label))
+        .config(MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+        .ui(ui, contents)
+        .0
+}
+
 /// The log's offset column: how long into the QSO a line landed.
 fn offset(s: f64) -> String {
     format!("+{:>6}", clock(s))
@@ -940,7 +993,7 @@ impl App {
             let on = self.modes.iter().filter(|(m, e)| m.protocol() == p && *e).count();
             let total = self.modes.iter().filter(|(m, _)| m.protocol() == p).count();
             let label = format!("{} {on}/{total}", p.name());
-            ui.menu_button(label, |ui| {
+            settings_menu(ui, label, |ui| {
                 let set_all = |modes: &mut Vec<(ModeId, bool)>, on: bool| {
                     for (_, e) in modes.iter_mut().filter(|(m, _)| m.protocol() == p) {
                         *e = on;
@@ -1620,35 +1673,13 @@ impl App {
                 // Settings live behind the hamburger: they are set once and
                 // then left alone, so they do not deserve permanent space on a
                 // bar that has to stay on one line.
-                ui.menu_button("☰", |ui| {
-                    ui.set_min_width(260.0);
-                    let w = 150.0;
-                    ui.add(
-                        elegance::Slider::new(&mut self.text_px, 8.0..=22.0)
-                            .label("text size")
-                            .suffix(" px")
-                            .desired_width(w),
-                    );
-                    ui.add(
-                        elegance::Slider::new(&mut self.span_s, 10.0..=120.0)
-                            .label("window")
-                            .suffix(" s")
-                            .desired_width(w),
-                    );
-                    ui.add(
-                        elegance::Slider::new(&mut self.scroll_secs, 0.0..=2.0)
-                            .label("scroll")
-                            .suffix(" s")
-                            .decimals(1)
-                            .desired_width(w),
-                    );
+                settings_menu(ui, "☰", |ui| {
+                    ui.set_min_width(300.0);
+                    setting(ui, "text size", &mut self.text_px, 8.0..=22.0, " px", 0.25, 1);
+                    setting(ui, "window", &mut self.span_s, 10.0..=120.0, " s", 0.5, 0);
+                    setting(ui, "scroll", &mut self.scroll_secs, 0.0..=2.0, " s", 0.02, 2);
                     if !live {
-                        ui.add(
-                            elegance::Slider::new(&mut self.speed, 1.0..=20.0)
-                                .label("speed")
-                                .suffix("×")
-                                .desired_width(w),
-                        );
+                        setting(ui, "speed", &mut self.speed, 1.0..=20.0, "×", 0.1, 1);
                     }
                     // Offered whether or not the app is listening. Live, the
                     // list is the one capture opened from and the mark is the
@@ -1744,7 +1775,6 @@ impl App {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 })
-                .response
                 .on_hover_text("Settings");
                 // "Source", not "File": every item under it answers "what is
                 // this listening to" — a recording, a synthetic band, the sound
