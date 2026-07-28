@@ -469,6 +469,7 @@ fn spawn_js8(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<proto
             if (samples.len() as f64) < mode.chunk_secs() * RATE as f64 {
                 continue;
             }
+            let pass = std::time::Instant::now();
             let decodes = shift_times(
                 protocol::decode_all(&samples, BAND.0, BAND.1, &[mode]),
                 win_start,
@@ -476,6 +477,13 @@ fn spawn_js8(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<proto
             if !decodes.is_empty() && tx.send(decodes).is_err() {
                 break; // UI gone
             }
+            // Cycles that pass while a decode runs are skipped at the top of
+            // the loop, so falling behind costs coverage rather than building a
+            // backlog — but with four modes due every six to thirty seconds and
+            // a pass costing seconds, the next is always already due and the
+            // thread never sleeps at all. Yielding for as long as the pass took
+            // holds it to half the wall clock.
+            thread::sleep(pass.elapsed());
         }
     });
 }
@@ -491,8 +499,12 @@ fn spawn_js8(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<proto
 fn spawn_olivia(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<protocol::Decode>>) {
     thread::spawn(move || {
         let mut seen: Vec<(ModeId, f64, f64)> = Vec::new(); // (mode, hz, time_s)
+        // Stretches past OLIVIA_STEP_S on a machine — or in a build — that
+        // cannot scan the band in that long. See the back-off below.
+        let mut step = OLIVIA_STEP_S;
         loop {
-            thread::sleep(Duration::from_secs_f64(OLIVIA_STEP_S));
+            thread::sleep(Duration::from_secs_f64(step));
+            let pass = std::time::Instant::now();
             let now = match buf.lock().unwrap().started() {
                 true => unix_now(),
                 false => continue,
@@ -525,6 +537,15 @@ fn spawn_olivia(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<pr
             if !fresh.is_empty() && tx.send(fresh).is_err() {
                 break; // UI gone
             }
+
+            // Scanning six Olivia modes across the whole band costs 3.5 s in a
+            // release build and forty in a debug one, against a 4 s step. Left
+            // alone the thread runs flat out for ever, and the interface —
+            // sharing a CPU and a buffer lock with it — stops answering. The
+            // step therefore stretches to whatever the pass actually cost:
+            // decoding takes at most half the wall clock, and at 24 s windows
+            // there is still overlap to spare.
+            step = OLIVIA_STEP_S.max(pass.elapsed().as_secs_f64());
         }
     });
 }
