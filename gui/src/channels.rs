@@ -7,16 +7,40 @@
 
 use ragchew::protocol::{Decode, ModeId};
 
+/// How much decoded text a channel keeps.
+///
+/// A monitor left running overnight would otherwise hold every character it
+/// ever decoded, per channel, and the whole set is cloned once a frame. Only
+/// the tail is ever read — the text panel shows what fits on a row, and a QSO
+/// copies what it wants into its own log as it arrives — so the rest is weight
+/// with no reader. Generous enough that a QSO would have to go unread for tens
+/// of thousands of characters to miss any: see [`Channel::text_dropped`].
+const MAX_TEXT_CHARS: usize = 4096;
+
+/// How many (time, frequency) samples a channel keeps, beyond the first.
+const MAX_HISTORY: usize = 256;
+
 /// A tracked signal accumulating text across transmissions.
 #[derive(Clone, Debug)]
 pub struct Channel {
     pub id: u64,
     /// Latest carrier frequency (tracks drift).
     pub hz: f64,
-    /// (time_s, hz) samples, for drawing the drifting streak / leader endpoint.
+    /// Carrier when the channel was first heard, kept apart from
+    /// [`Channel::hz_history`] because that is trimmed and this is what drift
+    /// is measured against.
+    pub first_hz: f64,
+    /// Recent (time_s, hz) samples, for drawing the drifting streak / leader
+    /// endpoint. Bounded to [`MAX_HISTORY`]; the oldest are dropped.
     pub hz_history: Vec<(f64, f64)>,
-    /// Accumulated decoded text, oldest first.
+    /// Accumulated decoded text, oldest first, bounded to [`MAX_TEXT_CHARS`].
     pub text: String,
+    /// Characters dropped off the front of `text` to keep it bounded.
+    ///
+    /// Readers that count from the beginning of the conversation — a QSO
+    /// tracking how much of this channel it has logged — add this to an index
+    /// into `text` to get a position that does not shift under trimming.
+    pub text_dropped: usize,
     /// Mode of the most recent decode.
     pub mode: ModeId,
     /// Character count of the most recently appended chunk (for the scroll-in
@@ -42,10 +66,23 @@ impl Channel {
     /// Real signals wander: the off-air JS8 recording in this repository drifts
     /// about 10 Hz over two minutes.
     pub fn drift_hz(&self) -> f64 {
-        match self.hz_history.first() {
-            Some((_, first)) => self.hz - first,
-            None => 0.0,
+        self.hz - self.first_hz
+    }
+
+    /// Take the newest text on, and drop as much off the front as that costs
+    /// once the channel is at its limit.
+    fn push_text(&mut self, chunk: &str) {
+        self.text.push_str(chunk);
+        let len = self.text.chars().count();
+        if len <= MAX_TEXT_CHARS {
+            return;
         }
+        let drop = len - MAX_TEXT_CHARS;
+        // By character, not by byte: a callsign is ASCII but decoded text need
+        // not be, and splitting a multi-byte character would panic.
+        let cut = self.text.char_indices().nth(drop).map_or(self.text.len(), |(i, _)| i);
+        self.text.drain(..cut);
+        self.text_dropped += drop;
     }
 }
 
@@ -89,8 +126,11 @@ impl ChannelSet {
                 ch.hz = d.hz;
                 ch.mode = d.mode;
                 ch.hz_history.push((d.time_s, d.hz));
+                if ch.hz_history.len() > MAX_HISTORY {
+                    ch.hz_history.remove(0);
+                }
                 ch.last_chunk_chars = d.text.chars().count();
-                ch.text.push_str(&d.text);
+                ch.push_text(&d.text);
                 ch.last_heard_s = d.time_s;
                 ch.quality = d.quality;
                 ch.best_quality = ch.best_quality.max(d.quality);
@@ -102,16 +142,22 @@ impl ChannelSet {
                 self.channels.push(Channel {
                     id,
                     hz: d.hz,
+                    first_hz: d.hz,
                     mode: d.mode,
                     hz_history: vec![(d.time_s, d.hz)],
                     last_chunk_chars: d.text.chars().count(),
-                    text: d.text,
+                    text_dropped: 0,
+                    text: String::new(),
                     last_heard_s: d.time_s,
                     first_heard_s: d.time_s,
                     quality: d.quality,
                     best_quality: d.quality,
                     chunks: 1,
                 });
+                // Through `push_text`, so a single outsized decode cannot put
+                // a brand-new channel over the limit either.
+                let ch = self.channels.last_mut().expect("just pushed");
+                ch.push_text(&d.text);
             }
         }
     }
@@ -228,5 +274,74 @@ mod tests {
         );
         assert_eq!(set.channels().len(), 1);
         assert_eq!(set.channels()[0].text, "CQ CQ DE W1AW");
+    }
+
+    /// A channel left running must not accumulate text without limit: the whole
+    /// set is deep-cloned once a frame, so what a monitor holds after a night on
+    /// the air is what it pays for on every one of them.
+    #[test]
+    fn a_channels_text_stops_growing() {
+        let mut set = ChannelSet::new(15.0);
+        let chunk = "CQ CQ DE K2N FN20 ";
+        let n = 4000;
+        for i in 0..n {
+            set.add(Decode {
+                hz: 1000.0,
+                time_s: i as f64,
+                text: chunk.to_string(),
+                mode: ModeId::Js8(js8::Mode::Normal),
+                quality: 4.0,
+            });
+        }
+        let ch = &set.channels()[0];
+        let produced = n * chunk.chars().count();
+        assert_eq!(ch.text.chars().count(), MAX_TEXT_CHARS, "text is not at its bound");
+        assert_eq!(
+            ch.text_dropped + ch.text.chars().count(),
+            produced,
+            "what was dropped plus what is kept must be everything decoded"
+        );
+        // The tail is what survives, and it is intact.
+        assert!(ch.text.ends_with(chunk), "the newest text was trimmed instead of the oldest");
+        assert!(ch.hz_history.len() <= MAX_HISTORY, "history is not bounded");
+    }
+
+    /// Drift is measured from where a station was first heard, which outlives
+    /// the frequency history being trimmed.
+    #[test]
+    fn drift_survives_a_trimmed_history() {
+        let mut set = ChannelSet::new(15.0);
+        for i in 0..(MAX_HISTORY * 3) {
+            set.add(Decode {
+                // creeping up 0.01 Hz a decode, well inside the tolerance
+                hz: 1000.0 + i as f64 * 0.01,
+                time_s: i as f64,
+                text: "x".to_string(),
+                mode: ModeId::Js8(js8::Mode::Normal),
+                quality: 4.0,
+            });
+        }
+        let ch = &set.channels()[0];
+        let expected = (MAX_HISTORY * 3 - 1) as f64 * 0.01;
+        assert!(
+            (ch.drift_hz() - expected).abs() < 1e-6,
+            "drift {} should be {expected} from where it started",
+            ch.drift_hz()
+        );
+    }
+
+    /// Text longer than the bound in a single decode still leaves the channel
+    /// at its limit rather than over it.
+    #[test]
+    fn one_outsized_decode_does_not_break_the_bound() {
+        let mut set = ChannelSet::new(15.0);
+        set.add(Decode {
+            hz: 1000.0,
+            time_s: 0.0,
+            text: "y".repeat(MAX_TEXT_CHARS * 2),
+            mode: ModeId::Js8(js8::Mode::Normal),
+            quality: 4.0,
+        });
+        assert_eq!(set.channels()[0].text.chars().count(), MAX_TEXT_CHARS);
     }
 }

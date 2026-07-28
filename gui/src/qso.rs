@@ -86,8 +86,9 @@ pub struct Qso {
     /// The reply being composed. Per QSO, so switching tabs and coming back
     /// finds it as you left it.
     pub draft: String,
-    /// How many characters of the bound channel's accumulated text are already
-    /// in the log.
+    /// How many characters the bound channel has ever produced that are already
+    /// in the log — counted from the start of the conversation, not from the
+    /// start of what the channel still holds, since that is trimmed.
     absorbed: usize,
 }
 
@@ -124,15 +125,21 @@ impl Qso {
         self.drift_hz = ch.drift_hz();
         self.quality = ch.quality;
 
-        let len = ch.text.chars().count();
+        // `absorbed` counts from the start of the conversation rather than
+        // from the start of what the channel still holds, so trimming the front
+        // of that text does not shift what this has already taken.
+        let have = ch.text_dropped + ch.text.chars().count();
         // Scrubbing the playback clock backwards rebuilds the channel with less
         // text than we have already logged. Nothing to take, and nothing to
         // panic about either.
-        if len <= self.absorbed {
+        if have <= self.absorbed {
             return;
         }
-        let new: String = ch.text.chars().skip(self.absorbed).collect();
-        self.absorbed = len;
+        // Text trimmed away before this QSO reached it is gone; start from the
+        // oldest character the channel still has rather than from behind it.
+        let seen = self.absorbed.max(ch.text_dropped);
+        let new: String = ch.text.chars().skip(seen - ch.text_dropped).collect();
+        self.absorbed = have;
         self.last_s = ch.last_heard_s;
         if self.call.trim().is_empty() {
             if let Some(c) = callsign_in(&new) {
@@ -464,6 +471,71 @@ mod tests {
         assert!((age(qsos.qsos()[0].started_utc) - 55.0).abs() < 1.0, "not backdated 55 s");
         let blank = qsos.qsos()[1].started_utc;
         assert!(blank >= before && blank <= after, "a blank QSO is stamped now");
+    }
+
+    /// A QSO following a channel keeps logging correctly once that channel
+    /// starts trimming its text.
+    ///
+    /// The channel only keeps a tail, so the position a QSO has reached cannot
+    /// be an index into what is left — it counts from the start of the
+    /// conversation instead. Get that wrong and the log either replays text it
+    /// already has or silently stops growing.
+    #[test]
+    fn a_qso_keeps_up_with_a_channel_that_trims_its_text() {
+        let mut set = ChannelSet::new(15.0);
+        let chunk = "DE K2N ";
+        let decode = |i: usize| js8_decode(1000.0, i as f64, chunk);
+
+        set.add(decode(0));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 1.0);
+
+        // Enough traffic to push the channel well past its bound.
+        let n = 2000;
+        for i in 1..n {
+            set.add(decode(i));
+            qsos.absorb(&set);
+        }
+
+        let ch = &set.channels()[0];
+        assert!(ch.text_dropped > 0, "the channel never trimmed; this proves nothing");
+
+        let q = &qsos.qsos()[0];
+        let logged: String = q.log.iter().filter(|e| e.dir == Dir::Rx).map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            logged.chars().count(),
+            n * chunk.chars().count(),
+            "the log should hold every character the channel produced, once"
+        );
+        assert_eq!(logged, chunk.repeat(n), "the log is not what was decoded, in order");
+    }
+
+    /// A QSO that falls further behind than the channel keeps loses the text in
+    /// between — but it must lose it cleanly, taking up from the oldest
+    /// character still held rather than subtracting its way past zero.
+    #[test]
+    fn a_qso_that_falls_behind_a_trim_resumes_cleanly() {
+        let mut set = ChannelSet::new(15.0);
+        let mut qsos = QsoSet::new();
+        set.add(js8_decode(1000.0, 0.0, "start "));
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let logged_first = qsos.qsos()[0].log.len();
+
+        // A long stretch with nobody reading it: the channel trims text this
+        // QSO has never seen.
+        for i in 1..3000 {
+            set.add(js8_decode(1000.0, i as f64, "middle "));
+        }
+        set.add(js8_decode(1000.0, 3000.0, "end "));
+        qsos.absorb(&set);
+
+        let q = &qsos.qsos()[0];
+        assert!(q.log.len() > logged_first, "nothing was absorbed after the gap");
+        let last = q.log.last().expect("a log entry");
+        assert!(last.text.ends_with("end "), "resumed at the wrong place: {:?}", last.text);
+        // What it took is exactly what the channel still had beyond its mark.
+        let ch = &set.channels()[0];
+        assert_eq!(last.text.chars().count(), ch.text.chars().count());
     }
 
     /// Clicking the same channel again returns to its tab instead of opening a
