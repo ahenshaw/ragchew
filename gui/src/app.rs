@@ -727,19 +727,21 @@ impl App {
         // waterfall's text panel; the button is for one that has not been heard
         // yet — calling first, or logging a contact made elsewhere.
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
             let mut want_active = self.qsos.active();
             let mut close: Option<usize> = None;
             for (i, q) in self.qsos.qsos().iter().enumerate() {
                 let on = i == self.qsos.active();
-                let label = egui::RichText::new(q.label()).color(mode_color(q.mode));
-                if ui.selectable_label(on, label).clicked() {
+                let (picked, closed) = Self::qso_tab(ui, &q.label(), mode_color(q.mode), on);
+                if picked {
                     want_active = i;
                 }
-                if on && ui.small_button("✕").on_hover_text("close this QSO").clicked() {
+                if closed {
                     close = Some(i);
                 }
             }
-            if ui.button("＋").on_hover_text("new QSO").clicked() {
+            ui.add_space(6.0);
+            if ui.button("+").on_hover_text("new QSO").clicked() {
                 let hz = (self.vp.f_lo + self.vp.f_hi) / 2.0;
                 let mode = self.enabled_modes().first().copied().unwrap_or(ModeId::Js8(
                     ragchew::js8::Mode::Normal,
@@ -784,6 +786,90 @@ impl App {
         if send {
             self.send_active(now_s);
         }
+    }
+
+    /// One tab in the QSO strip: a plate rounded at the top and square at the
+    /// bottom, so the selected one reads as joined to the panel below it. The
+    /// close cross appears only while the pointer is over the tab, but its
+    /// space is always reserved — tabs must not resize under the cursor.
+    ///
+    /// The cross is drawn, not typed: egui's default fonts carry no glyph for
+    /// any of the multiplication-sign codepoints an icon font would use.
+    ///
+    /// Returns whether the tab was picked, and whether its cross was clicked.
+    fn qso_tab(ui: &mut egui::Ui, label: &str, color: Color32, selected: bool) -> (bool, bool) {
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let pad = ui.spacing().button_padding;
+        let cross = 9.0; // side of the cross itself, inside its hit square
+        let hit = cross + 5.0;
+        // The colour goes into the layout, not into the paint call: a galley
+        // laid out with a colour ignores the one passed when it is drawn.
+        let text_color = if selected { color } else { color.gamma_multiply(0.7) };
+        let galley = ui.painter().layout_no_wrap(label.to_owned(), font, text_color);
+        let size = egui::vec2(
+            galley.size().x + hit + pad.x * 3.0,
+            galley.size().y.max(hit) + pad.y * 2.0,
+        );
+        let (rect, tab) = ui.allocate_exact_size(size, egui::Sense::click());
+
+        // The cross is interacted with after the tab, so it sits on top of it:
+        // a click there closes the QSO rather than selecting it.
+        let close_rect =
+            Rect::from_center_size(rect.right_center() - egui::vec2(pad.x + hit / 2.0, 0.0),
+                egui::Vec2::splat(hit));
+        let close = ui.interact(close_rect, tab.id.with("close"), egui::Sense::click());
+
+        if ui.is_rect_visible(rect) {
+            let v = ui.visuals();
+            let radius = egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 };
+            let fill = if selected {
+                v.widgets.active.weak_bg_fill
+            } else if tab.hovered() {
+                v.widgets.hovered.weak_bg_fill
+            } else {
+                v.widgets.inactive.weak_bg_fill
+            };
+            let p = ui.painter();
+            p.rect_filled(rect, radius, fill);
+            p.rect_stroke(
+                rect,
+                radius,
+                v.widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+            // The selected tab is marked along its top edge, where the mark
+            // cannot be mistaken for the separator under the strip.
+            if selected {
+                let top = Rect::from_min_max(rect.left_top(), rect.right_top() + egui::vec2(0.0, 2.0));
+                p.rect_filled(top, egui::CornerRadius { nw: 4, ne: 4, sw: 0, se: 0 }, v.selection.bg_fill);
+            }
+
+            let at = egui::pos2(rect.left() + pad.x, rect.center().y - galley.size().y / 2.0);
+            p.galley(at, galley, text_color);
+
+            // Hovering anywhere on the tab reveals the cross; hovering the
+            // cross itself lights it and gives it a backing plate.
+            if tab.hovered() || close.hovered() {
+                if close.hovered() {
+                    p.rect_filled(close_rect, 3, v.widgets.hovered.bg_fill);
+                }
+                let stroke = Stroke::new(
+                    1.4,
+                    if close.hovered() {
+                        v.widgets.hovered.fg_stroke.color
+                    } else {
+                        v.weak_text_color()
+                    },
+                );
+                let c = close_rect.center();
+                let r = cross / 2.0;
+                p.line_segment([c - egui::vec2(r, r), c + egui::vec2(r, r)], stroke);
+                p.line_segment([c + egui::vec2(r, -r), c - egui::vec2(r, -r)], stroke);
+            }
+        }
+
+        let close = close.on_hover_text("close this QSO");
+        (tab.clicked() && !close.hovered(), close.clicked())
     }
 
     /// The active QSO's info, log, reply box and send button. Returns whether
