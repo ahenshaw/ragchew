@@ -196,6 +196,14 @@ impl Theme {
         }
     }
 
+    fn hover(self) -> &'static str {
+        match self {
+            Theme::Auto => "follow the desktop",
+            Theme::Dark => "always dark",
+            Theme::Light => "always light",
+        }
+    }
+
     fn preference(self) -> egui::ThemePreference {
         match self {
             Theme::Auto => egui::ThemePreference::System,
@@ -528,8 +536,8 @@ impl LiveMode {
     fn device_label(&self) -> String {
         match (&self.err, &self.audio) {
             (Some(e), _) => format!("audio error: {e}"),
-            (None, Some(a)) => format!("● LIVE {:.1} kHz", a.in_rate as f32 / 1000.0),
-            _ => "● LIVE".to_string(),
+            (None, Some(a)) => format!("LIVE {:.1} kHz", a.in_rate as f32 / 1000.0),
+            _ => "LIVE".to_string(),
         }
     }
 }
@@ -831,7 +839,7 @@ impl App {
                 ui.separator();
                 for (m, enabled) in self.modes.iter_mut().filter(|(m, _)| m.protocol() == p) {
                     ui.horizontal(|ui| {
-                        if ui.checkbox(enabled, "").changed() {
+                        if ui.add(elegance::Checkbox::new(enabled, "")).changed() {
                             changed = true;
                         }
                         let c = mode_text_color(ui.visuals().dark_mode, *m);
@@ -1144,25 +1152,39 @@ impl App {
         });
 
         ui.separator();
+        let ready = !q.draft.trim().is_empty();
         ui.add(
-            egui::TextEdit::multiline(&mut q.draft)
-                .desired_rows(2)
+            elegance::TextArea::new(&mut q.draft)
+                .rows(2)
                 .desired_width(f32::INFINITY)
-                .hint_text("reply…"),
+                .hint("reply…"),
         );
         ui.horizontal(|ui| {
-            let ready = !q.draft.trim().is_empty();
+            // Green for the affirmative action, red for the one that stops a
+            // transmission already going out: the accents carry the meaning,
+            // so neither has to be read to be told apart.
             send = ui
-                .add_enabled(ready && busy <= 0.0, egui::Button::new("Send"))
+                .add(
+                    elegance::Button::new("Send")
+                        .accent(elegance::Accent::Green)
+                        .enabled(ready && busy <= 0.0),
+                )
                 .on_hover_text(match q.mode.period_s() {
                     Some(p) => format!("goes out on the next {p} s cycle"),
                     None => "goes out immediately".to_string(),
                 })
                 .clicked();
             if busy > 0.0 {
+                ui.add(elegance::Indicator::new(elegance::IndicatorState::Connecting));
                 let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 190, 120));
-                ui.colored_label(c, format!("● TX {busy:.0} s"));
-                abort = ui.small_button("abort").clicked();
+                ui.colored_label(c, format!("TX {busy:.0} s"));
+                abort = ui
+                    .add(
+                        elegance::Button::new("Abort")
+                            .accent(elegance::Accent::Red)
+                            .size(elegance::ButtonSize::Small),
+                    )
+                    .clicked();
             }
         });
 
@@ -1299,6 +1321,30 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Put the widget palette into egui, every frame.
+    ///
+    /// The two dark/light presets are a matched pair — same shape, same
+    /// typography — so switching between them moves no widget by a pixel. Auto
+    /// takes whatever egui resolved the system preference to, which is also
+    /// what [`legible`] reads, so the palette and the accents agree about
+    /// which way round the window is. Installing an unchanged theme is a
+    /// no-op, so this is cheap to do unconditionally.
+    fn install_theme(&self, ctx: &egui::Context) {
+        let dark = match self.theme {
+            Theme::Dark => true,
+            Theme::Light => false,
+            // egui has already resolved the system preference into an
+            // active dark/light theme; take that rather than asking the
+            // platform again and risking the two disagreeing.
+            Theme::Auto => ctx.theme() == egui::Theme::Dark,
+        };
+        if dark {
+            elegance::Theme::slate().install(ctx);
+        } else {
+            elegance::Theme::frost().install(ctx);
+        }
+    }
+
     /// A frame of the whole interface.
     ///
     /// Split out of [`eframe::App::ui`] because nothing here needs the
@@ -1310,6 +1356,7 @@ impl App {
         // context — cheap, it is an `Arc` — keeps repaints, the cursor and
         // texture uploads reachable meanwhile.
         let ctx = &ui.ctx().clone();
+        self.install_theme(ctx);
         // ---- LIVE: pull audio into the rolling spectrogram + channels ----
         let mut live = false;
         let mut live_spec: Option<Arc<Spectrogram>> = None;
@@ -1317,6 +1364,7 @@ impl App {
         let mut live_t = 0.0;
         let mut live_norm = self.norm;
         let mut live_label = String::new();
+        let mut live_err = false;
         let mut live_devices: Vec<crate::audio::AudioDevice> = Vec::new();
         let mut show_all = self.show_all_inputs;
         let mut all_inputs_toggled = false;
@@ -1329,6 +1377,7 @@ impl App {
             live_t = lm.t_now;
             live_norm = lm.norm;
             live_label = lm.device_label();
+            live_err = lm.err.is_some();
             live_devices = lm.devices.clone();
             live_selected = lm.selected.clone();
             ctx.request_repaint(); // keep the live view flowing
@@ -1392,15 +1441,34 @@ impl App {
                 // then left alone, so they do not deserve permanent space on a
                 // bar that has to stay on one line.
                 ui.menu_button("☰", |ui| {
-                    ui.set_min_width(240.0);
-                    ui.style_mut().spacing.slider_width = 150.0;
-                    ui.add(egui::Slider::new(&mut self.text_px, 8.0..=22.0).text("text size"));
-                    ui.add(egui::Slider::new(&mut self.span_s, 10.0..=120.0).text("window (s)"));
+                    ui.set_min_width(260.0);
+                    let w = 150.0;
                     ui.add(
-                        egui::Slider::new(&mut self.scroll_secs, 0.0..=2.0).text("scroll (s)"),
+                        elegance::Slider::new(&mut self.text_px, 8.0..=22.0)
+                            .label("text size")
+                            .suffix(" px")
+                            .desired_width(w),
+                    );
+                    ui.add(
+                        elegance::Slider::new(&mut self.span_s, 10.0..=120.0)
+                            .label("window")
+                            .suffix(" s")
+                            .desired_width(w),
+                    );
+                    ui.add(
+                        elegance::Slider::new(&mut self.scroll_secs, 0.0..=2.0)
+                            .label("scroll")
+                            .suffix(" s")
+                            .decimals(1)
+                            .desired_width(w),
                     );
                     if !live {
-                        ui.add(egui::Slider::new(&mut self.speed, 1.0..=20.0).text("speed ×"));
+                        ui.add(
+                            elegance::Slider::new(&mut self.speed, 1.0..=20.0)
+                                .label("speed")
+                                .suffix("×")
+                                .desired_width(w),
+                        );
                     }
                     // Offered whether or not the app is listening. Live, the
                     // list is the one capture opened from and the mark is the
@@ -1428,7 +1496,10 @@ impl App {
                         // ALSA advertises far more PCMs than there are
                         // devices; the escape hatch matters for whoever
                         // needs the one that got winnowed out.
-                        if ui.checkbox(&mut show_all, "show every ALSA PCM").changed() {
+                        if ui
+                            .add(elegance::Checkbox::new(&mut show_all, "show every ALSA PCM"))
+                            .changed()
+                        {
                             all_inputs_toggled = true;
                         }
                         if !live {
@@ -1464,16 +1535,20 @@ impl App {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("Theme");
-                        for t in Theme::ALL {
-                            let pick = ui.selectable_label(self.theme == t, t.label());
-                            let pick = match t {
-                                Theme::Auto => pick.on_hover_text("follow the desktop"),
-                                _ => pick,
-                            };
-                            if pick.clicked() {
-                                self.theme = t;
-                                ui.ctx().set_theme(t.preference());
-                            }
+                        // A one-of-three choice, so a segmented track rather
+                        // than three labels that only look related.
+                        let mut pick = Theme::ALL.iter().position(|t| *t == self.theme).unwrap_or(0);
+                        if ui
+                            .add(elegance::SegmentedControl::from_segments(
+                                &mut pick,
+                                Theme::ALL.map(|t| {
+                                    elegance::Segment::text(t.label()).hover_text(t.hover())
+                                }),
+                            ))
+                            .changed()
+                        {
+                            self.theme = Theme::ALL[pick];
+                            ui.ctx().set_theme(self.theme.preference());
                         }
                     });
                     ui.separator();
@@ -1518,6 +1593,15 @@ impl App {
                 if live {
                     // The device itself is chosen from the hamburger; the bar
                     // only reports that capture is running, and at what rate.
+                    // The lamp says which of those two it is — a stream that
+                    // failed to open still labels itself, in words nobody reads
+                    // until something is wrong.
+                    let state = if live_err {
+                        elegance::IndicatorState::Off
+                    } else {
+                        elegance::IndicatorState::On
+                    };
+                    ui.add(elegance::Indicator::new(state));
                     ui.strong(&live_label);
                 } else {
                     // Playable as soon as there is a waterfall to play; the scan

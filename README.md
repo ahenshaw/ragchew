@@ -212,6 +212,14 @@ whole interface lays itself out headlessly in a test — egui is pure layout unt
 something rasterises it — so the panels are exercised in CI even though the app
 cannot run there.
 
+Widget styling comes from [`egui-elegance`](https://crates.io/crates/egui-elegance):
+one installed theme that the egui built-ins inherit, plus its own buttons,
+sliders, inputs and indicators. Two palettes are used, a matched dark/light pair
+(`slate` / `frost`), picked by the Theme setting. Everything ragchew draws
+itself — the waterfall, the band bar, the inline text, the QSO tabs — is painted
+against `egui::Visuals`, so it follows the installed palette without going
+through the crate.
+
 ## Performance
 
 Single core, `--release`, on a 12 kHz recording:

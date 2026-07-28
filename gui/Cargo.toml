@@ -18,7 +18,14 @@ default = ["desktop"]
 # The interactive eframe app + live audio. Disable (`--no-default-features`) to
 # build just the pure rendering pieces (e.g. the render_png example) without the
 # windowing/audio stack.
-desktop = ["dep:eframe", "dep:cpal", "dep:clap", "dep:rfd", "dep:serde"]
+desktop = [
+    "dep:eframe",
+    "dep:cpal",
+    "dep:clap",
+    "dep:rfd",
+    "dep:serde",
+    "dep:egui-elegance",
+]
 
 [dependencies]
 ragchew = { path = ".." }
@@ -32,6 +39,11 @@ clap = { version = "4", optional = true, features = ["derive"] }
 # "async-std"]` uses the desktop portal instead.
 rfd = { version = "0.17", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
+# Widget styling for the desktop app: an installable theme that the egui
+# built-ins inherit, plus a few widgets of its own. Pinned to the same egui as
+# eframe pulls in — it tracks egui's release cadence, so a bump here has to move
+# with one there.
+egui-elegance = { version = "0.14", optional = true }
 
 [dev-dependencies]
 png = "0.17"
