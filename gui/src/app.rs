@@ -1402,29 +1402,44 @@ impl App {
                     if !live {
                         ui.add(egui::Slider::new(&mut self.speed, 1.0..=20.0).text("speed ×"));
                     }
-                    if live {
+                    // Offered whether or not the app is listening. Live, the
+                    // list is the one capture opened from and the mark is the
+                    // device actually open; otherwise it is the preference that
+                    // takes effect the moment it goes live — which is worth
+                    // setting before you start listening, not only after.
+                    ui.separator();
+                    ui.menu_button("Audio input", |ui| {
+                        ui.set_min_width(280.0);
+                        let devices = if live {
+                            live_devices.clone()
+                        } else {
+                            crate::audio::input_devices(show_all)
+                        };
+                        let current =
+                            if live { live_selected.clone() } else { self.preferred_input.clone() };
+                        for d in &devices {
+                            let on = current.as_ref() == Some(&d.id);
+                            if ui.selectable_label(on, &d.label).clicked() {
+                                chosen_device = Some(d.id.clone());
+                                ui.close();
+                            }
+                        }
                         ui.separator();
-                        ui.menu_button("Audio input", |ui| {
-                            ui.set_min_width(280.0);
-                            for d in &live_devices {
-                                let on = live_selected.as_ref() == Some(&d.id);
-                                if ui.selectable_label(on, &d.label).clicked() {
-                                    chosen_device = Some(d.id.clone());
-                                    ui.close();
-                                }
-                            }
-                            ui.separator();
-                            // ALSA advertises far more PCMs than there are
-                            // devices; the escape hatch matters for whoever
-                            // needs the one that got winnowed out.
-                            if ui.checkbox(&mut show_all, "show every ALSA PCM").changed() {
-                                all_inputs_toggled = true;
-                            }
-                        });
-                    }
+                        // ALSA advertises far more PCMs than there are
+                        // devices; the escape hatch matters for whoever
+                        // needs the one that got winnowed out.
+                        if ui.checkbox(&mut show_all, "show every ALSA PCM").changed() {
+                            all_inputs_toggled = true;
+                        }
+                        if !live {
+                            ui.weak(match current {
+                                Some(_) => "opened when the app goes live",
+                                None => "the default input, until one is picked",
+                            });
+                        }
+                    });
                     // The output is where transmissions go — the rig's codec,
-                    // for anyone doing this for real — so it is offered whether
-                    // or not the app is listening to a live input.
+                    // for anyone doing this for real.
                     ui.separator();
                     ui.menu_button("Audio output", |ui| {
                         ui.set_min_width(280.0);
