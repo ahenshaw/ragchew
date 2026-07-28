@@ -903,6 +903,38 @@ impl App {
         (tab.clicked() && !close.hovered(), close.clicked())
     }
 
+    /// The RX/TX marker on a log line: the tag set smaller than the body text
+    /// and boxed in a thin outline, so it reads as a label on the line rather
+    /// than as the first word of what was said. Colour alone did not separate
+    /// them — a received line and its tag were the same mode colour.
+    fn dir_badge(ui: &mut egui::Ui, tag: &str, color: Color32) {
+        let body = egui::TextStyle::Monospace.resolve(ui.style());
+        let font = FontId::new((body.size * 0.75).max(7.0), body.family.clone());
+        let galley = ui.painter().layout_no_wrap(tag.to_owned(), font, color);
+        let pad = egui::vec2(3.0, 1.0);
+        let box_size = galley.size() + pad * 2.0;
+
+        // The badge is shorter than the line it marks, and `horizontal_top`
+        // aligns tops, so it is given a little headroom to sit against the
+        // text's first line rather than above it.
+        let line_h = ui.text_style_height(&egui::TextStyle::Monospace);
+        let lead = ((line_h - box_size.y) / 2.0).clamp(0.0, 3.0);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(box_size.x, box_size.y + lead), egui::Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let boxed = Rect::from_min_size(egui::pos2(rect.left(), rect.top() + lead), box_size);
+        let p = ui.painter();
+        p.rect_stroke(
+            boxed,
+            3,
+            Stroke::new(1.0, color.gamma_multiply(0.55)),
+            egui::StrokeKind::Inside,
+        );
+        p.galley(boxed.min + pad, galley, color);
+    }
+
     /// The active QSO's info, log, reply box and send button. Returns whether
     /// the operator asked to send, and whether they asked to abort.
     fn qso_body(
@@ -1002,7 +1034,7 @@ impl App {
                 };
                 ui.horizontal_top(|ui| {
                     ui.monospace(offset(e.at_s - q.started_s));
-                    ui.colored_label(color, egui::RichText::new(tag).monospace().strong());
+                    Self::dir_badge(ui, tag, color);
                     ui.add(
                         egui::Label::new(egui::RichText::new(&e.text).monospace().color(color))
                             .wrap(),
