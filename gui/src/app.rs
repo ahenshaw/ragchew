@@ -442,6 +442,21 @@ fn transport_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
     resp
 }
 
+/// A time on a `track_w`-point slider, snapped to whole physical pixels.
+///
+/// A circle drawn at a fractional position is anti-aliased differently at every
+/// offset, so a thumb that slides through fractional positions appears to
+/// change shape as it goes. Snapped, its sub-pixel phase never changes and it
+/// only ever translates.
+fn snap_to_pixels(t: f64, span: f64, track_w: f32, points_per_px: f32) -> f64 {
+    let px = (track_w * points_per_px) as f64;
+    if !(span.is_finite() && t.is_finite()) || span <= 0.0 || px < 1.0 {
+        return t;
+    }
+    let per_px = span / px;
+    (t / per_px).round() * per_px
+}
+
 /// The log's offset column: how long into the QSO a line landed.
 fn offset(s: f64) -> String {
     format!("+{:>6}", clock(s))
@@ -1741,14 +1756,35 @@ impl App {
                 // shoved back and forth for the whole recording.
                 if !live {
                     ui.separator();
-                    ui.style_mut().spacing.slider_width = 170.0;
+                    const TRACK_W: f32 = 170.0;
+                    ui.style_mut().spacing.slider_width = TRACK_W;
+                    // The slider is shown a *copy* of the clock, snapped to the
+                    // physical pixel grid. A circle drawn at a fractional
+                    // position is anti-aliased differently every frame, so an
+                    // unsnapped thumb visibly changes shape as it slides; on
+                    // the grid it only ever translates.
+                    //
+                    // A copy, because quantising the clock itself is what the
+                    // slider's own `fixed_decimals` did — and since the slider
+                    // writes back every frame, at 1x the clock gained 0.017 s
+                    // and lost all of it again to rounding. Playback stopped
+                    // dead. So the snapped value goes back to the clock only
+                    // when the operator is actually dragging it.
+                    let span = self.duration_s.max(0.001);
+                    let mut shown =
+                        snap_to_pixels(self.t_now, span, TRACK_W, ctx.pixels_per_point());
+                    // One decimal, or the readout gains and loses characters
+                    // every frame — the whole widget twitching for the length
+                    // of the recording.
                     if ui
                         .add(
-                            egui::Slider::new(&mut self.t_now, 0.0..=self.duration_s.max(0.001))
+                            egui::Slider::new(&mut shown, 0.0..=span)
+                                .custom_formatter(|n, _| format!("{n:.1}"))
                                 .text("s"),
                         )
                         .dragged()
                     {
+                        self.t_now = shown;
                         self.playing = false;
                     }
                 }
@@ -2379,6 +2415,61 @@ mod tests {
                 paused.size()
             );
         });
+    }
+
+    /// Playback must advance at every speed, including the slowest.
+    ///
+    /// The slider is shown a copy of the clock for exactly this reason: it
+    /// writes its value back every frame, so anything that quantises what it
+    /// is given — `fixed_decimals`, a step — quantises the clock. At 1x the
+    /// clock gained 0.017 s per frame and lost all of it again to rounding.
+    /// The waterfall sat still and the app looked dead.
+    #[test]
+    fn the_playback_clock_advances_at_every_speed() {
+        for speed in [1.0f32, 2.0, 8.0, 20.0] {
+            let mut app = app_with_traffic(0.0);
+            app.duration_s = 600.0;
+            app.speed = speed;
+            app.playing = true;
+            app.t_now = 30.0;
+            let start = app.t_now;
+            for _ in 0..5 {
+                lay_out(&mut app);
+            }
+            assert!(
+                app.t_now > start,
+                "at {speed}x the clock stayed at {} over five frames",
+                app.t_now
+            );
+        }
+    }
+
+    /// The playback thumb must land on whole physical pixels, at every zoom
+    /// and every clock value, or it is anti-aliased differently at each offset
+    /// and appears to change shape as it slides.
+    #[test]
+    fn the_playback_thumb_lands_on_pixels() {
+        const TRACK_W: f32 = 170.0;
+        for ppp in [1.0f32, 1.5, 2.0] {
+            let px = (TRACK_W * ppp) as f64;
+            for span in [0.5f64, 12.7, 600.0] {
+                let mut phase = None;
+                for i in 0..200 {
+                    let t = span * (i as f64) / 199.0;
+                    let shown = snap_to_pixels(t, span, TRACK_W, ppp);
+                    assert!((shown - t).abs() <= span / px, "{shown} is not near {t}");
+                    // Where the thumb sits, in physical pixels along the track.
+                    let at = shown / span * px;
+                    let frac = (at - at.round()).abs();
+                    assert!(frac < 1e-6, "at {t} the thumb sits {frac} of a pixel off the grid");
+                    let ph = *phase.get_or_insert(frac);
+                    assert!((ph - frac).abs() < 1e-6, "the sub-pixel phase moved");
+                }
+            }
+        }
+        // Degenerate spans are passed through rather than dividing by zero.
+        assert_eq!(snap_to_pixels(3.0, 0.0, TRACK_W, 1.0), 3.0);
+        assert_eq!(snap_to_pixels(3.0, f64::NAN, TRACK_W, 1.0), 3.0);
     }
 
     /// A band with two stations in it, revealed at `t`.
