@@ -1978,10 +1978,18 @@ impl App {
         // panel claims what is left. New text reaches them here, so a QSO logs
         // what its station said whether or not its tab is the one on top.
         self.qsos.absorb(&channels);
+        // The conversations sit on the theme's card surface while the band
+        // keeps the panel background. The two are a designed pair — a shade
+        // apart in both palettes, lighter in the dark theme and lighter again
+        // in the light one — so the QSO panel reads as its own surface without
+        // needing a rule drawn between them.
+        let qso_frame =
+            egui::Frame::side_top_panel(ui.style()).fill(elegance::Theme::current(ctx).palette.card);
         let panel = egui::Panel::left("qsos")
             .resizable(true)
             .default_size(self.qso_w)
             .min_size(MIN_QSO_W)
+            .frame(qso_frame)
             .show(ui, |ui| self.qso_panel(ui, t_now));
         // The panel's own rect, not its contents': the contents are inset by
         // the frame margin, and feeding that back as next launch's width would
