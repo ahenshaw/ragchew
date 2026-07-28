@@ -1,5 +1,9 @@
 [workspace]
 members = ["gui"]
+# The root package is a library, so the gui's `ragchew` binary is the only
+# runnable target in the default set: bare `cargo run` starts the GUI, while
+# `cargo build`/`cargo test` still cover both packages.
+default-members = [".", "gui"]
 
 [workspace.package]
 version = "0.1.0"
