@@ -498,6 +498,12 @@ struct LiveMode {
     frames_rx: Option<std::sync::mpsc::Receiver<Vec<protocol::Decode>>>,
     spec: Arc<Spectrogram>,
     next_col: u64,
+    /// Columns ever pushed into the rolling spectrogram, including those since
+    /// dropped off its front. The spectrogram is capped, so its length stops
+    /// growing after eight minutes while the data keeps sliding through it;
+    /// anything tracking progress by length freezes at that point, which is
+    /// what left the waterfall stale and jumping.
+    cols_total: i64,
     channels: ChannelSet,
     norm: (f32, f32),
     cols_since_norm: usize,
@@ -522,6 +528,7 @@ impl LiveMode {
             frames_rx: None,
             spec: Arc::new(Spectrogram::empty(band.0, band.1, WINDOW / 4)),
             next_col: 0,
+            cols_total: 0,
             channels: ChannelSet::new(15.0),
             norm: (0.0, 1.0),
             cols_since_norm: 0,
@@ -542,6 +549,7 @@ impl LiveMode {
         self.frames_rx = None;
         self.spec = Arc::new(Spectrogram::empty(self.band.0, self.band.1, WINDOW / 4));
         self.next_col = 0;
+        self.cols_total = 0;
         self.channels = ChannelSet::new(15.0);
         self.norm = (0.0, 1.0);
         self.cols_since_norm = 0;
@@ -607,6 +615,7 @@ impl LiveMode {
             for w in &new_windows {
                 s.push_window(w);
             }
+            self.cols_total += new_windows.len() as i64;
             if s.columns.len() > MAX_COLS {
                 let drop = s.columns.len() - MAX_COLS;
                 s.columns.drain(0..drop);
@@ -1347,6 +1356,7 @@ impl App {
         px_w: usize,
         px_h: usize,
         col_hi: i64,
+        col_travel: i64,
         span_cols: usize,
     ) -> egui::TextureHandle {
         // A waterfall gains one column at a time and drops one off the far end:
@@ -1380,7 +1390,7 @@ impl App {
         // the range, and a plain subtraction overflows.
         // Saturating: before anything has been drawn `wf_col` is the floor of
         // the range, and a plain subtraction overflows.
-        let advanced = col_hi.saturating_sub(self.wf_col);
+        let advanced = col_travel.saturating_sub(self.wf_col);
         let reusable = self.tex.is_some() && self.tex_key == key && !norm_moved;
 
         // Nothing new, or not yet a whole pixel of it: what is on screen is
@@ -1422,7 +1432,7 @@ impl App {
             self.tex = Some(ctx.load_texture("waterfall", color, egui::TextureOptions::LINEAR));
         }
         self.tex_key = key;
-        self.wf_col = col_hi;
+        self.wf_col = col_travel;
         self.wf_norm = self.norm;
         self.tex.clone().unwrap()
     }
@@ -1533,6 +1543,7 @@ impl App {
         let mut live_norm = self.norm;
         let mut live_label = String::new();
         let mut live_err = false;
+        let mut live_cols_total = 0i64;
         let mut live_devices: Vec<crate::audio::AudioDevice> = Vec::new();
         let mut show_all = self.show_all_inputs;
         let mut all_inputs_toggled = false;
@@ -1546,6 +1557,7 @@ impl App {
             live_norm = lm.norm;
             live_label = lm.device_label();
             live_err = lm.err.is_some();
+            live_cols_total = lm.cols_total;
             live_devices = lm.devices.clone();
             live_selected = lm.selected.clone();
             ctx.request_repaint(); // keep the live view flowing
@@ -2086,6 +2098,12 @@ impl App {
             } else {
                 (t_now * SAMPLE_RATE as f64 / hop).round() as i64
             };
+            // How far the waterfall has actually travelled. Live, that is not
+            // `col_hi`: the spectrogram is capped, so once full its length
+            // stops changing while the newest column keeps arriving and the
+            // oldest keeps falling off. Scrolling has to follow the data, not
+            // the index it happens to sit at.
+            let col_travel = if live { live_cols_total } else { col_hi };
             let span_cols = (self.span_s as f64 * SAMPLE_RATE as f64 / hop).round() as usize;
             let ppp = ctx.pixels_per_point();
             let tex = self.waterfall_texture(
@@ -2094,6 +2112,7 @@ impl App {
                 (self.waterfall_w * ppp) as usize,
                 (g.height * ppp) as usize,
                 col_hi,
+                col_travel,
                 span_cols,
             );
             let wf_rect =
@@ -2594,6 +2613,43 @@ mod tests {
         // Degenerate sizes must not divide by zero.
         assert_eq!(texture_geometry(0, 0), (1, 1));
         assert_eq!(texture_geometry(1125, 0), (1125, 1));
+    }
+
+    /// The waterfall must keep moving once the spectrogram is full.
+    ///
+    /// It is capped at eight minutes of columns, and from then on its length
+    /// stops changing while the newest column still arrives and the oldest
+    /// falls off the front. Tracking progress by that length freezes the
+    /// picture — it then only moves when something else forces a redraw, which
+    /// arrives as a jump.
+    #[test]
+    fn the_waterfall_keeps_moving_when_the_spectrogram_is_full() {
+        let ctx = egui::Context::default();
+        let spec = Spectrogram::compute(&crate::demo::synth(), 0.0, 4000.0, WINDOW / 4);
+        let (w, h, span) = (120usize, 64usize, 600usize);
+        let (per_px, _) = texture_geometry(span, w);
+        let mut app = App::base((0.0, 4000.0));
+        app.norm = waterfall::percentiles(&spec);
+
+        // A full spectrogram: the index of the newest column never changes.
+        let col_hi = spec.columns.len() as i64;
+        let travel = 100_000i64;
+        app.waterfall_texture(&ctx, &spec, w, h, col_hi, travel, span);
+        let first = app.wf_img.as_ref().expect("an image").rgba.clone();
+
+        // Nothing has travelled: the picture is already right.
+        app.waterfall_texture(&ctx, &spec, w, h, col_hi, travel, span);
+        assert_eq!(app.wf_img.as_ref().unwrap().rgba, first, "redrawn for no reason");
+
+        // A pixel's worth of data has gone by, with the index still standing
+        // still. The picture has to move.
+        app.waterfall_texture(&ctx, &spec, w, h, col_hi, travel + per_px as i64, span);
+        assert_ne!(
+            app.wf_img.as_ref().unwrap().rgba,
+            first,
+            "the waterfall stopped moving once the spectrogram was full"
+        );
+        assert_eq!(app.wf_col, travel + per_px as i64, "travel was not recorded");
     }
 
     /// A band with two stations in it, revealed at `t`.
