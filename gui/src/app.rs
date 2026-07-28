@@ -375,6 +375,73 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
+/// The two words on the play/pause button, in the order it shows them.
+const TRANSPORT: [&str; 2] = ["pause", "play"];
+
+/// The play/pause button: one fixed slot, an icon painted rather than typed,
+/// and the word beside it.
+///
+/// The icon is painted because ⏸ and ▶ are not in the same bundled font — the
+/// first exists only in the emoji font at 0.75 em, the second comes from Noto
+/// at 0.87 em — so clicking swapped one typeface for another and the icon
+/// visibly changed size, even though the button box never did. Two rectangles
+/// and a triangle are the same size by construction.
+///
+/// The slot is sized for the longer word and the icon is pinned to the left of
+/// it, so nothing moves when the state flips except the tail of the word.
+fn transport_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let pad = ui.spacing().button_padding;
+    let icon = ui.text_style_height(&egui::TextStyle::Button) * 0.55;
+    let gap = 6.0;
+    let lay = |w: &str| {
+        ui.painter().layout_no_wrap(w.to_owned(), font.clone(), Color32::PLACEHOLDER)
+    };
+    let widest = TRANSPORT.iter().map(|w| lay(w).size().x).fold(0.0_f32, f32::max);
+    let galley = lay(if playing { TRANSPORT[0] } else { TRANSPORT[1] });
+
+    let size = egui::vec2(
+        pad.x * 2.0 + icon + gap + widest,
+        ui.spacing().interact_size.y.max(galley.size().y + pad.y * 2.0),
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let v = *ui.style().interact(&resp);
+        let p = ui.painter();
+        p.rect(rect, v.corner_radius, v.weak_bg_fill, v.bg_stroke, egui::StrokeKind::Inside);
+
+        let color = v.fg_stroke.color;
+        let box_ = Rect::from_center_size(
+            egui::pos2(rect.left() + pad.x + icon / 2.0, rect.center().y),
+            egui::Vec2::splat(icon),
+        );
+        if playing {
+            // Pause: two bars, with the gap between them a third of the width.
+            let bar = icon / 3.0;
+            for x in [box_.left(), box_.right() - bar] {
+                p.rect_filled(
+                    Rect::from_min_size(egui::pos2(x, box_.top()), egui::vec2(bar, icon)),
+                    1,
+                    color,
+                );
+            }
+        } else {
+            // Play: a triangle inscribed in the same square.
+            p.add(egui::Shape::convex_polygon(
+                vec![box_.left_top(), box_.left_bottom(), egui::pos2(box_.right(), box_.center().y)],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        p.galley(
+            egui::pos2(rect.left() + pad.x + icon + gap, rect.center().y - galley.size().y / 2.0),
+            galley,
+            color,
+        );
+    }
+    resp
+}
+
 /// The log's offset column: how long into the QSO a line landed.
 fn offset(s: f64) -> String {
     format!("+{:>6}", clock(s))
@@ -1607,12 +1674,13 @@ impl App {
                     // Playable as soon as there is a waterfall to play; the scan
                     // catches up on its own.
                     ui.add_enabled_ui(self.spec.is_some(), |ui| {
-                        // Fixed width: "⏸ pause" and "▶ play" do not measure the
-                        // same, and a button that resizes as you click it drags
-                        // the whole bar left and right with it.
-                        let h = ui.spacing().interact_size.y;
-                        let label = if self.playing { "⏸ pause" } else { "▶ play" };
-                        if ui.add_sized([78.0, h], egui::Button::new(label)).clicked() {
+                        // "⏸ pause" and "▶ play" do not measure the same, and a
+                        // button that resizes as you click it drags the whole
+                        // bar left and right with it. So the slot is the wider
+                        // of the two, measured in the font and padding actually
+                        // in force — a fixed width was right until a theme
+                        // changed the metrics under it.
+                        if transport_button(ui, self.playing).clicked() {
                             if self.t_now >= self.duration_s {
                                 self.t_now = 0.0;
                             }
@@ -2283,6 +2351,34 @@ mod tests {
         // `run_ui` hands the callback a `Ui` covering the whole window, which
         // is exactly what eframe gives `App::ui`.
         ctx.run_ui(input, |ui| app.draw(ui))
+    }
+
+    /// The play/pause button must not change size or shift its icon when it is
+    /// clicked: the bar is one row, and a control that twitches under the
+    /// cursor is the first thing the eye goes to.
+    ///
+    /// Both faces are asked for from the same `Ui` and compared. The icon is
+    /// painted rather than typed precisely so this holds — the glyphs ⏸ and ▶
+    /// come from different bundled fonts at different em heights.
+    #[test]
+    fn the_transport_button_does_not_twitch_when_clicked() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            elegance::Theme::slate().install(ui.ctx());
+            let playing = transport_button(ui, true).rect;
+            let paused = transport_button(ui, false).rect;
+            assert_eq!(
+                playing.size(),
+                paused.size(),
+                "the button is {:?} playing and {:?} paused",
+                playing.size(),
+                paused.size()
+            );
+        });
     }
 
     /// A band with two stations in it, revealed at `t`.
