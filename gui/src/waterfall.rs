@@ -68,19 +68,59 @@ const BG: [u8; 3] = [8, 10, 14];
 /// Global log-magnitude contrast bounds (55th, 99.5th percentiles) over the
 /// whole spectrogram. Precompute once and pass to [`render_window`] for a stable
 /// look while the visible window scrolls.
+///
+/// Estimated from a sample, not from every value. Two percentiles are a summary
+/// of a distribution, and a distribution of eight million values is no better
+/// summarised than one of a hundred thousand. Live capture recomputes this every
+/// second against a spectrogram that reaches 12,000 columns — 7.7 M values,
+/// 31 MB — and copying and sorting all of it cost 229 ms in release and 3.3 s in
+/// debug, on the UI thread, every time. That is the whole frame budget and more:
+/// the window stopped answering. See [`column_step`].
 pub fn percentiles(spec: &Spectrogram) -> (f32, f32) {
-    let mut vals: Vec<f32> = Vec::new();
-    for col in &spec.columns {
-        for &m in col {
-            vals.push((m + 1e-9).ln());
-        }
+    let step = column_step(spec.columns.len(), spec.n_bins);
+    let mut vals: Vec<f32> = Vec::with_capacity(SAMPLE_TARGET + spec.n_bins);
+    for col in spec.columns.iter().step_by(step) {
+        vals.extend(col.iter().map(|m| (m + 1e-9).ln()));
     }
     if vals.is_empty() {
         return (0.0, 1.0);
     }
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let pct = |p: f32| vals[((p * (vals.len() as f32 - 1.0)) as usize).min(vals.len() - 1)];
-    (pct(0.55), pct(0.995))
+    // Selection, not a sort: only two order statistics are wanted, and the
+    // 99.5th can be found in what the 55th left above it.
+    let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+    let idx = |p: f32| ((p * (vals.len() as f32 - 1.0)) as usize).min(vals.len() - 1);
+    let (lo_i, hi_i) = (idx(0.55), idx(0.995));
+    let (_, lo, rest) = vals.select_nth_unstable_by(lo_i, cmp);
+    let lo = *lo;
+    let hi = if hi_i > lo_i {
+        let (_, hi, _) = rest.select_nth_unstable_by(hi_i - lo_i - 1, cmp);
+        *hi
+    } else {
+        lo
+    };
+    (lo, hi)
+}
+
+/// How many values the contrast estimate settles for. A hundred thousand
+/// samples put the 99.5th percentile inside a thousandth of the value the whole
+/// spectrogram gives, which is far below anything the eye can see in a colour
+/// ramp.
+const SAMPLE_TARGET: usize = 100_000;
+
+/// A column stride that brings `cols * bins` down to about [`SAMPLE_TARGET`].
+///
+/// Time is strided; frequency never is. The two axes are not interchangeable
+/// here: a signal is a few bins wide and seconds long, so dropping columns
+/// costs almost nothing — the same carrier is in the next one — while dropping
+/// bins steps straight over the narrow peaks the 99.5th percentile is made of.
+/// Measured on the demo band, striding both moved the white point by 4% of the
+/// range; striding time alone holds both bounds inside 0.2%.
+fn column_step(cols: usize, bins: usize) -> usize {
+    let total = cols.saturating_mul(bins);
+    if total <= SAMPLE_TARGET || cols == 0 || bins == 0 {
+        return 1;
+    }
+    (total / SAMPLE_TARGET).max(1).min(cols)
 }
 
 /// Render the whole recording (contrast stretched to its own percentiles).
