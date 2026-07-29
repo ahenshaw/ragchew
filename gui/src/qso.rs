@@ -46,6 +46,42 @@ pub struct Entry {
     pub text: String,
 }
 
+/// Text on the air.
+///
+/// It stays in the composer while it goes out, struck through as far as it has
+/// got, and is cleared when the transmission ends — so the operator can see
+/// what is leaving and how much of it is left.
+#[derive(Clone, Debug)]
+pub struct Outgoing {
+    pub text: String,
+    /// UTC seconds the burst begins and ends. Before it begins — waiting for
+    /// the next cycle boundary, which is most of a JS8 send — nothing is
+    /// struck through yet, which is itself worth seeing.
+    pub start_unix: f64,
+    pub end_unix: f64,
+}
+
+impl Outgoing {
+    /// How many characters have gone out by `now_unix`.
+    ///
+    /// From elapsed time against the length of the burst. For a character
+    /// stream like Olivia that is very nearly the truth; for a JS8 frame,
+    /// where the whole message is packed into one fixed-length burst, it is a
+    /// progress bar wearing the text's clothes.
+    pub fn sent_chars(&self, now_unix: f64) -> usize {
+        let span = self.end_unix - self.start_unix;
+        if span <= 0.0 || !span.is_finite() {
+            return self.text.chars().count();
+        }
+        let done = ((now_unix - self.start_unix) / span).clamp(0.0, 1.0);
+        (done * self.text.chars().count() as f64).round() as usize
+    }
+
+    pub fn finished(&self, now_unix: f64) -> bool {
+        now_unix >= self.end_unix
+    }
+}
+
 /// A conversation with one station.
 #[derive(Clone, Debug)]
 pub struct Qso {
@@ -86,6 +122,13 @@ pub struct Qso {
     /// The reply being composed. Per QSO, so switching tabs and coming back
     /// finds it as you left it.
     pub draft: String,
+    /// What is on the air from this QSO and what is queued behind it, oldest
+    /// first. Kept until the last of it has gone, so the operator can watch it
+    /// leave while typing the next one.
+    pub outgoing: Vec<Outgoing>,
+    /// Set when a transmission ends, so the composer takes the keyboard back
+    /// the moment it returns: the operator's hands are already there.
+    pub want_focus: bool,
     /// How many characters the bound channel has ever produced that are already
     /// in the log — counted from the start of the conversation, not from the
     /// start of what the channel still holds, since that is trimmed.
@@ -175,6 +218,11 @@ impl QsoSet {
         &self.qsos
     }
 
+    #[cfg(test)]
+    pub fn qsos_mut(&mut self) -> &mut [Qso] {
+        &mut self.qsos
+    }
+
     /// Index of the tab on top. Meaningless when there are no QSOs; callers
     /// check [`QsoSet::is_empty`] first.
     pub fn active(&self) -> usize {
@@ -224,6 +272,8 @@ impl QsoSet {
             started_utc: backdated(now_s - ch.first_heard_s),
             log: Vec::new(),
             draft: String::new(),
+            outgoing: Vec::new(),
+            want_focus: false,
             absorbed: 0,
         };
         q.absorb(ch);
@@ -261,10 +311,33 @@ impl QsoSet {
             started_utc: SystemTime::now(),
             log: Vec::new(),
             draft: String::new(),
+            outgoing: Vec::new(),
+            want_focus: false,
             absorbed: 0,
         });
         self.active = self.qsos.len() - 1;
         self.active
+    }
+
+    /// Clear the composer of any QSO whose transmission has finished.
+    ///
+    /// Across all of them, not just the one on top: a send does not pause
+    /// because its tab is not the one being looked at.
+    pub fn retire_sent(&mut self, now_unix: f64) {
+        for q in &mut self.qsos {
+            if q.outgoing.is_empty() {
+                continue;
+            }
+            // Each message goes as it finishes rather than the buffer emptying
+            // in one go at the end: over a long exchange, holding every
+            // completed transmission until the last one had gone would leave
+            // the pane growing all session. What is left is what is still to
+            // go, and the one going out now.
+            q.outgoing.retain(|o| !o.finished(now_unix));
+            if q.outgoing.is_empty() {
+                q.want_focus = true;
+            }
+        }
     }
 
     pub fn close(&mut self, i: usize) {
@@ -536,6 +609,102 @@ mod tests {
         // What it took is exactly what the channel still had beyond its mark.
         let ch = &set.channels()[0];
         assert_eq!(last.text.chars().count(), ch.text.chars().count());
+    }
+
+    /// Text is struck through as it goes out: nothing while the burst is still
+    /// waiting for its cycle boundary, all of it once the burst has ended.
+    #[test]
+    fn outgoing_text_is_struck_through_as_it_is_sent() {
+        let out = Outgoing {
+            text: "CQ CQ DE K2N".to_string(), // 12 characters
+            start_unix: 1000.0,
+            end_unix: 1012.0,
+        };
+        // Queued but not started — a JS8 send waits out most of its cycle here.
+        assert_eq!(out.sent_chars(900.0), 0);
+        assert_eq!(out.sent_chars(1000.0), 0);
+        // Halfway through the burst is halfway through the text.
+        assert_eq!(out.sent_chars(1006.0), 6);
+        // And it neither overruns nor stops short at the end.
+        assert_eq!(out.sent_chars(1012.0), 12);
+        assert_eq!(out.sent_chars(9999.0), 12);
+        assert!(!out.finished(1011.9));
+        assert!(out.finished(1012.0));
+
+        // A zero-length burst is finished, not divided by.
+        let instant = Outgoing { text: "73".to_string(), start_unix: 5.0, end_unix: 5.0 };
+        assert_eq!(instant.sent_chars(5.0), 2);
+        assert!(instant.finished(5.0));
+    }
+
+    /// A finished transmission clears the composer of every QSO holding one,
+    /// not just the tab being looked at.
+    #[test]
+    fn finished_transmissions_are_retired_on_every_tab() {
+        let set = ChannelSet::from_decodes([js8_decode(1000.0, 0.0, "CQ ")], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        qsos.open_blank(1500.0, ModeId::Js8(ragchew::js8::Mode::Normal), 0.0);
+        for q in qsos.qsos_mut() {
+            q.outgoing
+                .push(Outgoing { text: "TEST".to_string(), start_unix: 0.0, end_unix: 10.0 });
+        }
+        qsos.set_active(0);
+
+        qsos.retire_sent(9.0);
+        assert!(qsos.qsos().iter().all(|q| !q.outgoing.is_empty()), "retired mid-burst");
+        qsos.retire_sent(10.0);
+        assert!(
+            qsos.qsos().iter().all(|q| q.outgoing.is_empty()),
+            "a finished send should clear on the tabs in the background too"
+        );
+    }
+
+    /// A finished transmission asks for the keyboard back, so the composer can
+    /// take it the moment it returns.
+    #[test]
+    fn a_finished_transmission_asks_for_the_composer_to_be_focused() {
+        let set = ChannelSet::from_decodes([js8_decode(1000.0, 0.0, "CQ ")], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        qsos.qsos_mut()[0]
+            .outgoing
+            .push(Outgoing { text: "TEST".to_string(), start_unix: 0.0, end_unix: 10.0 });
+
+        qsos.retire_sent(9.0);
+        assert!(!qsos.qsos()[0].want_focus, "asked for focus mid-burst");
+        qsos.retire_sent(10.0);
+        assert!(qsos.qsos()[0].want_focus, "the composer should take the keyboard back");
+    }
+
+    /// Each message leaves the buffer as it finishes, so a long exchange does
+    /// not accumulate everything it has ever sent.
+    #[test]
+    fn each_message_clears_as_it_finishes() {
+        let set = ChannelSet::from_decodes([js8_decode(1000.0, 0.0, "CQ ")], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let q = &mut qsos.qsos_mut()[0];
+        q.outgoing.push(Outgoing { text: "FIRST ".into(), start_unix: 0.0, end_unix: 10.0 });
+        q.outgoing.push(Outgoing { text: "SECOND".into(), start_unix: 15.0, end_unix: 25.0 });
+
+        // The first has gone, the second has not started: all of the first is
+        // struck through, none of the second.
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.outgoing[0].sent_chars(12.0), 6);
+        assert_eq!(q.outgoing[1].sent_chars(12.0), 0);
+
+        // The finished one goes; the queued one stays, and is still whole.
+        qsos.retire_sent(12.0);
+        let left = &qsos.qsos()[0].outgoing;
+        assert_eq!(left.len(), 1, "the finished message should have gone");
+        assert_eq!(left[0].text, "SECOND", "the wrong one was dropped");
+        assert!(!qsos.qsos()[0].want_focus, "asked for focus with a send still queued");
+
+        // and the keyboard comes back once there is nothing left to go
+        qsos.retire_sent(25.0);
+        assert!(qsos.qsos()[0].outgoing.is_empty());
+        assert!(qsos.qsos()[0].want_focus);
     }
 
     /// Clicking the same channel again returns to its tab instead of opening a
