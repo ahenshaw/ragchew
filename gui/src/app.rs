@@ -344,6 +344,13 @@ fn clock(s: f64) -> String {
     format!("{}:{:02}", (s / 60.0) as u64, (s % 60.0) as u64)
 }
 
+/// Now, in UTC seconds — the clock the transmit queue schedules against.
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
 /// A wall-clock instant as `YYYY-MM-DD hh:mm:ssZ`.
 ///
 /// UTC, because that is what a contact is logged in: a QSO spans operators in
@@ -1088,6 +1095,12 @@ impl App {
             if let Some(t) = self.tx.as_mut() {
                 t.abort();
             }
+            // The burst is gone, so the composer should not go on striking
+            // through text that is no longer being sent.
+            if let Some(q) = self.qsos.active_qso_mut() {
+                q.outgoing.clear();
+                q.want_focus = true;
+            }
         }
         if send {
             self.send_active(now_s);
@@ -1176,6 +1189,49 @@ impl App {
 
         let close = close.on_hover_text("close this QSO");
         (tab.clicked() && !close.hovered(), close.clicked())
+    }
+
+    /// Text on the air, in the composer's place: what has gone out struck
+    /// through and faded, what is still to go in full strength.
+    ///
+    /// Not a text box. The operator cannot edit what is already leaving the
+    /// sound card, and offering a cursor would say otherwise — so it is set in
+    /// the same frame and background the box uses, and simply cannot be typed
+    /// into until the burst ends and the box comes back empty.
+    fn outgoing_text(ui: &mut egui::Ui, queue: &[crate::qso::Outgoing]) {
+        let now = unix_now();
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let faded = ui.visuals().weak_text_color();
+        let sent = egui::TextFormat {
+            font_id: font.clone(),
+            color: faded,
+            strikethrough: Stroke::new(1.0, faded),
+            ..Default::default()
+        };
+        let to_go = egui::TextFormat {
+            font_id: font,
+            color: ui.visuals().strong_text_color(),
+            ..Default::default()
+        };
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = ui.available_width();
+        for out in queue {
+            let n = out.sent_chars(now);
+            let cut = out.text.char_indices().nth(n).map_or(out.text.len(), |(i, _)| i);
+            let (gone, left) = out.text.split_at(cut);
+            job.append(gone, 0.0, sent.clone());
+            job.append(left, 0.0, to_go.clone());
+        }
+
+        let palette = elegance::Theme::current(ui.ctx()).palette;
+        egui::Frame::new()
+            .fill(palette.input_bg)
+            .corner_radius(6)
+            .inner_margin(8)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.add(egui::Label::new(job));
+            });
     }
 
     /// The RX/TX marker on a log line: the tag set smaller than the body text
@@ -1299,64 +1355,106 @@ impl App {
         // The log takes whatever height is left over once the reply box and the
         // send button have had theirs, so growing the window grows the part
         // worth reading rather than the part being typed into.
-        let reserved = 96.0;
-        let log_h = (ui.available_height() - reserved).max(60.0);
+        // The composer is a panel of its own along the bottom edge, and the
+        // log takes what is left. Panels are what egui gives you for "this
+        // sticks to that edge"; the alternative was reserving a guessed height
+        // for the composer, which it did — 96 pixels, right up until the send
+        // row grew a countdown and an abort button.
         let dark = ui.visuals().dark_mode;
-        egui::ScrollArea::vertical().stick_to_bottom(true).max_height(log_h).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            for e in &q.log {
-                let (color, tag) = match e.dir {
-                    Dir::Rx => (mode_text_color(dark, q.mode), Dir::Rx.tag()),
-                    // Our own text takes the theme's own strong colour: it
-                    // is us talking, not a station with a mode colour.
-                    Dir::Tx => (ui.visuals().strong_text_color(), Dir::Tx.tag()),
-                };
-                ui.horizontal_top(|ui| {
-                    ui.monospace(offset(e.at_s - q.started_s));
-                    Self::dir_badge(ui, tag, color);
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(&e.text).monospace().color(color))
-                            .wrap(),
-                    );
-                });
+        let mut ready = false;
+        egui::Panel::bottom("qso_composer").show(ui, |ui| {
+            // The outgoing buffer is its own pane above the entry box, not a
+            // stand-in for it: what is leaving stays visible, struck through as
+            // far as it has got, while the next message is being typed. A
+            // composer that disappeared while transmitting made the operator
+            // wait out the burst before starting the reply.
+            if !q.outgoing.is_empty() {
+                Self::outgoing_text(ui, &q.outgoing);
             }
+            let resp = ui.add(
+                elegance::TextArea::new(&mut q.draft)
+                    .rows(2)
+                    .desired_width(f32::INFINITY)
+                    .hint("reply…"),
+            );
+            if q.want_focus {
+                resp.request_focus();
+                q.want_focus = false;
+            }
+            // Neither protocol can carry a newline — JS8's free-text alphabet
+            // is 44 characters and has none, and Olivia would put a bare
+            // control code on the air — so Enter has nothing useful to insert
+            // and means send instead. Any newline arriving by other means, a
+            // paste, is dropped for the same reason rather than transmitted as
+            // something odd.
+            let entered = resp.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+            if q.draft.contains('\n') {
+                q.draft.retain(|c| c != '\n');
+            }
+            ready = !q.draft.trim().is_empty();
+            if entered && ready {
+                send = true;
+            }
+            ui.horizontal(|ui| {
+                // Green for the affirmative action, red for the one that stops
+                // a transmission already going out: the accents carry the
+                // meaning, so neither has to be read to be told apart.
+                send |= ui
+                    .add(
+                        elegance::Button::new("Send")
+                            .accent(elegance::Accent::Green)
+                            .enabled(ready),
+                    )
+                    .on_hover_text(match (q.mode.period_s(), busy > 0.0) {
+                        (_, true) => "Enter, or click. Queued behind what is going out.".to_string(),
+                        (Some(p), _) => {
+                            format!("Enter, or click. Goes out on the next {p} s cycle.")
+                        }
+                        (None, _) => "Enter, or click. Goes out immediately.".to_string(),
+                    })
+                    .clicked();
+                if busy > 0.0 {
+                    ui.add(elegance::Indicator::new(elegance::IndicatorState::Connecting));
+                    let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 190, 120));
+                    ui.colored_label(c, format!("TX {busy:.0} s"));
+                    abort = ui
+                        .add(
+                            elegance::Button::new("Abort")
+                                .accent(elegance::Accent::Red)
+                                .size(elegance::ButtonSize::Small),
+                        )
+                        .clicked();
+                }
+            });
         });
 
-        ui.separator();
-        let ready = !q.draft.trim().is_empty();
-        ui.add(
-            elegance::TextArea::new(&mut q.draft)
-                .rows(2)
-                .desired_width(f32::INFINITY)
-                .hint("reply…"),
-        );
-        ui.horizontal(|ui| {
-            // Green for the affirmative action, red for the one that stops a
-            // transmission already going out: the accents carry the meaning,
-            // so neither has to be read to be told apart.
-            send = ui
-                .add(
-                    elegance::Button::new("Send")
-                        .accent(elegance::Accent::Green)
-                        .enabled(ready && busy <= 0.0),
-                )
-                .on_hover_text(match q.mode.period_s() {
-                    Some(p) => format!("goes out on the next {p} s cycle"),
-                    None => "goes out immediately".to_string(),
-                })
-                .clicked();
-            if busy > 0.0 {
-                ui.add(elegance::Indicator::new(elegance::IndicatorState::Connecting));
-                let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 190, 120));
-                ui.colored_label(c, format!("TX {busy:.0} s"));
-                abort = ui
-                    .add(
-                        elegance::Button::new("Abort")
-                            .accent(elegance::Accent::Red)
-                            .size(elegance::ButtonSize::Small),
-                    )
-                    .clicked();
-            }
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .stick_to_bottom(true)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    for e in &q.log {
+                        let (color, tag) = match e.dir {
+                            Dir::Rx => (mode_text_color(dark, q.mode), Dir::Rx.tag()),
+                            // Our own text takes the theme's own strong colour:
+                            // it is us talking, not a station with a mode
+                            // colour.
+                            Dir::Tx => (ui.visuals().strong_text_color(), Dir::Tx.tag()),
+                        };
+                        ui.horizontal_top(|ui| {
+                            ui.monospace(offset(e.at_s - q.started_s));
+                            Self::dir_badge(ui, tag, color);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&e.text).monospace().color(color),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    }
+                });
         });
 
         (send, abort)
@@ -1378,16 +1476,25 @@ impl App {
             }
         }
         let Some(q) = self.qsos.active_qso_mut() else { return };
-        let text = q.draft.trim().to_string();
-        if text.is_empty() {
+        // Sent as typed. A leading or trailing space is not stray whitespace
+        // in a character-stream mode: it is what keeps one transmission from
+        // running into the next, and both protocols carry a space. Only a
+        // draft with nothing but blanks in it is refused.
+        let text = q.draft.clone();
+        if text.trim().is_empty() {
             return;
         }
         let samples = tx::modulate(&text, q.hz, q.mode);
-        let at = tx::next_start(q.mode);
+        // Behind anything already going out, on that mode's next boundary.
+        let busy_until = self.tx.as_ref().map_or(0.0, |t| unix_now() + t.busy_for());
+        let at = tx::next_start_after(q.mode, busy_until);
         q.draft.clear();
         q.push_tx(&text, now_s);
         if let Some(t) = self.tx.as_mut() {
-            t.send(samples, at);
+            let end = t.send(samples, at);
+            // The outgoing pane keeps it until the whole queue has gone,
+            // striking it through as it leaves.
+            q.outgoing.push(crate::qso::Outgoing { text, start_unix: at, end_unix: end });
         }
         self.status = None;
     }
@@ -1978,6 +2085,7 @@ impl App {
         // panel claims what is left. New text reaches them here, so a QSO logs
         // what its station said whether or not its tab is the one on top.
         self.qsos.absorb(&channels);
+        self.qsos.retire_sent(unix_now());
         // The conversations sit on the theme's card surface while the band
         // keeps the panel background. The two are a designed pair — a shade
         // apart in both palettes, lighter in the dark theme and lighter again
@@ -2687,6 +2795,52 @@ mod tests {
             "the waterfall stopped moving once the spectrogram was full"
         );
         assert_eq!(app.wf_col, travel + per_px as i64, "travel was not recorded");
+    }
+
+    /// The whole composer sits at the foot of the QSO panel — the reply box as
+    /// well as the button under it — and the log fills the space above.
+    ///
+    /// Checking only the button is not enough: an earlier attempt left the
+    /// reply box up against the log at y=326 while the button sat correctly at
+    /// y=780, and a test that looked only for "Send" passed it.
+    #[test]
+    fn the_composer_sits_at_the_foot_of_the_qso_panel() {
+        let mut app = app_with_traffic(30.0);
+        lay_out(&mut app);
+        let channels = app.channels_now();
+        app.qsos.open_for_channel(&channels.channels()[0], app.t_now);
+
+        let window_h = 800.0f32; // per `lay_out`
+        let out = lay_out(&mut app);
+        let (mut reply_y, mut send_y, mut lowest_log_y) = (None, None, f32::MIN);
+        for cs in &out.shapes {
+            if let egui::Shape::Text(t) = &cs.shape {
+                match t.galley.text() {
+                    "Send" => send_y = Some(t.pos.y),
+                    "reply…" => reply_y = Some(t.pos.y),
+                    s if s.contains("K2N") => lowest_log_y = lowest_log_y.max(t.pos.y),
+                    _ => {}
+                }
+            }
+        }
+        let send_y = send_y.expect("the Send button should be drawn");
+        let reply_y = reply_y.expect("the reply box should be drawn");
+
+        // Measured at 725 and 777 of 800. The margin covers padding and font
+        // metrics; real space left below the composer should fail this.
+        assert!(
+            send_y > window_h - 40.0,
+            "Send sits at y={send_y} in an {window_h}-tall window, not at the foot of it"
+        );
+        assert!(
+            reply_y > window_h - 120.0,
+            "the reply box sits at y={reply_y}, adrift of the composer at {send_y}"
+        );
+        assert!(reply_y < send_y, "the reply box should be above its button");
+        assert!(
+            lowest_log_y > f32::MIN && lowest_log_y < reply_y,
+            "the log ({lowest_log_y}) should be above the composer ({reply_y})"
+        );
     }
 
     /// A band with two stations in it, revealed at `t`.
