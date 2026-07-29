@@ -988,11 +988,15 @@ impl App {
         if self.samples.is_empty() {
             return;
         }
-        // One thread per mode. Every mode's scan is independent of every other —
-        // nothing arbitrates between them afterwards, a signal is kept out of a
-        // neighbouring mode's results by that mode's own threshold — so this
-        // reports exactly what one pass over all of them would, in about the
-        // time of the slowest single mode.
+        // One thread per mode: a mode's own threshold is what keeps a signal
+        // out of its results, so the scans do not need each other to run, and
+        // splitting them reports in about the time of the slowest single mode
+        // instead of the sum of all of them.
+        //
+        // They do need each other to be *reconciled*, though, which is what
+        // `arbitrate_scans` does once the last one is in. Where PSK31 and a
+        // narrow Olivia mode both claim a signal the PSK decode has to go, and
+        // neither thread can tell on its own: each sees only its own mode.
         let modes = self.enabled_modes();
         self.pending_scans = modes.len();
         for m in modes {
@@ -1006,6 +1010,26 @@ impl App {
                 let _ = tx.send(frames);
             });
         }
+    }
+
+    /// Settle what the per-mode scans found between them.
+    ///
+    /// Run when the last scan lands, because the rule needs every mode's
+    /// results in front of it: a PSK decode is only dropped on the evidence of
+    /// an Olivia decode, and until Olivia's thread has reported there is no
+    /// evidence to weigh. A phantom may therefore be on screen for as long as
+    /// the scan takes, which is also how long the toolbar says it is scanning.
+    fn arbitrate_scans(&mut self) {
+        let found: Vec<protocol::Decode> = self.frames.iter().map(|f| f.decode.clone()).collect();
+        let before = found.len();
+        let kept = protocol::arbitrate(found);
+        if kept.len() == before {
+            return;
+        }
+        self.frames = kept
+            .into_iter()
+            .map(|d| Frame { reveal_s: d.time_s + d.mode.chunk_secs(), decode: d })
+            .collect();
     }
 
     /// The mode legend, doubling as the on/off control for what is scanned.
@@ -1762,9 +1786,14 @@ impl App {
                     self.playing = true;
                 }
             }
+            let mut landed = false;
             while let Ok(f) = self.frames_rx.try_recv() {
                 self.frames.extend(f);
                 self.pending_scans = self.pending_scans.saturating_sub(1);
+                landed = true;
+            }
+            if landed && self.pending_scans == 0 {
+                self.arbitrate_scans();
             }
             if self.spec.is_none() || self.pending_scans > 0 {
                 ctx.request_repaint();
@@ -2927,6 +2956,10 @@ mod tests {
         );
     }
 
+
+
+
+
     /// A PSK over stays one log entry even when the clock jumps over it, and
     /// the whole of it is drawn.
     ///
@@ -2982,6 +3015,52 @@ mod tests {
             })
             .sum();
         assert_eq!(drawn, text.chars().count(), "the panel drew {drawn} of {} characters", text.chars().count());
+    }
+
+
+    /// The file view reconciles what its per-mode scans found, once they are
+    /// all in.
+    ///
+    /// Each scan runs one mode, so no thread can see that its PSK decode sits
+    /// on top of a narrow Olivia signal — `tests/psk.rs` has the band where
+    /// that really happens. This checks the wiring: that the app applies the
+    /// rule when the last scan lands, and rebuilds its reveal times from what
+    /// survived.
+    #[test]
+    fn the_file_view_arbitrates_across_its_per_mode_scans() {
+        let mut app = App::base((300.0, 2600.0));
+        let d = |mode: ModeId, hz: f64, at: f64, text: &str| protocol::Decode {
+            mode,
+            hz,
+            time_s: at,
+            quality: 4.0,
+            text: text.to_string(),
+        };
+        let olivia = ModeId::Olivia(ragchew::olivia::OL_4_125);
+        let psk = ModeId::Psk(ragchew::psk::PSK31);
+        app.frames = [
+            // The Olivia station, from Olivia's thread.
+            d(olivia, 745.0, 6.0, "CQ DE TEST K "),
+            // The same signal read as PSK, from PSK's thread.
+            d(psk, 749.0, 6.2, "n teIer"),
+            // A real station elsewhere, which must survive.
+            d(psk, 1500.0, 7.0, "cq de w1aw "),
+        ]
+        .into_iter()
+        .map(|d| Frame { reveal_s: d.time_s + d.mode.chunk_secs(), decode: d })
+        .collect();
+        app.pending_scans = 0;
+
+        app.arbitrate_scans();
+
+        let kept: Vec<(ModeId, f64)> =
+            app.frames.iter().map(|f| (f.decode.mode, f.decode.hz)).collect();
+        assert_eq!(kept, [(olivia, 745.0), (psk, 1500.0)], "kept {kept:?}");
+        // Reveal times are rebuilt with the frames, not left behind.
+        for f in &app.frames {
+            let want = f.decode.time_s + f.decode.mode.chunk_secs();
+            assert!((f.reveal_s - want).abs() < 1e-9, "reveal time not rebuilt");
+        }
     }
 
     /// A band with two stations in it, revealed at `t`.

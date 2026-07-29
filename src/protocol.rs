@@ -250,6 +250,32 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
     out
 }
 
+/// Settle the claims two protocols make on the same signal, across a set of
+/// decodes that were not all found by the same call.
+///
+/// [`decode_all`] already does this to what it finds, which is the whole story
+/// when one call scans every mode. It is not the whole story when a caller
+/// splits the work up by mode to get it done sooner — the file view scans one
+/// mode per thread, so it finishes in the time of the slowest single mode
+/// rather than the sum of all of them. Arbitration can only weigh a PSK decode
+/// against an Olivia decode it can *see*, and split that way neither call sees
+/// the other's. Merge the results, pass them through here, and the rule applies
+/// as though one call had found them all.
+///
+/// Idempotent, and harmless on a set that needs nothing done to it: a PSK
+/// decode with no Olivia signal on top of it survives any number of passes.
+pub fn arbitrate(decodes: Vec<Decode>) -> Vec<Decode> {
+    let (psk, others): (Vec<Decode>, Vec<Decode>) =
+        decodes.into_iter().partition(|d| d.mode.protocol() == Protocol::Psk);
+    if psk.is_empty() {
+        return others;
+    }
+    let mut out = arbitrate_psk(psk, &others);
+    out.extend(others);
+    out.sort_by(|a, b| a.time_s.partial_cmp(&b.time_s).unwrap());
+    out
+}
+
 /// Drop PSK decodes that are really an Olivia signal being read twice.
 ///
 /// Every standard Olivia mode runs at 31.25 or 62.5 baud — `bandwidth / tones`

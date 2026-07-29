@@ -236,3 +236,83 @@ fn psk31_and_psk63_share_a_band() {
     assert!(slow.contains("this is the slow one"), "PSK31 decoded {slow:?}");
     assert!(fast.contains("and this is the fast one"), "PSK63 decoded {fast:?}");
 }
+
+/// Scanning mode by mode and merging must answer exactly as one scan does.
+///
+/// The file view splits its scan one thread per mode, so it finishes in the
+/// time of the slowest single mode rather than the sum. That is sound for
+/// detection — a mode's own threshold is what keeps a signal out of its own
+/// results — but not for arbitration, which weighs one protocol's claim
+/// against another's and so needs both in front of it. A thread scanning PSK
+/// alone has no Olivia decode to yield to.
+///
+/// Olivia 4/125 at 745 Hz is a band that shows it. It shares PSK31's symbol
+/// rate and is narrow enough to sit inside the analysis slice, and at this
+/// carrier it clears the gate outright: scanned on its own, PSK31 reads a page
+/// of rubbish off it at 749 Hz, at every level and every noise seed tried.
+#[test]
+fn scanning_mode_by_mode_arbitrates_the_same() {
+    let rate = SAMPLE_RATE as usize;
+    let mut audio = noise(30 * rate, 0.02, 0x9E37_79B9);
+    mix(&mut audio, rate, &olivia::encode("CQ DE TEST K ", 745.0, olivia::OL_4_125), 0.35);
+
+    let modes = protocol::default_modes();
+    let together = protocol::decode_all(&audio, BAND.0, BAND.1, &modes);
+    assert!(
+        text_of(&together, Protocol::Psk).is_empty(),
+        "one scan invented PSK text {:?}",
+        text_of(&together, Protocol::Psk)
+    );
+
+    // What the file view's threads produce between them, before anything
+    // reconciles them.
+    let split: Vec<protocol::Decode> =
+        modes.iter().flat_map(|m| protocol::decode_all(&audio, BAND.0, BAND.1, &[*m])).collect();
+    assert!(
+        !text_of(&split, Protocol::Psk).is_empty(),
+        "no phantom to arbitrate: this band no longer exercises the case"
+    );
+
+    let settled = protocol::arbitrate(split.clone());
+    assert!(
+        text_of(&settled, Protocol::Psk).is_empty(),
+        "arbitration left PSK text {:?} that a single scan drops",
+        text_of(&settled, Protocol::Psk)
+    );
+    // And it took nothing else with it. Compared as a set, because arbitration
+    // hands back what it kept in time order while the split scan produced it in
+    // mode order — the ordering the file view wants, since it reveals decodes
+    // as the clock reaches them.
+    let others = |ds: &[protocol::Decode]| {
+        let mut v: Vec<String> = ds
+            .iter()
+            .filter(|d| d.mode.protocol() != Protocol::Psk)
+            .map(|d| format!("{} {:.0} {:.2} {}", d.mode.name(), d.hz, d.time_s, d.text))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(others(&settled), others(&split), "arbitration disturbed another protocol");
+    assert!(
+        settled.windows(2).all(|w| w[0].time_s <= w[1].time_s),
+        "results came back out of time order"
+    );
+    // Running it again changes nothing: the file view arbitrates whenever a
+    // scan lands, and a rescan re-runs it over results already settled.
+    assert_eq!(protocol::arbitrate(settled.clone()).len(), settled.len(), "not idempotent");
+}
+
+/// A genuine PSK station inside a *wide* Olivia signal is not silenced by it:
+/// stations stacked inside each other is a thing this monitor exists to show.
+#[test]
+fn arbitration_spares_a_real_station_under_a_wide_signal() {
+    let rate = SAMPLE_RATE as usize;
+    let mut audio = noise(40 * rate, 0.02, 0x5AFE_0001);
+    mix(&mut audio, 0, &psk_station("cq cq de w1aw k ", 2150.0), 0.4);
+    mix(&mut audio, rate, &olivia::encode("DE VE3XYZ RST 599 ", 2000.0, olivia::OL_16_500), 0.35);
+
+    let out = protocol::decode_all(&audio, BAND.0, BAND.1, &protocol::default_modes());
+    let psk_text = text_of(&out, Protocol::Psk);
+    assert!(psk_text.contains("cq cq de w1aw k"), "the station was arbitrated away: {psk_text:?}");
+    assert!(text_of(&out, Protocol::Olivia).contains("DE VE3XYZ"), "the Olivia station went");
+}
