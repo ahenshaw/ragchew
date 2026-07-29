@@ -86,13 +86,23 @@ pub fn modulate(text: &str, hz: f64, mode: ModeId) -> Vec<f32> {
 /// Now, for a continuous mode. For a cycle-aligned one, the next boundary of
 /// its own grid — skipping one that is too close to make.
 pub fn next_start(mode: ModeId) -> f64 {
-    let now = unix_now();
+    next_start_after(mode, unix_now())
+}
+
+/// The same, for a transmission that cannot begin before `earliest` — the one
+/// already going out has to finish first.
+///
+/// A free-running mode simply follows on; a scheduled one waits for the first
+/// cycle boundary at or after that point, so queueing behind a burst does not
+/// put the next frame half a cycle out.
+pub fn next_start_after(mode: ModeId, earliest: f64) -> f64 {
+    let from = earliest.max(unix_now());
     match mode.period_s() {
-        None => now,
+        None => from,
         Some(p) => {
             let p = p as f64;
-            let mut t = ((now / p).floor() + 1.0) * p;
-            if t - now < CYCLE_MARGIN_S {
+            let mut t = ((from / p).floor() + 1.0) * p;
+            if t - from < CYCLE_MARGIN_S {
                 t += p;
             }
             t
@@ -331,5 +341,27 @@ mod tests {
             assert!(t > now && t - now >= CYCLE_MARGIN_S, "{m:?} start is too close to make");
             assert!(t - now <= 2.0 * p, "{m:?} waited {}s for a {p}s cycle", t - now);
         }
+    }
+
+    /// A second transmission goes behind the first, on a boundary — not half a
+    /// cycle into it, and not before the card has finished the burst it has.
+    #[test]
+    fn a_queued_transmission_waits_for_the_one_before_it() {
+        let js8 = ModeId::Js8(js8::Mode::Normal); // 15 s cycles
+        let now = unix_now();
+        let busy_until = now + 20.0;
+        let at = next_start_after(js8, busy_until);
+        assert!(at >= busy_until, "queued on top of a burst still going out");
+        assert!(
+            (at % 15.0).abs() < 1e-6,
+            "{at} is not on a 15 s boundary"
+        );
+        assert!(at - busy_until <= 15.0, "waited longer than one cycle");
+
+        // A free-running mode simply follows on.
+        let olivia = ModeId::Olivia(olivia::OL_8_250);
+        assert!((next_start_after(olivia, busy_until) - busy_until).abs() < 1e-6);
+        // and a past deadline never schedules in the past
+        assert!(next_start_after(olivia, 0.0) >= now);
     }
 }
