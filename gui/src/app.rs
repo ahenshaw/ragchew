@@ -159,6 +159,10 @@ pub fn run() -> eframe::Result<()> {
     )
 }
 
+/// What a QSO opened by hand starts in until the operator says otherwise.
+/// JS8 Normal is the mode most likely to raise someone.
+const DEFAULT_QSO_MODE: ModeId = ModeId::Js8(ragchew::js8::Mode::Normal);
+
 /// Which palette the window uses.
 ///
 /// Stored and restored by name for the same reason the mode list is: a name
@@ -303,6 +307,8 @@ struct Settings {
     view_hz: Option<(f64, f64)>,
     /// Palette, by [`Theme::name`].
     theme: String,
+    /// Mode a QSO opened by hand starts in, by [`ModeId::name`].
+    default_mode: String,
 }
 
 impl Default for Settings {
@@ -320,6 +326,7 @@ impl Default for Settings {
             qso_w: 340.0,
             view_hz: None,
             theme: Theme::default().name().to_string(),
+            default_mode: DEFAULT_QSO_MODE.name(),
         }
     }
 }
@@ -761,6 +768,10 @@ struct App {
     preferred_input: Option<String>,
     /// Offer every ALSA PCM in the device pickers, not just the winnowed set.
     show_all_inputs: bool,
+    /// What a QSO opened by hand transmits in. Not tied to the modes being
+    /// scanned for: what you listen to and what you call in are separate
+    /// choices, and a QSO started by hand has no decode to take a mode from.
+    default_mode: ModeId,
     /// Palette the operator asked for. egui holds the same preference, but this
     /// is what gets written to the settings file — and under Auto, egui's
     /// resolved light/dark cannot tell us what was asked for.
@@ -825,6 +836,7 @@ impl App {
             status: None,
             preferred_input: None,
             show_all_inputs: false,
+            default_mode: DEFAULT_QSO_MODE,
             theme: Theme::default(),
             qsos: QsoSet::new(),
             qso_w: 340.0,
@@ -853,6 +865,7 @@ impl App {
             qso_w: self.qso_w,
             view_hz: Some((self.vp.f_lo, self.vp.f_hi)),
             theme: self.theme.name().to_string(),
+            default_mode: self.default_mode.name(),
         }
     }
 
@@ -870,6 +883,9 @@ impl App {
         // An unknown name leaves the theme at Auto rather than at whatever the
         // last build happened to write.
         self.theme = Theme::parse(&s.theme).unwrap_or_default();
+        // A name this build does not know — an older file, or a newer one —
+        // leaves the mode at the default rather than failing the whole file.
+        self.default_mode = protocol::parse_mode(&s.default_mode).unwrap_or(DEFAULT_QSO_MODE);
         let (lo, hi) = s.view_hz.unwrap_or(self.band);
         self.set_view(lo, hi);
 
@@ -1054,12 +1070,13 @@ impl App {
                 }
             }
             ui.add_space(6.0);
-            if ui.button("+").on_hover_text("new QSO").clicked() {
+            if ui
+                .button("+")
+                .on_hover_text(format!("new QSO in {}", self.default_mode.name()))
+                .clicked()
+            {
                 let hz = (self.vp.f_lo + self.vp.f_hi) / 2.0;
-                let mode = self.enabled_modes().first().copied().unwrap_or(ModeId::Js8(
-                    ragchew::js8::Mode::Normal,
-                ));
-                self.qsos.open_blank(hz, mode, now_s);
+                self.qsos.open_blank(hz, self.default_mode, now_s);
                 want_active = self.qsos.len() - 1;
             }
             self.qsos.set_active(want_active);
@@ -1788,6 +1805,27 @@ impl App {
                     if !live {
                         setting(ui, "speed", &mut self.speed, 1.0..=20.0, "×", 0.1, 1);
                     }
+                    ui.separator();
+                    // The modes are listed whether or not they are being
+                    // scanned for: calling in a mode you are not listening to
+                    // is unusual but not wrong, and refusing it here would be
+                    // the interface deciding it knows better.
+                    let all: Vec<ModeId> = self.modes.iter().map(|(m, _)| *m).collect();
+                    let current = self.default_mode;
+                    ui.menu_button(format!("New QSO in {}", current.name()), |ui| {
+                        ui.set_min_width(220.0);
+                        for m in all {
+                            let c = mode_text_color(ui.visuals().dark_mode, m);
+                            let label = egui::RichText::new(m.name()).color(c);
+                            if ui.selectable_label(m == current, label).clicked() {
+                                self.default_mode = m;
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("what the + button opens a conversation in");
+
                     // Offered whether or not the app is listening. Live, the
                     // list is the one capture opened from and the mark is the
                     // device actually open; otherwise it is the preference that
@@ -2501,6 +2539,7 @@ mod tests {
         app.preferred_output = Some("alsa:plughw:CARD=Rig,DEV=0".to_string());
         app.qso_w = 380.0;
         app.theme = Theme::Light;
+        app.default_mode = ModeId::Olivia(ragchew::olivia::OL_16_500);
         app.set_view(1200.0, 1400.0);
         for (m, on) in app.modes.iter_mut() {
             *on = m.protocol() == Protocol::Olivia;
@@ -2518,6 +2557,7 @@ mod tests {
         assert_eq!(restored.preferred_output.as_deref(), Some("alsa:plughw:CARD=Rig,DEV=0"));
         assert_eq!(restored.qso_w, 380.0);
         assert_eq!(restored.theme, Theme::Light);
+        assert_eq!(restored.default_mode, ModeId::Olivia(ragchew::olivia::OL_16_500));
         assert_eq!((restored.vp.f_lo, restored.vp.f_hi), (1200.0, 1400.0));
         assert_eq!(restored.enabled_modes(), app.enabled_modes());
         assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
@@ -2565,6 +2605,42 @@ mod tests {
                 luma(light)
             );
         }
+    }
+
+    /// The mode a hand-opened QSO starts in survives a restart, and a name this
+    /// build does not know falls back rather than taking the file down.
+    #[test]
+    fn an_unknown_default_mode_falls_back() {
+        // Genuinely unparseable: an Olivia name is any tone/bandwidth pair the
+        // codec can build, so "Olivia 128/2000" is a real mode, not a typo.
+        for name in [r#""JS8 Hyper""#, r#""aubergine""#, r#""""#] {
+            let json = format!(r#"{{"text_px":17.0,"default_mode":{name}}}"#);
+            let mut app = App::base((0.0, 4000.0));
+            app.default_mode = ModeId::Olivia(ragchew::olivia::OL_8_250);
+            app.apply(serde_json::from_str(&json).unwrap());
+            assert_eq!(app.default_mode, DEFAULT_QSO_MODE, "{name} should not have been honoured");
+            assert_eq!(app.text_px, 17.0, "{name} took the other settings with it");
+        }
+        // and a file from before the setting existed
+        let mut app = App::base((0.0, 4000.0));
+        app.default_mode = ModeId::Olivia(ragchew::olivia::OL_8_250);
+        app.apply(serde_json::from_str(r#"{"text_px":17.0}"#).unwrap());
+        assert_eq!(app.default_mode, DEFAULT_QSO_MODE);
+    }
+
+    /// The + button opens a QSO in the chosen mode, whether or not that mode is
+    /// one of the ones being scanned for.
+    #[test]
+    fn a_hand_opened_qso_takes_the_default_mode() {
+        let mut app = App::base((0.0, 4000.0));
+        let wanted = ModeId::Olivia(ragchew::olivia::OL_32_1000);
+        app.default_mode = wanted;
+        // scanning for something else entirely
+        for (m, on) in app.modes.iter_mut() {
+            *on = matches!(m, ModeId::Js8(_));
+        }
+        app.qsos.open_blank((app.vp.f_lo + app.vp.f_hi) / 2.0, app.default_mode, 0.0);
+        assert_eq!(app.qsos.qsos()[0].mode, wanted);
     }
 
     /// A settings file written before the view was saved leaves it alone: the
