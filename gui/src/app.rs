@@ -2927,6 +2927,63 @@ mod tests {
         );
     }
 
+    /// A PSK over stays one log entry even when the clock jumps over it, and
+    /// the whole of it is drawn.
+    ///
+    /// This is the end-to-end version of what `qso.rs` checks with decodes it
+    /// places by hand: the real demo band, the real frame loop, and the real
+    /// character times the decoder produces. It regressed once, and visibly —
+    /// the entry that was open when the tab was opened stopped growing at 46
+    /// characters while the rest of the over went into a second one. The cause
+    /// was timing a silence between two absorbs, which measures how often the
+    /// app looked rather than how long the station stopped for.
+    #[test]
+    fn a_psk_over_survives_a_jump_of_the_clock() {
+        let mut app = App::base((300.0, 2600.0));
+        let samples = crate::demo::synth();
+        app.frames =
+            protocol::decode_all(&samples, 300.0, 2600.0, &[ModeId::Psk(ragchew::psk::PSK31)])
+                .into_iter()
+                .map(|d| Frame { reveal_s: d.time_s + d.mode.chunk_secs(), decode: d })
+                .collect();
+        app.duration_s = 60.0;
+        app.samples = Arc::new(samples);
+
+        // Open the QSO part-way in, then jump the clock past the end of the
+        // over in one frame — scrubbing a recording, or a window that was not
+        // being drawn while the app was in the background.
+        app.t_now = 12.0;
+        lay_out(&mut app);
+        let early = app.channels_now();
+        app.qsos.open_for_channel(&early.channels()[0], app.t_now);
+        let opened_with = app.qsos.qsos()[0].log[0].text.chars().count();
+        app.t_now = 58.0;
+        let out = lay_out(&mut app);
+
+        let q = &app.qsos.qsos()[0];
+        assert_eq!(q.log.len(), 1, "the over split into {} entries", q.log.len());
+        let text = q.log[0].text.clone();
+        assert!(
+            text.chars().count() > opened_with * 3,
+            "the entry stopped growing: {} characters, opened with {opened_with}",
+            text.chars().count()
+        );
+        assert_eq!(q.call, "KB9PSK");
+
+        // And it reaches the screen. A log the panel cannot draw is not a log.
+        let drawn: usize = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("kb9psk") => {
+                    Some(t.galley.text().chars().count())
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(drawn, text.chars().count(), "the panel drew {drawn} of {} characters", text.chars().count());
+    }
+
     /// A band with two stations in it, revealed at `t`.
     fn app_with_traffic(t: f64) -> App {
         let mut app = App::base((0.0, 4000.0));

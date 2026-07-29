@@ -176,3 +176,54 @@ fn weak_band_overlaps_and_sits_below_the_noise() {
         }
     }
 }
+
+/// A PSK over reaches the QSO log as one entry, not one per character.
+///
+/// The synthetic tests in `qso.rs` place their own decodes in time. This one
+/// takes the times the decoder actually produces from audio — every character
+/// separately, roughly five a second, from overlapping analysis blocks — and
+/// feeds them to a QSO the way the app does, one absorb per decode. What must
+/// come back is one line per over: the demo station calls CQ seven times
+/// without pausing, so that is one line.
+#[test]
+fn a_psk_over_reaches_the_log_as_one_entry() {
+    use ragchew::protocol::ModeId;
+    use ragchew::psk::PSK31;
+    use ragchew_gui::qso::QsoSet;
+
+    let (hz, _, call, repeats) = demo::PSK_STATIONS[0];
+    // Only the one station and only its mode: the whole-band scan is what makes
+    // the tests above slow, and none of it is under test here.
+    let decodes = protocol::decode_all(
+        &demo::synth(),
+        hz - 60.0,
+        hz + 60.0,
+        &[ModeId::Psk(PSK31)],
+    );
+    assert!(decodes.len() > 100, "the station barely decoded: {} characters", decodes.len());
+    assert!(
+        decodes.iter().all(|d| d.text.chars().count() == 1),
+        "a PSK decode is one character; this test's premise has changed"
+    );
+
+    let mut set = ChannelSet::new(15.0);
+    let mut qsos = QsoSet::new();
+    for d in decodes {
+        set.add(d);
+        if qsos.qsos().is_empty() {
+            qsos.open_for_channel(&set.channels()[0], 0.0);
+        }
+        qsos.absorb(&set);
+    }
+
+    let q = &qsos.qsos()[0];
+    assert_eq!(
+        q.log.len(),
+        1,
+        "one uninterrupted over became {} log entries",
+        q.log.len()
+    );
+    let copies = q.log[0].text.matches(call.trim_end()).count();
+    assert!(copies >= repeats - 2, "logged {copies} copies of the call: {:?}", q.log[0].text);
+    assert_eq!(q.call, "KB9PSK", "the call was never read out of the over");
+}

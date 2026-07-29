@@ -2,8 +2,13 @@
 //! (one per station/conversation) by carrier frequency, tolerating drift, so a
 //! station's text stays on one row over time.
 //!
-//! A "decode" is one JS8 frame or one Olivia FEC block — the tracker does not
-//! care which, only where it landed and when.
+//! A "decode" is one JS8 frame, one Olivia FEC block, or — for PSK — a single
+//! character. The tracker does not care which, only where it landed and when.
+//!
+//! It does care about *when* on one further count. A decode's own time is known
+//! only here, as it arrives; downstream the text is one string with the
+//! silences squeezed out of it. So this is where a station going quiet is
+//! noticed and written down: see [`Channel::breaks`].
 
 use ragchew::protocol::{Decode, ModeId};
 
@@ -43,6 +48,18 @@ pub struct Channel {
     pub text_dropped: usize,
     /// Mode of the most recent decode.
     pub mode: ModeId,
+    /// Where this station stopped and started again: `(character index, the
+    /// time it resumed)`, indexed from the start of the conversation the way
+    /// [`Channel::text_dropped`] counts, and trimmed with the text.
+    ///
+    /// A continuous mode carries no mark for the end of an over — there is no
+    /// frame and no schedule, only text that stops coming for a while — and
+    /// this is the only place that can see it, because it is the only place
+    /// that sees each decode's own time. By the time a reader has the channel,
+    /// the text is one string and the silences in it are gone.
+    ///
+    /// Empty for cycle-aligned modes: a JS8 frame is a whole utterance already.
+    pub breaks: Vec<(usize, f64)>,
     /// Character count of the most recently appended chunk (for the scroll-in
     /// animation).
     pub last_chunk_chars: usize,
@@ -83,8 +100,40 @@ impl Channel {
         let cut = self.text.char_indices().nth(drop).map_or(self.text.len(), |(i, _)| i);
         self.text.drain(..cut);
         self.text_dropped += drop;
+        // A break in text nobody can read any more says nothing.
+        self.breaks.retain(|&(i, _)| i >= self.text_dropped);
+    }
+
+    /// Absolute index of the next character this channel will take.
+    fn next_index(&self) -> usize {
+        self.text_dropped + self.text.chars().count()
     }
 }
+
+/// How long a station must go quiet before what it sends next is a new over —
+/// or `None` for a mode whose decodes are whole utterances already.
+///
+/// Five seconds is long enough to type a word badly and short enough to be a
+/// pause rather than a hesitation. Fast modes are held to it as a floor:
+/// PSK63's own timing would end an over after two thirds of a second, which is
+/// well inside a hunt-and-peck typist's reach for a key. Slower ones are given
+/// room to be slow — Olivia sends a block every two seconds, and two of those
+/// in a row are not a pause.
+///
+/// Cycle-aligned modes are exempt rather than merely slow. A JS8 frame is a
+/// packed, self-contained message sent on a UTC boundary, so one frame is one
+/// thing said. The split is the same one the decode threads make
+/// ([`audio::spawn_decoder`](crate::audio::spawn_decoder)), for the same
+/// reason: a schedule is either there to be used or it is not.
+pub fn over_gap_s(mode: ModeId) -> Option<f64> {
+    if mode.period_s().is_some() {
+        return None;
+    }
+    Some((4.0 * mode.chunk_secs()).max(MIN_OVER_GAP_S))
+}
+
+/// Shortest silence that ends an over, however fast the mode is.
+pub const MIN_OVER_GAP_S: f64 = 5.0;
 
 /// Tracks channels as decodes arrive (in time order).
 #[derive(Clone)]
@@ -130,6 +179,14 @@ impl ChannelSet {
                     ch.hz_history.remove(0);
                 }
                 ch.last_chunk_chars = d.text.chars().count();
+                // Measured here because here is the only place the times are
+                // still separate: one decode, one instant. Recorded before the
+                // text goes on, so the index is where the new over starts.
+                if let Some(limit) = over_gap_s(d.mode) {
+                    if d.time_s - ch.last_heard_s > limit {
+                        ch.breaks.push((ch.next_index(), d.time_s));
+                    }
+                }
                 ch.push_text(&d.text);
                 ch.last_heard_s = d.time_s;
                 ch.quality = d.quality;
@@ -153,6 +210,7 @@ impl ChannelSet {
                     quality: d.quality,
                     best_quality: d.quality,
                     chunks: 1,
+                    breaks: Vec::new(),
                 });
                 // Through `push_text`, so a single outsized decode cannot put
                 // a brand-new channel over the limit either.
@@ -343,5 +401,81 @@ mod tests {
             quality: 4.0,
         });
         assert_eq!(set.channels()[0].text.chars().count(), MAX_TEXT_CHARS);
+    }
+
+    /// Where a station stopped and started again is recorded as it arrives,
+    /// because it cannot be recovered afterwards: by the time a reader has the
+    /// channel, the silence is just the space between two characters in a
+    /// string.
+    #[test]
+    fn a_pause_in_a_continuous_mode_is_marked() {
+        let psk = |t: f64, c: char| Decode {
+            hz: 620.0,
+            time_s: t,
+            text: c.to_string(),
+            mode: ModeId::Psk(ragchew::psk::PSK31),
+            quality: 4.0,
+        };
+        let step = ModeId::Psk(ragchew::psk::PSK31).chunk_secs();
+        let mut set = ChannelSet::new(15.0);
+
+        let mut t = 0.0;
+        for c in "hi om ".chars() {
+            set.add(psk(t, c));
+            t += step;
+        }
+        assert!(set.channels()[0].breaks.is_empty(), "text arriving steadily is one over");
+
+        // The station stops, then comes back.
+        let resumed = t + MIN_OVER_GAP_S + 1.0;
+        t = resumed;
+        for c in "back ".chars() {
+            set.add(psk(t, c));
+            t += step;
+        }
+        let ch = &set.channels()[0];
+        assert_eq!(ch.breaks.len(), 1, "breaks: {:?}", ch.breaks);
+        assert_eq!(ch.breaks[0].0, "hi om ".chars().count(), "marked at the wrong character");
+        assert!((ch.breaks[0].1 - resumed).abs() < 1e-9, "marked at the wrong time");
+        assert_eq!(ch.text, "hi om back ", "the text itself is untouched");
+    }
+
+    /// A cycle-aligned mode records none: every frame is a whole utterance, so
+    /// there is nothing for a gap to tell anyone.
+    #[test]
+    fn a_cycle_aligned_mode_marks_nothing() {
+        let mut set = ChannelSet::new(15.0);
+        for i in 0..4 {
+            set.add(d(1000.0, i as f64 * 15.0, "DE K2N "));
+        }
+        assert!(set.channels()[0].breaks.is_empty());
+        assert!(over_gap_s(ModeId::Js8(js8::Mode::Normal)).is_none());
+    }
+
+    /// Breaks are indexed from the start of the conversation, like the text
+    /// they point into, and go when the text they point at does.
+    #[test]
+    fn breaks_are_trimmed_with_the_text() {
+        let olivia = |t: f64, s: &str| Decode {
+            hz: 1000.0,
+            time_s: t,
+            text: s.to_string(),
+            mode: ModeId::Olivia(olivia::OL_8_250),
+            quality: 4.0,
+        };
+        let mut set = ChannelSet::new(15.0);
+        let mut t = 0.0;
+        // Pause between every block, so every one of them starts an over.
+        for _ in 0..(MAX_TEXT_CHARS / 8 + 40) {
+            set.add(olivia(t, "12345678"));
+            t += 60.0;
+        }
+        let ch = &set.channels()[0];
+        assert!(ch.text_dropped > 0, "the channel never trimmed; this proves nothing");
+        assert!(
+            ch.breaks.iter().all(|&(i, _)| i >= ch.text_dropped),
+            "a break points into text that is gone"
+        );
+        assert!(!ch.breaks.is_empty(), "every break was dropped");
     }
 }

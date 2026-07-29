@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use ragchew::protocol::ModeId;
 
-use crate::channels::{Channel, ChannelSet};
+use crate::channels::{over_gap_s, Channel, ChannelSet};
 
 /// Which way a log entry went.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,12 +38,37 @@ impl Dir {
 /// One line of the conversation.
 #[derive(Clone, Debug)]
 pub struct Entry {
-    /// Audio-clock time this landed, in the same seconds the playback clock
+    /// Audio-clock time this *began*, in the same seconds the playback clock
     /// counts. The log shows it as an offset from the start of the QSO, which
     /// is what tells you the rhythm of an exchange.
+    ///
+    /// An entry that grew over several decodes keeps the time of the first, so
+    /// the column reads as when the station started saying this rather than
+    /// when it stopped.
     pub at_s: f64,
     pub dir: Dir,
     pub text: String,
+}
+
+/// The part of a received entry whose last word is certainly finished.
+///
+/// A continuous mode arrives a character at a time, so the token on the end of
+/// an entry is usually still being sent — and a partial call sign is call
+/// *shaped* long before it is right: `kb9p` passes every test `kb9psk` does,
+/// and a QSO that grabbed it would carry the wrong call into the log. So
+/// everything past the last space is left until the next character settles it.
+///
+/// A frame from a cycle-aligned mode arrives whole and is returned whole; its
+/// last token is finished by definition, and trimming it would lose the call in
+/// a frame that ends on one.
+fn settled_text(text: &str, mode: ModeId) -> &str {
+    if over_gap_s(mode).is_none() {
+        return text;
+    }
+    match text.char_indices().rfind(|(_, c)| c.is_whitespace()) {
+        Some((i, c)) => &text[..i + c.len_utf8()],
+        None => "",
+    }
 }
 
 /// Text on the air.
@@ -157,11 +182,42 @@ impl Qso {
         self.last_s = at_s.max(self.last_s);
     }
 
+    /// Add received characters: onto the entry already open, or as an entry of
+    /// their own when `began` says they start an over.
+    ///
+    /// Our own transmission always ends the entry it interrupts, whatever the
+    /// timing — the last thing in the log being a TX is exactly what "the other
+    /// station started a new over" looks like, so nothing joins across it.
+    fn push_rx(&mut self, chars: &[char], began: Option<f64>, now_s: f64) {
+        if chars.is_empty() {
+            return;
+        }
+        let text: String = chars.iter().collect();
+        let open = match self.log.last() {
+            Some(e) if began.is_none() && e.dir == Dir::Rx => Some(self.log.len() - 1),
+            _ => None,
+        };
+        match open {
+            Some(i) => self.log[i].text.push_str(&text),
+            None => self.log.push(Entry { at_s: began.unwrap_or(now_s), dir: Dir::Rx, text }),
+        }
+    }
+
     /// Take whatever the followed channel has decoded since last time.
     ///
     /// The channel accumulates one long string, so the new tail is the whole of
-    /// what arrived — one entry per decode in practice, since this runs every
-    /// frame and a frame is far shorter than a JS8 cycle or an Olivia block.
+    /// what arrived. This runs every frame, so on a continuous mode that tail
+    /// is usually a single character — which is why it joins the entry already
+    /// open rather than starting one.
+    ///
+    /// What breaks the run is either of the two things that mean the other
+    /// station finished: we transmitted, or it stopped. The second is not
+    /// something this can time for itself. A QSO absorbs whatever arrived since
+    /// it last looked, which is one character during playback and a whole scan
+    /// pass — several seconds of text — from a live radio, so the interval
+    /// between calls measures the decoder's cadence and not the operator's.
+    /// [`Channel::breaks`] holds the real silences, recorded where the decodes
+    /// still had their own times, and this splits on those.
     fn absorb(&mut self, ch: &Channel) {
         self.hz = ch.hz;
         self.mode = ch.mode;
@@ -181,15 +237,44 @@ impl Qso {
         // Text trimmed away before this QSO reached it is gone; start from the
         // oldest character the channel still has rather than from behind it.
         let seen = self.absorbed.max(ch.text_dropped);
-        let new: String = ch.text.chars().skip(seen - ch.text_dropped).collect();
+        let new: Vec<char> = ch.text.chars().skip(seen - ch.text_dropped).collect();
         self.absorbed = have;
         self.last_s = ch.last_heard_s;
+
+        // Every over that starts inside what we just took. Usually none: text
+        // still arriving is the same over as the character before it.
+        let starts = ch.breaks.iter().filter(|&&(i, _)| i >= seen && i < have);
+
+        let mut from = 0usize;
+        // `None` continues the entry already open; `Some` is a fresh over, and
+        // carries the time it began so the log stamps it with that rather than
+        // with whenever this happened to be noticed.
+        //
+        // A cycle-aligned mode starts as one: it records no breaks because it
+        // needs none — every decode is a whole message and takes its own line,
+        // which is how the log has always shown JS8.
+        let mut began: Option<f64> =
+            over_gap_s(ch.mode).is_none().then_some(ch.last_heard_s);
+        for &(i, at_s) in starts {
+            let cut = i - seen;
+            if cut > from {
+                self.push_rx(&new[from..cut], began, ch.last_heard_s);
+            }
+            from = cut;
+            began = Some(at_s);
+        }
+        self.push_rx(&new[from..], began, ch.last_heard_s);
+
+        // Looked for in the whole entry rather than in what just arrived: on a
+        // continuous mode what just arrived is one character, and a call sign
+        // spread over twenty of them would never be seen. Rescanning costs
+        // nothing worth counting, and only happens while the call is unknown.
         if self.call.trim().is_empty() {
-            if let Some(c) = callsign_in(&new) {
+            let entry = self.log.last().expect("an entry was just written");
+            if let Some(c) = callsign_in(settled_text(&entry.text, ch.mode)) {
                 self.call = c;
             }
         }
-        self.log.push(Entry { at_s: ch.last_heard_s, dir: Dir::Rx, text: new });
     }
 }
 
@@ -434,6 +519,7 @@ fn is_call_core(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::MIN_OVER_GAP_S;
     use ragchew::protocol::Decode;
     use ragchew::{js8, olivia};
 
@@ -445,6 +531,31 @@ mod tests {
             quality: 4.0,
             text: text.to_string(),
         }
+    }
+
+    /// One character, which is all a PSK decode ever is.
+    fn psk_decode(hz: f64, t: f64, ch: char) -> Decode {
+        Decode {
+            mode: ModeId::Psk(ragchew::psk::PSK31),
+            hz,
+            time_s: t,
+            quality: 4.0,
+            text: ch.to_string(),
+        }
+    }
+
+    /// Feed a PSK station's text in one character at a time, at the rate the
+    /// mode sends them, absorbing after each — which is what the app does, a
+    /// frame at a time, as the playback clock passes each character.
+    fn psk_over(set: &mut ChannelSet, qsos: &mut QsoSet, from_s: f64, text: &str) -> f64 {
+        let step = ModeId::Psk(ragchew::psk::PSK31).chunk_secs();
+        let mut t = from_s;
+        for c in text.chars() {
+            set.add(psk_decode(620.0, t, c));
+            qsos.absorb(set);
+            t += step;
+        }
+        t
     }
 
     /// The calls in this repository's own demo band, which are the ones any
@@ -526,6 +637,149 @@ mod tests {
         assert_eq!(q.log.len(), 2);
         assert_eq!(q.log[1].text, "73 GL ");
         assert_eq!(q.log[1].at_s, 35.0);
+    }
+
+    /// A PSK over is one line in the log, not one line per character.
+    ///
+    /// PSK decodes arrive a character at a time — there is no frame and no
+    /// block — so a log that started an entry per decode gave every letter its
+    /// own timestamped row. What has to come back is the over, whole, stamped
+    /// when the station started sending it.
+    #[test]
+    fn a_psk_over_is_one_entry() {
+        let text = "cq cq de kb9psk pse k ";
+        let mut set = ChannelSet::new(15.0);
+        set.add(psk_decode(620.0, 0.0, 'c'));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        psk_over(&mut set, &mut qsos, ModeId::Psk(ragchew::psk::PSK31).chunk_secs(), &text[1..]);
+
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.log.len(), 1, "one over, {} entries: {:?}", q.log.len(), q.log);
+        assert_eq!(q.log[0].text, text);
+        assert_eq!(q.log[0].at_s, 0.0, "stamped when the over ended, not when it began");
+        assert_eq!(q.call, "KB9PSK");
+    }
+
+    /// Live, a scan pass hands over several seconds of text at once — longer
+    /// than the silence that ends an entry. The over must not split at those
+    /// boundaries: they are the decoder's cadence, not the operator's.
+    #[test]
+    fn an_over_absorbed_in_batches_is_still_one_entry() {
+        let step = ModeId::Psk(ragchew::psk::PSK31).chunk_secs();
+        const BATCH: usize = 40;
+        assert!(
+            BATCH as f64 * step > MIN_OVER_GAP_S,
+            "a batch shorter than the gap would prove nothing"
+        );
+
+        let text: Vec<char> = "cq cq de kb9psk kb9psk pse k  ".repeat(4).chars().collect();
+        let mut set = ChannelSet::new(15.0);
+        let mut qsos = QsoSet::new();
+        let mut t = 0.0;
+        for (i, batch) in text.chunks(BATCH).enumerate() {
+            for c in batch {
+                set.add(psk_decode(620.0, t, *c));
+                t += step;
+            }
+            if i == 0 {
+                qsos.open_for_channel(&set.channels()[0], 0.0);
+            }
+            qsos.absorb(&set);
+        }
+
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.log.len(), 1, "the over split on a batch boundary: {:?}", q.log);
+        assert_eq!(q.log[0].text.chars().count(), text.len());
+    }
+
+    /// A distinguishable gap in reception is what ends an over, since nothing
+    /// in a continuous mode's signal says so.
+    #[test]
+    fn silence_starts_a_new_psk_entry() {
+        let mut set = ChannelSet::new(15.0);
+        set.add(psk_decode(620.0, 0.0, 'h'));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let end = psk_over(&mut set, &mut qsos, 0.3, "i om ");
+
+        // A pause too short to mean anything: still the same over.
+        let end = psk_over(&mut set, &mut qsos, end + MIN_OVER_GAP_S - 1.0, "es tnx ");
+        assert_eq!(qsos.qsos()[0].log.len(), 1, "a two-second pause split the over");
+
+        // Long enough that the station plainly stopped.
+        psk_over(&mut set, &mut qsos, end + MIN_OVER_GAP_S + 1.0, "back again ");
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.log.len(), 2, "the station came back and the log did not notice");
+        assert_eq!(q.log[0].text, "hi om es tnx ");
+        assert_eq!(q.log[1].text, "back again ");
+    }
+
+    /// Sending ends the over we were copying, whatever the timing — which is
+    /// the other half of "start a new entry when we send".
+    #[test]
+    fn our_own_transmission_ends_the_received_entry() {
+        let mut set = ChannelSet::new(15.0);
+        set.add(psk_decode(620.0, 0.0, 'k'));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let end = psk_over(&mut set, &mut qsos, 0.3, " de w1aw ");
+
+        qsos.qsos_mut()[0].push_tx("r r ur 599", end);
+        // Straight back to us, well inside the gap that would otherwise join.
+        psk_over(&mut set, &mut qsos, end + 0.5, "tnx 73 ");
+
+        let q = &qsos.qsos()[0];
+        let dirs: Vec<Dir> = q.log.iter().map(|e| e.dir).collect();
+        assert_eq!(dirs, [Dir::Rx, Dir::Tx, Dir::Rx], "logged {:?}", q.log);
+        assert_eq!(q.log[2].text, "tnx 73 ");
+    }
+
+    /// Olivia is continuous too, so its blocks join into an over — but a block
+    /// takes two seconds, and two in a row are not a pause.
+    #[test]
+    fn olivia_blocks_join_but_a_real_pause_does_not() {
+        let block = |t: f64, text: &str| Decode {
+            mode: ModeId::Olivia(olivia::OL_8_250),
+            hz: 1000.0,
+            time_s: t,
+            quality: 4.0,
+            text: text.to_string(),
+        };
+        let mut set = ChannelSet::new(15.0);
+        set.add(block(0.0, "gm om "));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+
+        for (i, text) in ["ur rst ", "579 in ", "em73 "].iter().enumerate() {
+            set.add(block(2.05 * (i + 1) as f64, text));
+            qsos.absorb(&set);
+        }
+        assert_eq!(qsos.qsos()[0].log.len(), 1, "back-to-back blocks split");
+        assert_eq!(qsos.qsos()[0].log[0].text, "gm om ur rst 579 in em73 ");
+
+        set.add(block(60.0, "btu "));
+        qsos.absorb(&set);
+        assert_eq!(qsos.qsos()[0].log.len(), 2, "a minute of silence did not split");
+    }
+
+    /// JS8 is exempt: a frame is a packed message sent on a UTC boundary, so it
+    /// stays one entry per frame however close together the frames come. This
+    /// is the behaviour the tests above it depend on, stated on its own.
+    #[test]
+    fn js8_frames_stay_one_entry_each() {
+        let mut set = ChannelSet::new(15.0);
+        set.add(js8_decode(1000.0, 0.0, "CQ DE K2N "));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        // Consecutive cycles: closer together than MIN_OVER_GAP_S would allow a
+        // continuous mode, and still three separate things said.
+        for (i, text) in ["FN20 5W ", "PSE K "].iter().enumerate() {
+            set.add(js8_decode(1000.0, 1.0 + i as f64, text));
+            qsos.absorb(&set);
+        }
+        assert_eq!(qsos.qsos()[0].log.len(), 3);
+        assert!(over_gap_s(ModeId::Js8(js8::Mode::Normal)).is_none());
     }
 
     /// The UTC stamp is the moment the station was first heard, not the moment
