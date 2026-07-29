@@ -4,22 +4,32 @@ A panoramic monitor for HAM radio keyboard-to-keyboard digital modes: a
 waterfall of a whole audio band, with every conversation in it decoded and
 printed inline — whatever mode each one is using.
 
-Two protocol families are implemented, both from scratch in Rust:
+Three protocol families are implemented, all from scratch in Rust:
 
 | Protocol | Modes | Character |
 |----------|-------|-----------|
 | **JS8** ([JS8Call](https://js8call.com)) | Slow / Normal / Fast / Turbo | 15-second bursts on a UTC grid, LDPC-coded, packed messages |
 | **Olivia** MFSK | 8/250, 16/500, 32/1000, … any `tones/bandwidth` pair | continuous conversational text, Walsh-Hadamard-coded |
+| **PSK** | PSK31, PSK63 | continuous differential BPSK, 31 Hz wide, no error correction at all |
 
 They could hardly be less alike — one is a scheduled burst mode with a packed
-87-bit payload, the other a free-running character stream with no sync pattern
-at all — which is the point: `ragchew` decodes them side by side in one band and
-presents them the same way.
+87-bit payload, the next a free-running character stream with no sync pattern at
+all, the third 31 Hz of carrier with nothing to prove itself with — which is the
+point: `ragchew` decodes them side by side in one band and presents them the
+same way.
+
+PSK31 is the awkward one, and interesting for it. JS8 has a Costas array, LDPC
+and a CRC; Olivia has a Walsh correlation measured against the noise floor. Feed
+a BPSK31 demodulator pure noise and it produces bits, and varicode turns two in
+five of them into letters — so a monitor that prints everything it scans has to
+supply the proof the mode does not carry. `src/psk/modem.rs` documents the
+three-stage gate that does it, and `examples/psk_gate.rs` is the harness the
+thresholds were measured on.
 
 ## Try it
 
 ```
-cargo run -p ragchew-gui --release -- --demo          # synthetic multi-protocol band
+cargo run -p ragchew-gui --release -- --demo          # synthetic three-protocol band
 cargo run -p ragchew-gui --release -- --weak          # Olivia under the noise floor
 cargo run -p ragchew-gui --release -- --live          # decode the default audio input
 cargo run -p ragchew-gui --release -- recording.wav   # decode a recording

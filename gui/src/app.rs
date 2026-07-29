@@ -220,8 +220,8 @@ impl Theme {
 /// Per-mode colour, so a channel's colour tells you what it is.
 ///
 /// Each protocol gets its own end of the spectrum — JS8 cool through warm,
-/// Olivia violet through cyan — so you can tell the two families apart at a
-/// glance and still read the individual mode off the shade.
+/// Olivia violet through cyan, PSK a yellow of its own — so you can tell the
+/// families apart at a glance and still read the individual mode off the shade.
 fn mode_color(m: ModeId) -> Color32 {
     use ragchew::js8::Mode as J;
     match m {
@@ -239,6 +239,9 @@ fn mode_color(m: ModeId) -> Color32 {
             (16, 1000) => Color32::from_rgb(130, 235, 200),
             _ => Color32::from_rgb(200, 190, 230),
         },
+        // Clear of both families: PSK31 is narrow enough to sit inside an
+        // Olivia signal on the waterfall, so it must not shade like one.
+        ModeId::Psk(_) => Color32::from_rgb(245, 220, 130), // yellow
     }
 }
 
@@ -1017,20 +1020,25 @@ impl App {
             let total = self.modes.iter().filter(|(m, _)| m.protocol() == p).count();
             let label = format!("{} {on}/{total}", p.name());
             settings_menu(ui, label, |ui| {
-                let set_all = |modes: &mut Vec<(ModeId, bool)>, on: bool| {
-                    for (_, e) in modes.iter_mut().filter(|(m, _)| m.protocol() == p) {
-                        *e = on;
+                // Bulk controls only earn their place when there is more than
+                // one mode to apply them to. PSK has a single one, and "all"
+                // over a lone checkbox is a second way to do the same thing.
+                if total > 1 {
+                    let set_all = |modes: &mut Vec<(ModeId, bool)>, on: bool| {
+                        for (_, e) in modes.iter_mut().filter(|(m, _)| m.protocol() == p) {
+                            *e = on;
+                        }
+                    };
+                    if ui.button("all").clicked() {
+                        set_all(&mut self.modes, true);
+                        changed = true;
                     }
-                };
-                if ui.button("all").clicked() {
-                    set_all(&mut self.modes, true);
-                    changed = true;
+                    if ui.button("none").clicked() {
+                        set_all(&mut self.modes, false);
+                        changed = true;
+                    }
+                    ui.separator();
                 }
-                if ui.button("none").clicked() {
-                    set_all(&mut self.modes, false);
-                    changed = true;
-                }
-                ui.separator();
                 for (m, enabled) in self.modes.iter_mut().filter(|(m, _)| m.protocol() == p) {
                     ui.horizontal(|ui| {
                         if ui.add(elegance::Checkbox::new(enabled, "")).changed() {

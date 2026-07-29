@@ -5,12 +5,13 @@
 //! decodes *every* conversation in an audio band at once, whatever mode each
 //! one is using.
 //!
-//! Two protocol families are implemented today:
+//! Three protocol families are implemented today:
 //!
 //! | module            | protocol | modes |
 //! |-------------------|----------|-------|
 //! | [`js8`]           | JS8 (JS8Call) — burst, cycle-aligned, LDPC | Slow / Normal / Fast / Turbo |
 //! | [`olivia`]        | Olivia MFSK — continuous, Walsh-Hadamard FEC | any tones/bandwidth pair, e.g. 8/250, 16/500, 32/1000 |
+//! | [`psk`]           | PSK — continuous, differential BPSK, no FEC at all | PSK31, PSK63 |
 //!
 //! [`protocol`] sits on top of both and is what applications normally use: it
 //! erases the difference between "JS8 Normal frame" and "Olivia 32/1000 block"
@@ -33,6 +34,7 @@ pub mod dsp;
 pub mod js8;
 pub mod olivia;
 pub mod protocol;
+pub mod psk;
 pub mod spectrogram;
 pub mod wav;
 

@@ -5,11 +5,11 @@
 //! is how a rig fed from a USB codec with VOX — or a speaker held to a
 //! microphone — actually gets driven. Keying a radio is a separate job.
 //!
-//! The two protocols want opposite scheduling, and it is the same asymmetry the
-//! decoder deals with. Olivia is continuous and starts the instant you press
-//! send. JS8 lives on a UTC grid, so a transmission waits for the next cycle
-//! boundary; a receiver looking for frames on that grid will not find one that
-//! started whenever the operator happened to finish typing.
+//! The protocols want opposite scheduling, and it is the same asymmetry the
+//! decoder deals with. Olivia and PSK31 are continuous and start the instant
+//! you press send. JS8 lives on a UTC grid, so a transmission waits for the
+//! next cycle boundary; a receiver looking for frames on that grid will not
+//! find one that started whenever the operator happened to finish typing.
 //!
 //! Untested in CI (no audio device here); verified to compile.
 
@@ -22,6 +22,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ragchew::js8::message::{self, IType};
 use ragchew::js8::{modem, submode};
 use ragchew::olivia;
+use ragchew::psk;
 use ragchew::protocol::ModeId;
 
 /// Everything is modulated at the crate's internal rate and resampled up to
@@ -48,11 +49,13 @@ fn unix_now() -> f64 {
 /// A JS8 frame holds only a few characters, one frame goes per cycle, and a
 /// message longer than one frame is therefore a *sequence* of frames a cycle
 /// apart — silence and all, so that what comes back is one buffer that can be
-/// handed to the card and forgotten about. Olivia has no such structure: the
-/// whole message is one continuous transmission however long it is.
+/// handed to the card and forgotten about. Olivia and PSK31 have no such
+/// structure: the whole message is one continuous transmission however long it
+/// is, idle either side of it in PSK31's case.
 pub fn modulate(text: &str, hz: f64, mode: ModeId) -> Vec<f32> {
     match mode {
         ModeId::Olivia(m) => olivia::encode(text, hz, m),
+        ModeId::Psk(m) => psk::encode(text, hz, m),
         ModeId::Js8(m) => {
             let sm = submode::of(m);
             let period = sm.period_s as usize * RATE as usize;

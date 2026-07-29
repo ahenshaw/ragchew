@@ -39,6 +39,9 @@ fn modes() {
         };
         let cps = match m {
             ModeId::Olivia(o) => format!("{:.2}", o.chars_per_sec()),
+            // Varicode is variable-length, so this is an average over English
+            // rather than a rate the mode guarantees.
+            ModeId::Psk(p) => format!("~{:.2}", 1.0 / p.char_secs()),
             ModeId::Js8(_) => "—".to_string(),
         };
         println!("{:<16} {:>9.0} Hz {:>9}  {timing}", m.name(), m.bandwidth_hz(), cps);
@@ -68,6 +71,7 @@ fn encode(args: &[String]) {
             audio
         }
         ModeId::Olivia(m) => olivia::encode(text, hz, m),
+        ModeId::Psk(m) => ragchew::psk::encode(text, hz, m),
     };
 
     wav::write(out, &audio, SAMPLE_RATE).expect("write wav");

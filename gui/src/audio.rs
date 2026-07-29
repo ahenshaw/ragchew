@@ -404,25 +404,28 @@ impl LiveAudio {
 
 /// Spawn the decode threads for `modes` and return the channel they report on.
 ///
-/// The two protocol families need opposite scheduling, so they get a thread
-/// each: JS8 is *cycle-aligned* — its frames start on UTC multiples of the
-/// submode's period, so a decode is triggered the moment each cycle's audio is
-/// complete — while Olivia is *continuous*, with no schedule at all, so it is
-/// re-scanned on a rolling window. Dropping the returned receiver retires both
-/// threads at their next send, which is how a change of modes takes effect.
+/// Scheduling splits the protocols in two, so they get a thread each. JS8 is
+/// *cycle-aligned*: its frames start on UTC multiples of the submode's period,
+/// so a decode is triggered the moment each cycle's audio is complete. Olivia
+/// and PSK31 are *continuous*, with no schedule at all, so they are re-scanned
+/// together on a rolling window — together and not one thread each, because
+/// they contend for the same signals and [`protocol::decode_all`] can only
+/// arbitrate between them if it sees both. Dropping the returned receiver
+/// retires both threads at their next send, which is how a change of modes
+/// takes effect.
 pub fn spawn_decoder(
     buf: Arc<Mutex<AudioBuf>>,
     modes: Vec<ModeId>,
 ) -> Receiver<Vec<protocol::Decode>> {
     let (tx, rx) = channel();
-    let js8: Vec<ModeId> = modes.iter().copied().filter(|m| matches!(m, ModeId::Js8(_))).collect();
-    let olivia: Vec<ModeId> =
-        modes.iter().copied().filter(|m| matches!(m, ModeId::Olivia(_))).collect();
+    let js8: Vec<ModeId> = modes.iter().copied().filter(|m| m.period_s().is_some()).collect();
+    let continuous: Vec<ModeId> =
+        modes.iter().copied().filter(|m| m.period_s().is_none()).collect();
     if !js8.is_empty() {
         spawn_js8(buf.clone(), js8, tx.clone());
     }
-    if !olivia.is_empty() {
-        spawn_olivia(buf, olivia, tx);
+    if !continuous.is_empty() {
+        spawn_continuous(buf, continuous, tx);
     }
     rx
 }
@@ -488,20 +491,25 @@ fn spawn_js8(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<proto
     });
 }
 
-/// Rolling-window Olivia decoding.
+/// Rolling-window decoding for the modes that run continuously.
 ///
-/// Olivia never tells you where a transmission starts, so there is nothing to
-/// align to: the last [`OLIVIA_WINDOW_S`] seconds are simply re-scanned every
-/// [`OLIVIA_STEP_S`]. Windows overlap heavily, both so a block straddling a
-/// boundary is not lost and because the decoder needs several consecutive
-/// blocks in view before it will trust a signal — so the same block gets
-/// decoded repeatedly and duplicates are filtered on the way out.
-fn spawn_olivia(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<protocol::Decode>>) {
+/// Neither Olivia nor PSK31 tells you where a transmission starts, so there is
+/// nothing to align to: the last [`CONTINUOUS_WINDOW_S`] seconds are simply
+/// re-scanned every [`CONTINUOUS_STEP_S`]. Windows overlap heavily, both so a
+/// block straddling a boundary is not lost and because either decoder needs
+/// several consecutive blocks in view before it will trust a signal — so the
+/// same block gets decoded repeatedly and duplicates are filtered on the way
+/// out.
+fn spawn_continuous(
+    buf: Arc<Mutex<AudioBuf>>,
+    modes: Vec<ModeId>,
+    tx: Sender<Vec<protocol::Decode>>,
+) {
     thread::spawn(move || {
         let mut seen: Vec<(ModeId, f64, f64)> = Vec::new(); // (mode, hz, time_s)
-        // Stretches past OLIVIA_STEP_S on a machine — or in a build — that
+        // Stretches past CONTINUOUS_STEP_S on a machine — or in a build — that
         // cannot scan the band in that long. See the back-off below.
-        let mut step = OLIVIA_STEP_S;
+        let mut step = CONTINUOUS_STEP_S;
         loop {
             thread::sleep(Duration::from_secs_f64(step));
             let pass = std::time::Instant::now();
@@ -510,7 +518,7 @@ fn spawn_olivia(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<pr
                 false => continue,
             };
             let (samples, win_start) =
-                slice_around(&buf, now - OLIVIA_WINDOW_S, OLIVIA_WINDOW_S);
+                slice_around(&buf, now - CONTINUOUS_WINDOW_S, CONTINUOUS_WINDOW_S);
             if samples.len() < RATE as usize {
                 continue;
             }
@@ -531,7 +539,7 @@ fn spawn_olivia(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<pr
                     .collect();
 
             seen.extend(fresh.iter().map(|d| (d.mode, d.hz, d.time_s)));
-            let cutoff = win_start - OLIVIA_WINDOW_S;
+            let cutoff = win_start - CONTINUOUS_WINDOW_S;
             seen.retain(|&(_, _, t)| t >= cutoff);
 
             if !fresh.is_empty() && tx.send(fresh).is_err() {
@@ -539,24 +547,28 @@ fn spawn_olivia(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<pr
             }
 
             // Scanning six Olivia modes across the whole band costs 3.5 s in a
-            // release build and forty in a debug one, against a 4 s step. Left
+            // release build and forty in a debug one, against a 4 s step —
+            // PSK31 adds a couple of milliseconds a block to that and is not
+            // what makes this expensive. Left
             // alone the thread runs flat out for ever, and the interface —
             // sharing a CPU and a buffer lock with it — stops answering. The
             // step therefore stretches to whatever the pass actually cost:
             // decoding takes at most half the wall clock, and at 24 s windows
             // there is still overlap to spare.
-            step = OLIVIA_STEP_S.max(pass.elapsed().as_secs_f64());
+            step = CONTINUOUS_STEP_S.max(pass.elapsed().as_secs_f64());
         }
     });
 }
 
-/// Audio window an Olivia pass looks at. It must hold several FEC blocks of the
-/// slowest mode for the decoder to sync at all.
-const OLIVIA_WINDOW_S: f64 = 24.0;
+/// Audio window a continuous-mode pass looks at. It must hold several FEC
+/// blocks of the slowest Olivia mode for that decoder to sync at all, which is
+/// also comfortably several of PSK31's 8.2-second analysis blocks.
+const CONTINUOUS_WINDOW_S: f64 = 24.0;
 
-/// How often an Olivia pass runs. Text appears this long after it is sent, so
-/// shorter is livelier — at the cost of re-scanning the band more often.
-const OLIVIA_STEP_S: f64 = 4.0;
+/// How often a continuous-mode pass runs. Text appears this long after it is
+/// sent, so shorter is livelier — at the cost of re-scanning the band more
+/// often.
+const CONTINUOUS_STEP_S: f64 = 4.0;
 
 /// `secs` seconds of audio starting at UTC time `from`, plus the capture-relative
 /// time of the first sample returned.

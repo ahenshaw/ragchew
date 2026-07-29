@@ -14,6 +14,8 @@ use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 thread_local! {
     static PLANNER: RefCell<FftPlanner<f32>> = RefCell::new(FftPlanner::<f32>::new());
     static PLANS: RefCell<HashMap<usize, Arc<dyn Fft<f32>>>> = RefCell::new(HashMap::new());
+    static INVERSE_PLANS: RefCell<HashMap<usize, Arc<dyn Fft<f32>>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// A cached forward FFT plan of length `n` (per thread).
@@ -23,6 +25,22 @@ pub fn plan(n: usize) -> Arc<dyn Fft<f32>> {
             return p.clone();
         }
         let p = PLANNER.with(|pl| pl.borrow_mut().plan_fft_forward(n));
+        plans.borrow_mut().insert(n, p.clone());
+        p
+    })
+}
+
+/// A cached inverse FFT plan of length `n` (per thread).
+///
+/// Unnormalised, as rustfft leaves it: everything built on this reads ratios,
+/// not absolute levels. The PSK gate uses it to cut a narrow slice out of a
+/// band-wide spectrum and turn it back into a decimated complex baseband.
+pub fn plan_inverse(n: usize) -> Arc<dyn Fft<f32>> {
+    INVERSE_PLANS.with(|plans| {
+        if let Some(p) = plans.borrow().get(&n) {
+            return p.clone();
+        }
+        let p = PLANNER.with(|pl| pl.borrow_mut().plan_fft_inverse(n));
         plans.borrow_mut().insert(n, p.clone());
         p
     })

@@ -12,6 +12,7 @@
 
 use crate::js8;
 use crate::olivia;
+use crate::psk;
 
 /// A protocol family.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -20,6 +21,8 @@ pub enum Protocol {
     Js8,
     /// Olivia MFSK: continuous, Walsh-Hadamard-coded.
     Olivia,
+    /// PSK31: continuous, differential BPSK, uncoded.
+    Psk,
 }
 
 impl Protocol {
@@ -27,6 +30,7 @@ impl Protocol {
         match self {
             Protocol::Js8 => "JS8",
             Protocol::Olivia => "Olivia",
+            Protocol::Psk => "PSK",
         }
     }
 
@@ -35,11 +39,12 @@ impl Protocol {
         match self {
             Protocol::Js8 => js8::submode::ALL.iter().map(|s| ModeId::Js8(s.mode)).collect(),
             Protocol::Olivia => olivia::COMMON.iter().map(|&m| ModeId::Olivia(m)).collect(),
+            Protocol::Psk => psk::COMMON.iter().map(|&m| ModeId::Psk(m)).collect(),
         }
     }
 
     /// All protocols this crate implements.
-    pub const ALL: [Protocol; 2] = [Protocol::Js8, Protocol::Olivia];
+    pub const ALL: [Protocol; 3] = [Protocol::Js8, Protocol::Olivia, Protocol::Psk];
 }
 
 /// A specific mode of a specific protocol — everything needed to name, colour
@@ -48,6 +53,7 @@ impl Protocol {
 pub enum ModeId {
     Js8(js8::Mode),
     Olivia(olivia::Mode),
+    Psk(psk::Mode),
 }
 
 impl ModeId {
@@ -55,6 +61,7 @@ impl ModeId {
         match self {
             ModeId::Js8(_) => Protocol::Js8,
             ModeId::Olivia(_) => Protocol::Olivia,
+            ModeId::Psk(_) => Protocol::Psk,
         }
     }
 
@@ -63,6 +70,7 @@ impl ModeId {
         match self {
             ModeId::Js8(m) => format!("JS8 {}", m.name()),
             ModeId::Olivia(m) => m.name(),
+            ModeId::Psk(m) => m.name(),
         }
     }
 
@@ -71,6 +79,7 @@ impl ModeId {
         match self {
             ModeId::Js8(m) => m.name().to_string(),
             ModeId::Olivia(m) => m.short_name(),
+            ModeId::Psk(m) => m.short_name(),
         }
     }
 
@@ -80,6 +89,7 @@ impl ModeId {
             // 8 tones, so 7 gaps plus a tone's worth of skirt.
             ModeId::Js8(m) => 8.0 * js8::submode::of(m).spacing(),
             ModeId::Olivia(m) => m.bandwidth as f64,
+            ModeId::Psk(m) => m.bandwidth_hz(),
         }
     }
 
@@ -91,6 +101,10 @@ impl ModeId {
         match self {
             ModeId::Js8(m) => js8::submode::of(m).spacing().max(15.0),
             ModeId::Olivia(m) => (m.bandwidth as f64 / 4.0).max(m.spacing()),
+            // A PSK31 carrier is estimated to a couple of Hz and stations pack
+            // in tighter than any other mode here, so the floor is half a
+            // symbol rate rather than the usual 15 Hz.
+            ModeId::Psk(m) => m.baud() / 2.0,
         }
     }
 
@@ -99,7 +113,7 @@ impl ModeId {
     pub fn period_s(self) -> Option<u32> {
         match self {
             ModeId::Js8(m) => Some(js8::submode::of(m).period_s),
-            ModeId::Olivia(_) => None,
+            ModeId::Olivia(_) | ModeId::Psk(_) => None,
         }
     }
 
@@ -109,6 +123,7 @@ impl ModeId {
         match self {
             ModeId::Js8(m) => js8::submode::of(m).frame_secs(),
             ModeId::Olivia(m) => m.block_secs(),
+            ModeId::Psk(m) => m.char_secs(),
         }
     }
 }
@@ -150,17 +165,21 @@ pub fn parse_mode(s: &str) -> Option<ModeId> {
             _ => return None,
         }));
     }
+    if s.starts_with("psk") || s.starts_with("bpsk") {
+        return psk::parse(&s).map(ModeId::Psk);
+    }
     olivia::parse(&s).map(ModeId::Olivia)
 }
 
-/// The modes a band scan tries by default: all four JS8 submodes and the common
-/// Olivia modes.
+/// The modes a band scan tries by default: all four JS8 submodes, and the
+/// common Olivia and PSK modes.
 ///
 /// Scanning costs time per mode, so callers watching a known calling frequency
 /// should pass a shorter list.
 pub fn default_modes() -> Vec<ModeId> {
     let mut v = Protocol::Js8.modes();
     v.extend(Protocol::Olivia.modes());
+    v.extend(Protocol::Psk.modes());
     v
 }
 
@@ -205,8 +224,80 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
         }));
     }
 
+    // PSK modes are scanned together for the same reason.
+    let psk_modes: Vec<psk::Mode> = modes
+        .iter()
+        .filter_map(|m| match m {
+            ModeId::Psk(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    if !psk_modes.is_empty() {
+        let found: Vec<Decode> = psk::decode_all(samples, hz_lo, hz_hi, &psk_modes)
+            .into_iter()
+            .map(|r| Decode {
+                mode: ModeId::Psk(r.mode),
+                hz: r.hz,
+                time_s: r.offset as f64 / crate::SAMPLE_RATE as f64,
+                quality: (r.score / psk::modem::NOISE_FLOOR) as f32,
+                text: r.text,
+            })
+            .collect();
+        out.extend(arbitrate_psk(found, &out));
+    }
+
     out.sort_by(|a, b| a.time_s.partial_cmp(&b.time_s).unwrap());
     out
+}
+
+/// Drop PSK decodes that are really an Olivia signal being read twice.
+///
+/// Every standard Olivia mode runs at 31.25 or 62.5 baud — `bandwidth / tones`
+/// works out that way for all of them, because they descend from the same
+/// 2000/64 as PSK31 does. Most are saved by width: their energy falls outside
+/// the PSK detector's narrow analysis slice and they never trip it. Olivia
+/// 4/125 is not — it shares the symbol rate *and* fits inside the slice, and it
+/// clears both of the PSK gate's stages.
+///
+/// No refinement of the gate settles that honestly, because the one measure
+/// that separates them at equal SNR — how compact the signal's spectrum is —
+/// tracks SNR itself, so a weak PSK31 station reads the same as a strong Olivia
+/// 4/125 one. What settles it is that Olivia can prove itself and PSK31 cannot:
+/// a Walsh correlation above the noise floor is evidence, and an uncoded bit
+/// stream is not. So where the two claim the same signal, PSK31 yields.
+///
+/// Only narrow Olivia modes arbitrate. A wide one must not silence a genuine
+/// PSK31 station sitting inside its bandwidth — stations stacked inside each
+/// other is a thing this monitor is meant to show, not hide.
+fn arbitrate_psk(found: Vec<Decode>, others: &[Decode]) -> Vec<Decode> {
+    /// How far apart in time two decodes may be and still be the same signal.
+    /// An Olivia block and a PSK character land at quite different instants
+    /// within the same transmission.
+    const NEAR_S: f64 = 10.0;
+
+    let olivia: Vec<&Decode> =
+        others.iter().filter(|d| d.mode.protocol() == Protocol::Olivia).collect();
+    if olivia.is_empty() {
+        return found;
+    }
+    found
+        .into_iter()
+        .filter(|p| {
+            // Only an Olivia mode narrow enough to sit inside the PSK
+            // detector's own analysis slice can be mistaken for PSK at all, and
+            // that width scales with the mode: PSK31 looks through 125 Hz,
+            // PSK63 through 250.
+            let slice = match p.mode {
+                ModeId::Psk(m) => m.slice_hz(),
+                _ => return true,
+            };
+            !olivia.iter().any(|o| {
+                o.mode.bandwidth_hz() <= slice
+                    && (o.hz - p.hz).abs() < o.mode.bandwidth_hz() / 2.0
+                    && (o.time_s - p.time_s).abs() < NEAR_S
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

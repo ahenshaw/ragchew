@@ -4,8 +4,9 @@
 //! builds the Olivia weak-signal band behind `--weak`, where the whole point is
 //! how far under the noise a signal can be and still be read.
 //!
-//! Eleven stations: all four JS8 submodes on their own cycles, plus three
-//! Olivia stations rag-chewing continuously across the same band, under a little
+//! Twelve stations across all three protocols: all four JS8 submodes on their
+//! own cycles, three Olivia stations rag-chewing continuously, and a PSK31
+//! station calling CQ over and over the way a real one does — under a little
 //! noise, inside the 300–2600 Hz the app scans.
 //!
 //! Carriers are spaced so no two occupied bandwidths collide — Olivia is wide,
@@ -15,6 +16,20 @@
 //! not much of a monitor. It also makes the point that the two protocols are
 //! tracked independently: they share a patch of spectrum without sharing a row
 //! of text.
+//!
+//! The PSK31 station is in the clear, at 620 Hz, in a 62 Hz gap between the JS8
+//! stations that nothing else here is narrow enough to use. That is a choice,
+//! not an oversight: it was also tried at 2150 Hz, inside the Olivia 16/500
+//! signal, where it copies five of its seven calls intact and costs the Olivia
+//! station nothing. Move it there — one line below — for a band where three
+//! protocols share one patch of spectrum.
+//!
+//! What kept it in the clear is that the two damaged calls are damaged by real
+//! QRM, and PSK31 is the one mode here with no error correction to absorb it.
+//! A demo that shows the new mode dropping characters in the one place a reader
+//! cannot tell interference from a broken decoder is a poor first impression,
+//! and the band already carries a deliberate collision to make the co-channel
+//! point.
 //!
 //! They do interfere, and asymmetrically. The JS8 frames come through intact —
 //! Olivia spreads its power over sixteen tones, so only one or two ever land in
@@ -27,6 +42,7 @@ use ragchew::js8::message::{self, IType};
 use ragchew::js8::modem;
 use ragchew::js8::submode::{self, Submode};
 use ragchew::olivia::{self, Mode as Olivia};
+use ragchew::psk::{self, PSK31};
 use ragchew::SAMPLE_RATE;
 
 /// (carrier Hz, submode, per-cycle frame texts). Each station keeps its carrier
@@ -54,6 +70,27 @@ pub const OLIVIA_STATIONS: &[(f64, Olivia, f64, &str)] = &[
     (1330.0, olivia::OL_4_125, 3.0, "DE VE7OLV QRP 5W "),
     (2000.0, olivia::OL_16_500, 6.0, "GM OM UR RST 579 IN EM73 BTU "),
 ];
+
+/// (carrier Hz, start time in seconds, the call, times it is repeated).
+///
+/// PSK31 is continuous like Olivia, but a station has to be on the air for most
+/// of one 8.2-second analysis block before the detector will believe it, and
+/// one CQ call is shorter than that. So a station repeats — which is what
+/// calling CQ *is*, and what makes this the easiest kind of PSK31 signal to
+/// find as well as the most common.
+///
+/// Lower case on purpose: varicode gives its shortest codes to lower-case
+/// letters, and PSK31 operators type accordingly.
+pub const PSK_STATIONS: &[(f64, f64, &str, usize)] = &[
+    // In the clear, in the gap between two JS8 stations. Change to 2150.0 to
+    // put it inside the Olivia 16/500 signal instead — see the module docs.
+    (620.0, 0.2, "cq cq de kb9psk kb9psk pse k  ", 7),
+];
+
+/// What a PSK31 station puts on the air: its call, repeated.
+pub fn psk_text(call: &str, repeats: usize) -> String {
+    call.repeat(repeats)
+}
 
 /// Bandwidth (Hz) the SNR figures below are quoted in — the convention amateur
 /// weak-signal work uses, so the numbers mean what a ham expects them to.
@@ -214,6 +251,13 @@ pub fn synth() -> Vec<f32> {
         mix(&mut buf, (start_s * rate as f64) as usize, &audio, 0.35);
     }
 
+    for (hz, start_s, call, repeats) in PSK_STATIONS {
+        // Narrower than anything else here, so it needs less amplitude to be
+        // just as readable.
+        let audio = psk::encode(&psk_text(call, *repeats), *hz, PSK31);
+        mix(&mut buf, (start_s * rate as f64) as usize, &audio, 0.3);
+    }
+
     // light deterministic noise
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     for s in buf.iter_mut() {
@@ -244,12 +288,23 @@ mod tests {
             let bw = m.bandwidth as f64;
             bands.push((hz - bw / 2.0, hz + bw / 2.0, format!("{} @ {hz}", m.name())));
         }
+        for (hz, _, _, _) in PSK_STATIONS {
+            let bw = PSK31.bandwidth_hz();
+            bands.push((hz - bw / 2.0, hz + bw / 2.0, format!("PSK31 @ {hz}")));
+        }
         bands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
+        // Every pair, not just neighbouring ones. A narrow station sitting
+        // inside a wide one is not adjacent to it in this list — the PSK31
+        // station is separated from its Olivia host by the JS8 station — and
+        // comparing neighbours alone would quietly stop noticing exactly the
+        // kind of overlap this band is built to contain.
         let collisions: Vec<String> = bands
-            .windows(2)
-            .filter(|w| w[0].1 > w[1].0)
-            .map(|w| format!("{} / {}", w[0].2, w[1].2))
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| bands[i + 1..].iter().map(move |b| (a, b)))
+            .filter(|(a, b)| a.1 > b.0 && b.1 > a.0)
+            .map(|(a, b)| format!("{} / {}", a.2, b.2))
             .collect();
         assert_eq!(
             collisions,

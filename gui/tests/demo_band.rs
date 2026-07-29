@@ -1,10 +1,11 @@
 //! The demo band, decoded end to end.
 //!
 //! This is the closest thing to an integration test the project has: synthesize
-//! eleven stations across two protocols, scan the band with every mode enabled,
-//! and check that each station comes back on its own channel. It exercises the
-//! whole chain — both modems, the protocol dispatcher, mode auto-detection and
-//! the channel tracker — against a signal nobody hand-tuned it for.
+//! twelve stations across three protocols, scan the band with every mode
+//! enabled, and check that each station comes back on its own channel. It
+//! exercises the whole chain — all three modems, the protocol dispatcher, mode
+//! auto-detection and the channel tracker — against a signal nobody hand-tuned
+//! it for.
 //!
 //! It takes about fifteen seconds in release mode, so run the suite with
 //! `--release`.
@@ -34,7 +35,8 @@ fn text_near(set: &ChannelSet, hz: f64, p: Protocol) -> String {
 #[test]
 fn every_station_is_decoded() {
     let set = channels();
-    let n = demo::JS8_STATIONS.len() + demo::OLIVIA_STATIONS.len();
+    let n =
+        demo::JS8_STATIONS.len() + demo::OLIVIA_STATIONS.len() + demo::PSK_STATIONS.len();
     assert_eq!(set.channels().len(), n, "expected {n} channels");
 
     for (hz, sm, msgs) in demo::JS8_STATIONS {
@@ -47,6 +49,22 @@ fn every_station_is_decoded() {
             .find(|c| c.text == want)
             .expect("channel exists");
         assert_eq!(ch.mode.short_name(), sm.mode.name(), "wrong submode detected at {hz} Hz");
+    }
+
+    // The PSK31 station is checked for its calls rather than for exact
+    // equality. It is the only mode here with no error correction and no frame
+    // to synchronise on: the detector needs a station on the air for most of an
+    // 8.2-second block before it will believe it, so the opening of a
+    // transmission is missed — which is also what happens when you tune across
+    // a real one. What has to come back is the call, cleanly and repeatedly.
+    for (hz, _, call, repeats) in demo::PSK_STATIONS {
+        let got = text_near(&set, *hz, Protocol::Psk);
+        assert!(got.contains(call.trim_end()), "PSK31 at {hz} Hz decoded {got:?}");
+        let copies = got.matches(call.trim_end()).count();
+        assert!(
+            copies >= repeats - 2,
+            "PSK31 at {hz} Hz copied its call {copies} times of {repeats}: {got:?}"
+        );
     }
 
     // Olivia stations in the clear are copied exactly; the one deliberately
