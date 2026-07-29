@@ -18,10 +18,14 @@
 //! would print, and a wrong code there is worse than a missing one. Text handed
 //! to [`encode`] that is outside the range is skipped.
 //!
-//! The table below has been checked for internal consistency — the two
-//! structural rules above, plus uniqueness — but **not** against a reference
-//! implementation, which the Olivia FEC layer in this crate was. Cross-check it
-//! against fldigi's `psk_varicode.cxx` before trusting a decode on the air.
+//! The table below is checked digit for digit against fldigi's
+//! `pskvaricode.cxx` by `tests/psk_reference.rs`, as well as for internal
+//! consistency — the two structural rules above, plus uniqueness. The reference
+//! check is the one that matters: varicode is 256 hand-assigned codes rather
+//! than an algorithm, and since the mode carries no FEC and no CRC, a single
+//! transcribed digit would decode as a plausible *wrong* character with nothing
+//! downstream to notice. The structural tests cannot see that — they pass
+//! happily on a table with a corrupted code in it.
 
 /// (character, code) pairs, in ASCII order. Codes are written MSB first.
 pub const VARICODE: &[(char, &str)] = &[

@@ -255,8 +255,8 @@ number of modes enabled, which is what the GUI's mode menus are really for.
 
 ## Validation
 
-Both protocols are checked bit-for-bit against independent implementations —
-see `tools/ref`.
+All three protocols are checked bit-for-bit against independent implementations
+— see `tools/ref`.
 
 **JS8**, against Robert Morris (AB1HL)'s
 [`fate`](https://github.com/rtmrtmrtmrtm/fate):
@@ -287,6 +287,22 @@ fldigi uses):
   8-minute QSO recording, `ragchew` recovers 94% of the word-forming text the
   reference does while emitting 21% fewer characters overall — it declines to
   guess where the reference prints whatever the correlation happened to say.
+
+**PSK**, against fldigi's varicode table:
+
+- `tests/psk_reference.rs` — all 95 printable codes are digit-for-digit
+  fldigi's, in both directions, and the 161 this crate leaves out are confirmed
+  not to alias onto ones it prints. Varicode is a hand-assigned table rather
+  than an algorithm, and the mode has no FEC or CRC, so a single mistyped digit
+  would be a plausible wrong character for ever with nothing downstream to
+  catch it — and the structural tests do not catch it either.
+- `tests/psk.rs` — both modes round-trip, PSK31 and PSK63 do not invent each
+  other, one station stays one carrier, and — the property the three-stage gate
+  exists to protect — **nothing invented** from noise, nor from a band
+  containing only JS8 and Olivia.
+- `examples/psk_gate.rs` — the sensitivity and false-alarm harness the gate's
+  thresholds were measured on, running on the shipping code rather than a copy
+  of it. 0 of 55,320 noise candidates clear the first two stages.
 
 ```
 cargo test --release
