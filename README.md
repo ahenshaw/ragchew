@@ -310,5 +310,8 @@ cargo test --release
 
 ## License
 
-GPL-3.0-or-later. JS8/JS8Call, fldigi and both reference implementations are
-GPL; the embedded `src/js8/jsc_words.txt` word list originates from JS8Call.
+GPL-3.0-or-later. JS8/JS8Call and fldigi are GPL, as is Pawel Jalocha's MFSK
+reference vendored in `tools/ref/olivia/jalocha/`; the embedded
+`src/js8/jsc_words.txt` word list originates from JS8Call. The JS8 reference in
+`tools/ref/js8/` is Robert Morris's `fate`, which is **MIT** — its licence text
+travels with it as `LICENSE.fate`, as MIT requires.

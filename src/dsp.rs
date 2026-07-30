@@ -151,6 +151,16 @@ pub struct Snr {
 /// tenths on a bare carrier, where the band is mostly noise. Both figures are
 /// bias; a single reading scatters by more.
 ///
+/// Those figures are against a clean noise floor. What this reports is the
+/// signal against the floor *beside it, while it is transmitting*, which on a
+/// strong signal is not the same as the band's quiet-time floor: on
+/// `tests/vectors/john_3_16.wav` a frame measures +30.4 dB here against
+/// +36.7 dB taken from a silent second of the same recording, the difference
+/// being the receiver's own images and leakage lifting the neighbourhood while
+/// the transmission is on. Reading it conservatively is the intended
+/// behaviour — what limits copy is the floor a signal actually competes with —
+/// but it is a floor, not a vacuum.
+///
 /// `None` if there is too little audio to transform, or if the band asked for
 /// falls outside what the sample rate carries.
 pub fn snr_db(
