@@ -1338,11 +1338,24 @@ impl App {
             field(ui, "Grid", &mut q.grid);
             ui.label("RST");
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut q.rst_sent).desired_width(44.0))
-                    .on_hover_text("sent");
+                let sent = ui
+                    .add(egui::TextEdit::singleline(&mut q.rst_sent).desired_width(44.0))
+                    .on_hover_text(if q.rst_sent_auto {
+                        "sent — kept at the measured SNR while a JS8 station is being \
+                         copied; type here and it is yours from then on"
+                    } else {
+                        "sent"
+                    });
+                // Typing hands the field over for good: the log has to record
+                // what the operator chose to send, not what was measured after
+                // they chose it.
+                if sent.changed() {
+                    q.rst_sent_auto = false;
+                }
                 ui.label("/");
                 ui.add(egui::TextEdit::singleline(&mut q.rst_rcvd).desired_width(44.0))
-                    .on_hover_text("received");
+                    .on_hover_text("received — what the other station gave you, so nothing \
+                                    here is filled in for you");
             });
             ui.end_row();
 

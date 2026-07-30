@@ -50,6 +50,29 @@ pub struct Entry {
     pub text: String,
 }
 
+/// The signal report this mode's exchange is made of, for a station measured
+/// at `snr_db` — or `None` where a measurement does not determine one.
+///
+/// JS8 exchanges the SNR itself, in whole dB with a sign, and that is precisely
+/// what [`ragchew::protocol::Decode::snr_db`] measures. Filling it in is
+/// transcription, not invention, which is the whole test for whether this
+/// should happen at all.
+///
+/// The keyboard modes get nothing, on purpose. RST and RSQ are not determined
+/// by an SNR: readability and tone quality are separate judgements, and the
+/// strength digit is conventionally read off a meter rather than off the audio.
+/// An operator sending a courtesy 599 is making a choice, and a log has to
+/// record the choice they made rather than a number this crate invented for
+/// them. The measured figure is on the panel beside the field for them to use
+/// as they see fit.
+pub fn suggested_report(mode: ModeId, snr_db: f32) -> Option<String> {
+    match mode {
+        // Two digits and a sign, as JS8Call and WSJT-X write it: "-05", "+13".
+        ModeId::Js8(_) => Some(format!("{:+03}", snr_db.round() as i32)),
+        ModeId::Olivia(_) | ModeId::Psk(_) => None,
+    }
+}
+
 /// The part of a received entry whose last word is certainly finished.
 ///
 /// A continuous mode arrives a character at a time, so the token on the end of
@@ -120,6 +143,13 @@ pub struct Qso {
     pub grid: String,
     pub rst_sent: String,
     pub rst_rcvd: String,
+    /// Whether `rst_sent` is still this crate's to keep current.
+    ///
+    /// Set false the moment the operator types in the field, and never set back
+    /// — what goes in the log has to be what they chose to send. Until then the
+    /// report tracks the station, so a QSO opened on a fade and answered ten
+    /// minutes later reports what was last copied rather than what was first.
+    pub rst_sent_auto: bool,
     /// Channel being followed, if this QSO was opened from one.
     pub channel: Option<u64>,
     /// Carrier and mode: taken from the bound channel as it drifts, or set by
@@ -231,6 +261,14 @@ impl Qso {
         self.quality = ch.quality;
         self.snr_db = ch.snr_db;
         self.best_snr_db = ch.best_snr_db;
+        // The report follows the most recent decode rather than the best one:
+        // what you send is what you just copied, which is also what WSJT-X and
+        // JS8Call report.
+        if self.rst_sent_auto {
+            if let Some(report) = ch.snr_db.and_then(|db| suggested_report(ch.mode, db)) {
+                self.rst_sent = report;
+            }
+        }
 
         // `absorbed` counts from the start of the conversation rather than
         // from the start of what the channel still holds, so trimming the front
@@ -348,6 +386,7 @@ impl QsoSet {
         let id = self.next_id;
         self.next_id += 1;
         let mut q = Qso {
+            rst_sent_auto: true,
             id,
             call: String::new(),
             name: String::new(),
@@ -389,6 +428,7 @@ impl QsoSet {
         let id = self.next_id;
         self.next_id += 1;
         self.qsos.push(Qso {
+            rst_sent_auto: true,
             id,
             call: String::new(),
             name: String::new(),
@@ -570,6 +610,101 @@ mod tests {
             t += step;
         }
         t
+    }
+
+
+    /// A JS8 report is transcription: the exchange *is* the SNR, so the field
+    /// is filled from the measurement and follows the station while it is
+    /// still ours.
+    #[test]
+    fn a_js8_report_is_filled_from_the_measurement() {
+        let decode = |t: f64, snr: f32| Decode {
+            snr_db: Some(snr),
+            mode: ModeId::Js8(js8::Mode::Normal),
+            hz: 1000.0,
+            time_s: t,
+            quality: 4.0,
+            text: "DE K2N ".to_string(),
+        };
+        let mut set = ChannelSet::from_decodes([decode(0.0, -12.4)], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        assert_eq!(qsos.qsos()[0].rst_sent, "-12", "not filled from the first decode");
+
+        // The station comes up; what we would send comes up with it, because a
+        // report is of the transmission you are answering.
+        set.add(decode(15.0, 6.5));
+        qsos.absorb(&set);
+        assert_eq!(qsos.qsos()[0].rst_sent, "+07");
+        assert_eq!(qsos.qsos()[0].snr_db, Some(6.5));
+    }
+
+    /// Once the operator types, the field is theirs for good — a log records
+    /// what was sent, not what was measured after the fact.
+    #[test]
+    fn typing_a_report_stops_it_being_overwritten() {
+        let decode = |t: f64, snr: f32| Decode {
+            snr_db: Some(snr),
+            mode: ModeId::Js8(js8::Mode::Normal),
+            hz: 1000.0,
+            time_s: t,
+            quality: 4.0,
+            text: "DE K2N ".to_string(),
+        };
+        let mut set = ChannelSet::from_decodes([decode(0.0, -12.0)], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+
+        // What the panel does when the field is edited.
+        qsos.qsos_mut()[0].rst_sent = "599".to_string();
+        qsos.qsos_mut()[0].rst_sent_auto = false;
+
+        set.add(decode(15.0, 9.0));
+        qsos.absorb(&set);
+        assert_eq!(qsos.qsos()[0].rst_sent, "599", "the operator's report was overwritten");
+        // The measurement itself still tracks; it is only the report that is
+        // handed over.
+        assert_eq!(qsos.qsos()[0].snr_db, Some(9.0));
+    }
+
+    /// The keyboard modes are left alone: RST and RSQ are judgements, and an
+    /// SNR does not determine them.
+    #[test]
+    fn a_keyboard_mode_report_is_left_to_the_operator() {
+        for mode in [ModeId::Psk(ragchew::psk::PSK31), ModeId::Olivia(olivia::OL_8_250)] {
+            assert_eq!(suggested_report(mode, 3.0), None, "{} was given a report", mode.name());
+
+            let set = ChannelSet::from_decodes(
+                [Decode {
+                    snr_db: Some(3.0),
+                    mode,
+                    hz: 1000.0,
+                    time_s: 0.0,
+                    quality: 4.0,
+                    text: "cq de w1aw ".to_string(),
+                }],
+                15.0,
+            );
+            let mut qsos = QsoSet::new();
+            qsos.open_for_channel(&set.channels()[0], 0.0);
+            assert!(
+                qsos.qsos()[0].rst_sent.is_empty(),
+                "{} filled in a report: {:?}",
+                mode.name(),
+                qsos.qsos()[0].rst_sent
+            );
+        }
+    }
+
+    /// The wire format JS8Call and WSJT-X use: a sign and two digits.
+    #[test]
+    fn a_report_is_written_the_way_the_mode_writes_it() {
+        let js8 = ModeId::Js8(js8::Mode::Normal);
+        for (snr, want) in
+            [(-12.4f32, "-12"), (-12.6, "-13"), (0.4, "+00"), (6.5, "+07"), (-5.0, "-05")]
+        {
+            assert_eq!(suggested_report(js8, snr).as_deref(), Some(want), "for {snr} dB");
+        }
     }
 
     /// The calls in this repository's own demo band, which are the ones any

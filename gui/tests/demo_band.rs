@@ -297,3 +297,47 @@ fn the_reported_snr_matches_the_band_it_was_built_with() {
         }
     }
 }
+
+/// Opening a QSO on a JS8 station fills the report it would send.
+///
+/// The unit tests in `qso.rs` place the SNR by hand, so they cannot tell
+/// whether a real decode carries one at all. This runs the actual scan over a
+/// demo JS8 station and checks the field arrives filled, in the form JS8Call
+/// writes it, agreeing with the measurement it came from.
+#[test]
+fn a_js8_qso_offers_the_report_it_measured() {
+    use ragchew::protocol::ModeId;
+    use ragchew_gui::qso::{suggested_report, QsoSet};
+
+    let (hz, sm, _) = demo::JS8_STATIONS[1]; // 700 Hz, Normal
+    let mode = ModeId::Js8(sm.mode);
+    let decodes = protocol::decode_all(&demo::synth(), hz - 100.0, hz + 100.0, &[mode]);
+    assert!(!decodes.is_empty(), "the station did not decode");
+
+    let mut set = ChannelSet::new(15.0);
+    let mut qsos = QsoSet::new();
+    for d in decodes {
+        set.add(d);
+        if qsos.qsos().is_empty() {
+            qsos.open_for_channel(&set.channels()[0], 0.0);
+        }
+        qsos.absorb(&set);
+    }
+
+    let q = &qsos.qsos()[0];
+    let snr = q.snr_db.expect("a real JS8 decode carries a measurement");
+    assert_eq!(
+        q.rst_sent,
+        suggested_report(mode, snr).expect("JS8 has a report"),
+        "the field does not match the {snr:+.1} dB it was measured at"
+    );
+    assert!(q.rst_sent_auto, "nothing edited it, so it is still ours to keep current");
+    // The demo band is built well above its noise, so a sane report and not,
+    // say, a "-99" out of an unmeasured decode.
+    assert!(
+        q.rst_sent.starts_with('+') || q.rst_sent.starts_with('-'),
+        "malformed report {:?}",
+        q.rst_sent
+    );
+    assert!((-40.0..40.0).contains(&snr), "implausible {snr} dB off the demo band");
+}
