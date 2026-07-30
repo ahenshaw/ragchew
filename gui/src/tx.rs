@@ -348,23 +348,55 @@ mod tests {
 
     /// A second transmission goes behind the first, on a boundary — not half a
     /// cycle into it, and not before the card has finished the burst it has.
+    ///
+    /// The deadlines here are placed against a *known* boundary rather than
+    /// against the wall clock. Timing this test relative to `now` made its
+    /// answer depend on where the machine happened to be in the 15 s cycle when
+    /// it ran, and it failed 2.67% of the time — which is 0.4/15, the
+    /// [`CYCLE_MARGIN_S`] window in which the schedule deliberately gives up on
+    /// the coming boundary and takes the one after. The bound below allows for
+    /// that skip, which the earlier `<= one cycle` did not.
     #[test]
     fn a_queued_transmission_waits_for_the_one_before_it() {
-        let js8 = ModeId::Js8(js8::Mode::Normal); // 15 s cycles
-        let now = unix_now();
-        let busy_until = now + 20.0;
+        let js8 = ModeId::Js8(js8::Mode::Normal);
+        let p = js8.period_s().expect("JS8 is cycle-aligned") as f64;
+        assert_eq!(p, 15.0, "these cases are written around a 15 s cycle");
+        // A boundary comfortably in the future, so `unix_now()` inside
+        // `next_start_after` never becomes the binding constraint.
+        let base = (unix_now() / p).ceil() * p + 10.0 * p;
+
+        // Mid-burst: the next boundary, and no further.
+        let busy_until = base + 7.0;
         let at = next_start_after(js8, busy_until);
         assert!(at >= busy_until, "queued on top of a burst still going out");
+        assert!((at % p).abs() < 1e-6, "{at} is not on a {p} s boundary");
         assert!(
-            (at % 15.0).abs() < 1e-6,
-            "{at} is not on a 15 s boundary"
+            (at - (base + p)).abs() < 1e-6,
+            "waited {} s when the next boundary was {} s away",
+            at - busy_until,
+            base + p - busy_until
         );
-        assert!(at - busy_until <= 15.0, "waited longer than one cycle");
+
+        // Ending just too close to a boundary to make it: that cycle is given
+        // up and the next one taken, so the wait exceeds a full cycle.
+        let busy_until = base + p - CYCLE_MARGIN_S / 2.0;
+        let at = next_start_after(js8, busy_until);
+        assert!(
+            (at - (base + 2.0 * p)).abs() < 1e-6,
+            "a boundary {} s away should have been skipped as unmakeable",
+            base + p - busy_until
+        );
+        assert!(
+            at - busy_until <= p + CYCLE_MARGIN_S,
+            "waited {} s, longer than a cycle plus the margin",
+            at - busy_until
+        );
 
         // A free-running mode simply follows on.
         let olivia = ModeId::Olivia(olivia::OL_8_250);
-        assert!((next_start_after(olivia, busy_until) - busy_until).abs() < 1e-6);
+        assert!((next_start_after(olivia, base + 7.0) - (base + 7.0)).abs() < 1e-6);
         // and a past deadline never schedules in the past
+        let now = unix_now();
         assert!(next_start_after(olivia, 0.0) >= now);
     }
 }
