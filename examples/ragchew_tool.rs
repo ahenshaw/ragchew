@@ -98,8 +98,15 @@ fn decode(args: &[String]) {
         println!("(nothing decoded in {hz_lo:.0}–{hz_hi:.0} Hz)");
     }
     for d in results {
+        // Two numbers on purpose: `snr` is a measurement of the signal and
+        // reads the same whatever carried it; `q` is the decoder's confidence
+        // against its own mode's threshold and only compares within a protocol.
+        let snr = match d.snr_db {
+            Some(db) => format!("{db:+6.1}"),
+            None => "     —".to_string(),
+        };
         println!(
-            "{:7.1} Hz  t={:7.2}s  {:>14}  q={:5.1}  {:?}",
+            "{:7.1} Hz  t={:7.2}s  {:>14}  {snr} dB  q={:5.1}  {:?}",
             d.hz,
             d.time_s,
             d.mode.name(),

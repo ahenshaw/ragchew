@@ -73,6 +73,20 @@ pub struct Channel {
     /// Best confidence seen on this channel, which is a fairer summary than the
     /// last one when a station is fading in and out.
     pub best_quality: f32,
+    /// Signal-to-noise of the most recent decode, in dB against
+    /// [`ragchew::dsp::SNR_REF_BW_HZ`] — see [`ragchew::protocol::Decode::snr_db`].
+    ///
+    /// Kept apart from `quality` because they answer different questions.
+    /// `quality` is how sure the decoder is and is comparable only against its
+    /// own protocol's threshold; this is how loud the station is, and means the
+    /// same thing on every row of the band.
+    ///
+    /// `None` until a decode arrives that could be measured.
+    pub snr_db: Option<f32>,
+    /// Best SNR seen on this channel, for the same reason `best_quality` is
+    /// kept: a station fading in and out is better summarised by its peak than
+    /// by wherever it happened to be on the last block.
+    pub best_snr_db: Option<f32>,
     /// Number of decodes accumulated.
     pub chunks: usize,
 }
@@ -191,6 +205,10 @@ impl ChannelSet {
                 ch.last_heard_s = d.time_s;
                 ch.quality = d.quality;
                 ch.best_quality = ch.best_quality.max(d.quality);
+                if let Some(snr) = d.snr_db {
+                    ch.snr_db = Some(snr);
+                    ch.best_snr_db = Some(ch.best_snr_db.map_or(snr, |b: f32| b.max(snr)));
+                }
                 ch.chunks += 1;
             }
             None => {
@@ -209,6 +227,8 @@ impl ChannelSet {
                     first_heard_s: d.time_s,
                     quality: d.quality,
                     best_quality: d.quality,
+                    snr_db: d.snr_db,
+                    best_snr_db: d.snr_db,
                     chunks: 1,
                     breaks: Vec::new(),
                 });
@@ -250,6 +270,7 @@ mod tests {
 
     fn d(hz: f64, t: f64, s: &str) -> Decode {
         Decode {
+            snr_db: None,
             hz,
             time_s: t,
             text: s.to_string(),
@@ -263,6 +284,7 @@ mod tests {
     #[test]
     fn tracks_quality_and_drift() {
         let q = |hz: f64, t: f64, quality: f32| Decode {
+            snr_db: None,
             hz,
             time_s: t,
             text: "x".to_string(),
@@ -305,6 +327,7 @@ mod tests {
     #[test]
     fn protocols_never_share_a_channel() {
         let ol = Decode {
+            snr_db: None,
             hz: 1000.0,
             time_s: 0.0,
             text: "OL".to_string(),
@@ -320,6 +343,7 @@ mod tests {
     #[test]
     fn olivia_blocks_accumulate_into_one_channel() {
         let block = |hz: f64, t: f64, s: &str| Decode {
+            snr_db: None,
             hz,
             time_s: t,
             text: s.to_string(),
@@ -344,6 +368,7 @@ mod tests {
         let n = 4000;
         for i in 0..n {
             set.add(Decode {
+                snr_db: None,
                 hz: 1000.0,
                 time_s: i as f64,
                 text: chunk.to_string(),
@@ -371,6 +396,7 @@ mod tests {
         let mut set = ChannelSet::new(15.0);
         for i in 0..(MAX_HISTORY * 3) {
             set.add(Decode {
+                snr_db: None,
                 // creeping up 0.01 Hz a decode, well inside the tolerance
                 hz: 1000.0 + i as f64 * 0.01,
                 time_s: i as f64,
@@ -394,6 +420,7 @@ mod tests {
     fn one_outsized_decode_does_not_break_the_bound() {
         let mut set = ChannelSet::new(15.0);
         set.add(Decode {
+            snr_db: None,
             hz: 1000.0,
             time_s: 0.0,
             text: "y".repeat(MAX_TEXT_CHARS * 2),
@@ -410,6 +437,7 @@ mod tests {
     #[test]
     fn a_pause_in_a_continuous_mode_is_marked() {
         let psk = |t: f64, c: char| Decode {
+            snr_db: None,
             hz: 620.0,
             time_s: t,
             text: c.to_string(),
@@ -457,6 +485,7 @@ mod tests {
     #[test]
     fn breaks_are_trimmed_with_the_text() {
         let olivia = |t: f64, s: &str| Decode {
+            snr_db: None,
             hz: 1000.0,
             time_s: t,
             text: s.to_string(),

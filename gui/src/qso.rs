@@ -130,6 +130,12 @@ pub struct Qso {
     /// confidence of the last decode in multiples of the noise floor.
     pub drift_hz: f64,
     pub quality: f32,
+    /// Live from the bound channel: how loud the station is, in dB against
+    /// [`ragchew::dsp::SNR_REF_BW_HZ`], and the best it has been. Unlike
+    /// `quality` this is a measurement and means the same thing in every mode,
+    /// which is what makes it worth offering as a signal report.
+    pub snr_db: Option<f32>,
+    pub best_snr_db: Option<f32>,
     /// Audio-clock time the station was first heard (or the tab was opened, for
     /// a blank one), and when it was last heard from.
     pub started_s: f64,
@@ -223,6 +229,8 @@ impl Qso {
         self.mode = ch.mode;
         self.drift_hz = ch.drift_hz();
         self.quality = ch.quality;
+        self.snr_db = ch.snr_db;
+        self.best_snr_db = ch.best_snr_db;
 
         // `absorbed` counts from the start of the conversation rather than
         // from the start of what the channel still holds, so trimming the front
@@ -352,6 +360,8 @@ impl QsoSet {
             mode: ch.mode,
             drift_hz: ch.drift_hz(),
             quality: ch.quality,
+            snr_db: ch.snr_db,
+            best_snr_db: ch.best_snr_db,
             started_s: ch.first_heard_s,
             last_s: ch.last_heard_s,
             started_utc: backdated(now_s - ch.first_heard_s),
@@ -391,6 +401,8 @@ impl QsoSet {
             mode,
             drift_hz: 0.0,
             quality: 0.0,
+            snr_db: None,
+            best_snr_db: None,
             started_s: now_s,
             last_s: now_s,
             started_utc: SystemTime::now(),
@@ -525,6 +537,7 @@ mod tests {
 
     fn js8_decode(hz: f64, t: f64, text: &str) -> Decode {
         Decode {
+            snr_db: None,
             mode: ModeId::Js8(js8::Mode::Normal),
             hz,
             time_s: t,
@@ -536,6 +549,7 @@ mod tests {
     /// One character, which is all a PSK decode ever is.
     fn psk_decode(hz: f64, t: f64, ch: char) -> Decode {
         Decode {
+            snr_db: None,
             mode: ModeId::Psk(ragchew::psk::PSK31),
             hz,
             time_s: t,
@@ -740,6 +754,7 @@ mod tests {
     #[test]
     fn olivia_blocks_join_but_a_real_pause_does_not() {
         let block = |t: f64, text: &str| Decode {
+            snr_db: None,
             mode: ModeId::Olivia(olivia::OL_8_250),
             hz: 1000.0,
             time_s: t,

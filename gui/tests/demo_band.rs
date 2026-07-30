@@ -227,3 +227,73 @@ fn a_psk_over_reaches_the_log_as_one_entry() {
     assert!(copies >= repeats - 2, "logged {copies} copies of the call: {:?}", q.log[0].text);
     assert_eq!(q.call, "KB9PSK", "the call was never read out of the over");
 }
+
+/// The reported SNR is the SNR the station was built with — as closely as a
+/// band this crowded allows.
+///
+/// The weak-signal band declares each station's level in dB against the noise
+/// in 2.5 kHz and scales it to exactly that, so it is its own ground truth.
+/// This is where the whole chain meets it: synthesis, the band scan,
+/// `Decode::snr_db`, and the per-mode measurement bandwidth behind it.
+/// `examples/snr.rs` measures the estimator far more finely, on one station at
+/// a time; what this adds is five of them inside each other's skirts.
+///
+/// Two errors are intrinsic to measuring a signal by integrating a band, and
+/// this asserts them rather than papering over them:
+///
+/// - A station with a **narrower one inside its bandwidth** reads high, because
+///   the guest's power is inside the host's band and no amount of arithmetic
+///   can separate them. 32/1000 hosts 8/250 and 16/500 hosts 4/125.
+/// - A station whose **guard region is mostly other stations** reads low,
+///   because the noise floor is read off that region. Lowering the quantile
+///   buys tolerance of it — 8/500, with four neighbours in its skirts, gained
+///   0.55 dB from that — but not immunity.
+#[test]
+fn the_reported_snr_matches_the_band_it_was_built_with() {
+    use ragchew::protocol::ModeId;
+    use ragchew_gui::demo::WEAK_STATIONS;
+
+    let samples = demo::synth_weak();
+    let modes: Vec<ModeId> = WEAK_STATIONS.iter().map(|st| ModeId::Olivia(st.mode)).collect();
+    let out = protocol::decode_all(&samples, 300.0, 2600.0, &modes);
+
+    for st in WEAK_STATIONS {
+        let mode = ModeId::Olivia(st.mode);
+        let reported: Vec<f32> = out
+            .iter()
+            .filter(|d| d.mode == mode && (d.hz - st.hz).abs() < st.mode.spacing() * 2.0)
+            .filter_map(|d| d.snr_db)
+            .collect();
+        assert!(!reported.is_empty(), "{} at {} Hz reported no SNR", st.mode.name(), st.hz);
+        let got = reported.iter().sum::<f32>() / reported.len() as f32;
+        let err = got - st.snr_db;
+        let what = format!(
+            "{} at {} Hz: built {:+.1} dB, reads {got:+.2} dB over {} decodes",
+            st.mode.name(),
+            st.hz,
+            st.snr_db,
+            reported.len()
+        );
+
+        // A station narrower than this one, transmitting inside its band.
+        let guest = WEAK_STATIONS.iter().any(|o| {
+            o.hz != st.hz
+                && (o.hz - st.hz).abs() < mode.power_bandwidth_hz() / 2.0
+                && (o.mode.bandwidth as f64) <= mode.power_bandwidth_hz()
+        });
+
+        if guest {
+            assert!(
+                (-0.5..3.0).contains(&err),
+                "{what} — a host should read high by its guest's power, not {err:+.2} dB"
+            );
+        } else if st.full_copy {
+            assert!(err.abs() < 1.0, "{what} — {err:+.2} dB off in the clear");
+        } else {
+            // The station deliberately past its reach. Its decodes land at
+            // ragged offsets, which drags the average down; it is here to be
+            // seen at all, not to be measured.
+            assert!(err.abs() < 3.0, "{what} — even the marginal station is {err:+.2} dB out");
+        }
+    }
+}

@@ -1348,15 +1348,20 @@ impl App {
 
             ui.label("Signal");
             if bound {
+                let snr = match q.snr_db {
+                    Some(db) => format!("{db:+.0} dB"),
+                    None => "— dB".to_string(),
+                };
                 ui.label(format!(
-                    "{:.0} Hz  {:+.1} drift  ×{:.1}",
+                    "{:.0} Hz  {:+.1} drift  {snr}  ×{:.1}",
                     q.hz,
                     q.drift_hz,
                     q.quality.max(0.0)
                 ))
                 .on_hover_text(
-                    "carrier, how far it has wandered since first heard, and the last \
-                     decode's confidence in multiples of the mode's noise floor",
+                    "carrier, how far it has wandered since first heard, the station's \
+                     signal-to-noise in 2.5 kHz — the figure a signal report means — and \
+                     the last decode's confidence in multiples of the mode's noise floor",
                 );
             } else {
                 ui.horizontal(|ui| {
@@ -2449,12 +2454,21 @@ impl App {
                             ch.hz,
                             ch.drift_hz()
                         ));
-                        // `quality` is normalised to the protocol's own noise
-                        // floor, so it is a ratio rather than a dB figure — see
-                        // protocol::Decode. Saying "x4.4" is honest where "13 dB"
-                        // would imply a channel SNR this is not.
-                        ui.label(format!(
-                            "SNR ×{:.1} above noise (best ×{:.1})",
+                        // Two numbers, because they answer two questions. The
+                        // SNR is a measurement of the signal, in the 2.5 kHz a
+                        // ham quotes them in, and reads the same on every row
+                        // of the band. `quality` is the decoder's own
+                        // confidence against its own protocol's threshold, so
+                        // it is a ratio and stays one — this used to be
+                        // labelled SNR, which it never was.
+                        match (ch.snr_db, ch.best_snr_db) {
+                            (Some(now), Some(best)) => {
+                                ui.label(format!("SNR {now:+.0} dB (best {best:+.0})"))
+                            }
+                            _ => ui.weak("SNR not measured"),
+                        };
+                        ui.weak(format!(
+                            "confidence ×{:.1} of the mode's noise floor (best ×{:.1})",
                             ch.quality, ch.best_quality
                         ));
                         ui.weak(format!(
@@ -3030,6 +3044,7 @@ mod tests {
     fn the_file_view_arbitrates_across_its_per_mode_scans() {
         let mut app = App::base((300.0, 2600.0));
         let d = |mode: ModeId, hz: f64, at: f64, text: &str| protocol::Decode {
+            snr_db: None,
             mode,
             hz,
             time_s: at,
@@ -3067,6 +3082,7 @@ mod tests {
     fn app_with_traffic(t: f64) -> App {
         let mut app = App::base((0.0, 4000.0));
         let d = |hz: f64, at: f64, text: &str| protocol::Decode {
+            snr_db: None,
             mode: ModeId::Js8(ragchew::js8::Mode::Normal),
             hz,
             time_s: at,

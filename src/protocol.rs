@@ -10,6 +10,7 @@
 //! Adding a protocol means adding a [`ModeId`] variant and a branch in
 //! [`decode_all`]; nothing above this module needs to change.
 
+use crate::dsp;
 use crate::js8;
 use crate::olivia;
 use crate::psk;
@@ -117,6 +118,38 @@ impl ModeId {
         }
     }
 
+    /// The band this mode's *power* is in, which is not always the bandwidth it
+    /// is named for.
+    ///
+    /// [`ModeId::bandwidth_hz`] is what the mode occupies for the purposes of
+    /// laying stations out and keeping them apart — a channel spacing. Measuring
+    /// a signal's strength needs the band its energy is actually in, and for
+    /// JS8 the two differ: a frame keeps only 62% of its power inside the
+    /// conventional 8 × tone spacing, and 99% inside twice that. Measured on an
+    /// off-air recording and on this crate's own synthesis, which agree to
+    /// within 4% — see `examples/snr.rs`, section F.
+    ///
+    /// Olivia and PSK are given no margin on purpose. Their nominal bandwidth
+    /// already holds their power, and widening a measurement band reaches into
+    /// the neighbours: Olivia 8/250 measured over 500 Hz with a station 200 Hz
+    /// away reads 3 dB strong, counting that station as its own.
+    pub fn power_bandwidth_hz(self) -> f64 {
+        match self {
+            ModeId::Js8(_) => 2.0 * self.bandwidth_hz(),
+            ModeId::Olivia(_) | ModeId::Psk(_) => self.bandwidth_hz(),
+        }
+    }
+
+    /// Shortest stretch of audio worth measuring an SNR over.
+    ///
+    /// A decode's own extent, except for a mode whose decodes are shorter than
+    /// the measurement needs: a PSK character is a fifth of a second, which is
+    /// less than one analysis window, so its SNR is read from the second of
+    /// audio around it instead.
+    pub fn snr_window_s(self) -> f64 {
+        self.chunk_secs().max(1.0)
+    }
+
     /// How long one unit of decoded text takes on the air (a JS8 frame, an
     /// Olivia block).
     pub fn chunk_secs(self) -> f64 {
@@ -139,11 +172,22 @@ pub struct Decode {
     /// Decoder confidence, in multiples of that protocol's noise floor: 1.0 is
     /// "no better than noise" and higher is better.
     ///
-    /// The two protocols measure entirely different things — JS8 the strength
-    /// of its Costas sync, Olivia the peak of a Walsh correlation — so this is
-    /// normalised to make the numbers mean the same *kind* of thing, not to
-    /// make them precisely comparable.
+    /// Each protocol measures an entirely different thing — JS8 the strength of
+    /// its Costas sync, Olivia the peak of a Walsh correlation, PSK the
+    /// envelope line at the symbol rate — so this is normalised to make the
+    /// numbers mean the same *kind* of thing, not to make them comparable.
+    /// It says how sure the decoder is, not how loud the station is: for the
+    /// latter see [`Decode::snr_db`], which is comparable across every mode
+    /// because it is a measurement rather than a decision statistic.
     pub quality: f32,
+    /// Signal-to-noise in [`dsp::SNR_REF_BW_HZ`], in dB — the figure a ham
+    /// means by SNR, and the one WSJT-X and JS8Call report.
+    ///
+    /// Measured off the audio around the decode rather than taken from the
+    /// decoder, so it means the same thing whatever carried it. `None` when
+    /// there was too little audio to measure, which is why it is not simply a
+    /// number: a decode at the very start or end of a buffer has no room.
+    pub snr_db: Option<f32>,
     /// The decoded text.
     pub text: String,
 }
@@ -192,12 +236,16 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
         if let ModeId::Js8(mode) = m {
             let sm = js8::submode::of(*mode);
             out.extend(js8::modem::decode_all_sm(samples, hz_lo, hz_hi, 30, &sm).into_iter().map(
-                |r| Decode {
-                    mode: ModeId::Js8(r.mode),
-                    hz: r.hz,
-                    time_s: r.offset as f64 / crate::SAMPLE_RATE as f64,
-                    quality: (r.sync / js8::modem::NOISE_SYNC) as f32,
-                    text: js8::message::unpack(&r.a87).text(),
+                |r| {
+                    let mode = ModeId::Js8(r.mode);
+                    Decode {
+                        mode,
+                        hz: r.hz,
+                        time_s: r.offset as f64 / crate::SAMPLE_RATE as f64,
+                        quality: (r.sync / js8::modem::NOISE_SYNC) as f32,
+                        snr_db: measure_snr(samples, r.offset, r.hz, mode),
+                        text: js8::message::unpack(&r.a87).text(),
+                    }
                 },
             ));
         }
@@ -214,11 +262,13 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
         .collect();
     if !olivia_modes.is_empty() {
         out.extend(olivia::decode_all(samples, hz_lo, hz_hi, &olivia_modes).into_iter().map(|r| {
+            let mode = ModeId::Olivia(r.mode);
             Decode {
-                mode: ModeId::Olivia(r.mode),
+                mode,
                 hz: r.hz,
                 time_s: r.offset as f64 / crate::SAMPLE_RATE as f64,
                 quality: (r.snr / olivia::modem::NOISE_FLOOR) as f32,
+                snr_db: measure_snr(samples, r.offset, r.hz, mode),
                 text: r.text(),
             }
         }));
@@ -235,12 +285,16 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
     if !psk_modes.is_empty() {
         let found: Vec<Decode> = psk::decode_all(samples, hz_lo, hz_hi, &psk_modes)
             .into_iter()
-            .map(|r| Decode {
-                mode: ModeId::Psk(r.mode),
-                hz: r.hz,
-                time_s: r.offset as f64 / crate::SAMPLE_RATE as f64,
-                quality: (r.score / psk::modem::NOISE_FLOOR) as f32,
-                text: r.text,
+            .map(|r| {
+                let mode = ModeId::Psk(r.mode);
+                Decode {
+                    mode,
+                    hz: r.hz,
+                    time_s: r.offset as f64 / crate::SAMPLE_RATE as f64,
+                    quality: (r.score / psk::modem::NOISE_FLOOR) as f32,
+                    snr_db: measure_snr(samples, r.offset, r.hz, mode),
+                    text: r.text,
+                }
             })
             .collect();
         out.extend(arbitrate_psk(found, &out));
@@ -248,6 +302,30 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
 
     out.sort_by(|a, b| a.time_s.partial_cmp(&b.time_s).unwrap());
     out
+}
+
+/// SNR of the signal a decode came from, in dB against
+/// [`dsp::SNR_REF_BW_HZ`].
+///
+/// Measured over the decode's own stretch of audio, or the second around it
+/// where that is shorter than the measurement needs — a PSK character being a
+/// fifth of a second. The window is centred on the decode when it has to grow,
+/// so what is measured stays the signal that produced it.
+///
+/// `None` at the edges of the buffer, where there is not enough audio either
+/// side to measure over. A caller that needs a number for every decode should
+/// treat that as "not measured" rather than as a weak signal.
+fn measure_snr(samples: &[f32], offset: usize, hz: f64, mode: ModeId) -> Option<f32> {
+    let rate = crate::SAMPLE_RATE as f64;
+    let want = (mode.snr_window_s() * rate) as usize;
+    let extent = (mode.chunk_secs() * rate) as usize;
+    // Grown symmetrically, so a short decode is measured on the audio around
+    // it rather than on the audio after it.
+    let pad = want.saturating_sub(extent) / 2;
+    let from = offset.saturating_sub(pad);
+    let to = (offset + extent + pad).min(samples.len());
+    let win = samples.get(from..to)?;
+    dsp::snr_db(win, crate::SAMPLE_RATE, hz, mode.power_bandwidth_hz()).map(|s| s.db as f32)
 }
 
 /// Settle the claims two protocols make on the same signal, across a set of
