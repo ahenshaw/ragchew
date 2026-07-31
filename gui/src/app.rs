@@ -109,7 +109,16 @@ struct Args {
     #[arg(long)]
     record: bool,
 
-    /// Where the log and any recordings are written.
+    /// Log every decode to a CSV file alongside the log.
+    ///
+    /// The station's own record of what was heard, one row per decode:
+    /// `utc,mode,hz,snr_db,quality,text`. A night of traffic is a few
+    /// kilobytes, against 700 MB for `--record`, so this is the one to leave
+    /// on. Live capture only.
+    #[arg(long)]
+    csv: bool,
+
+    /// Where the log, the CSV and any recordings are written.
     ///
     /// Defaults to `$XDG_DATA_HOME/ragchew`, or `~/.local/share/ragchew`.
     #[arg(long, value_name = "DIR")]
@@ -186,8 +195,11 @@ pub fn run() -> eframe::Result<()> {
             // The saved palette has to reach egui before the first frame, or
             // the window flashes the system theme on the way to the wanted one.
             cc.egui_ctx.set_theme(app.theme.preference());
-            // Before `go_live`, which is what reads it.
+            // Before `go_live`, which is what reads them.
             app.record = args.record;
+            if args.csv {
+                app.set_csv(true);
+            }
             if live {
                 app.go_live();
             } else if args.weak {
@@ -200,6 +212,31 @@ pub fn run() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+impl App {
+    /// Start or stop the CSV traffic log.
+    ///
+    /// Unlike recording, this is not tied to a capture: the writer is a file
+    /// and a flag, and the decode threads consult it when they have something
+    /// to write. So it can be switched on before going live, and survives a
+    /// change of audio device without a break in the record.
+    fn set_csv(&mut self, on: bool) {
+        if !on {
+            crate::traffic::stop();
+            return;
+        }
+        if crate::traffic::is_on() {
+            return;
+        }
+        match crate::traffic::start(&diag::data_dir()) {
+            Some(p) => diag_info!("traffic", "logging decodes to {}", p.display()),
+            None => {
+                self.status = Some("could not open the CSV log".to_string());
+                diag_warn!("traffic", "could not open a CSV in {}", diag::data_dir().display());
+            }
+        }
+    }
 }
 
 /// A duration as `h:mm:ss`, for a recording that may well run all night.
@@ -1992,6 +2029,8 @@ impl App {
         let mut go_live = false;
         let mut record_toggled = false;
         let mut want_record = self.record;
+        let mut csv_toggled = false;
+        let mut want_csv = crate::traffic::is_on();
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Settings live behind the hamburger: they are set once and
@@ -2070,6 +2109,31 @@ impl App {
                     ui.separator();
                     ui.menu_button("Diagnostics", |ui| {
                         ui.set_min_width(340.0);
+                        // First, because it is the one worth leaving on: a
+                        // night of traffic is kilobytes here and gigabytes as
+                        // audio.
+                        if ui
+                            .add(elegance::Checkbox::new(
+                                &mut want_csv,
+                                "log decodes to a CSV file",
+                            ))
+                            .on_hover_text(
+                                "one row per decode — utc, mode, hz, snr, quality, text — \
+                                 for the station's own record. Live capture only.",
+                            )
+                            .changed()
+                        {
+                            csv_toggled = true;
+                        }
+                        match crate::traffic::path() {
+                            Some(p) => {
+                                ui.weak(format!("{}  —  {} rows", p.display(), crate::traffic::rows()));
+                            }
+                            None => {
+                                ui.weak(format!("files go to {}", diag::data_dir().display()));
+                            }
+                        }
+                        ui.separator();
                         ui.add_enabled_ui(live, |ui| {
                             if ui
                                 .add(elegance::Checkbox::new(
@@ -2350,6 +2414,9 @@ impl App {
             if let Some(lm) = self.live.as_mut() {
                 lm.set_recording(want_record);
             }
+        }
+        if csv_toggled {
+            self.set_csv(want_csv);
         }
 
         // A different output takes effect on the next send: dropping the stream

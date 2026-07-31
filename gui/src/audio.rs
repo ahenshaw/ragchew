@@ -16,6 +16,7 @@ use ragchew::spectrogram::WINDOW;
 
 use crate::diag::{self, Health, RunningGuard, ThreadHealth};
 use crate::record::Tap;
+use crate::traffic;
 use crate::{diag_info, diag_warn};
 
 /// Everything is decoded at the crate's internal rate; the sound card is
@@ -624,6 +625,7 @@ fn spawn_js8(
 
             if !decodes.is_empty() {
                 Health::bump(&stats.decodes, decodes.len() as u64);
+                log_traffic(&buf, &decodes);
                 for d in &decodes {
                     diag_info!(
                         "js8",
@@ -714,6 +716,7 @@ fn spawn_continuous(
 
             if !fresh.is_empty() {
                 Health::bump(&stats.decodes, fresh.len() as u64);
+                log_traffic(&buf, &fresh);
                 for d in &fresh {
                     diag_info!(
                         "cont",
@@ -989,6 +992,24 @@ fn measure_offset(buf: &Arc<Mutex<AudioBuf>>, mode: ModeId, period: f64) -> Opti
         return None;
     }
     Some((start_unix + win_start + newest).rem_euclid(period))
+}
+
+/// Record decodes in the traffic log, stamped with the UTC time each
+/// transmission's audio *began* rather than the moment it was decoded.
+///
+/// The two differ by seconds and sometimes tens of them — a continuous-mode
+/// pass reports blocks from anywhere in a 24-second window — and a station log
+/// that said "decoded at" would misdate every entry in it by however long the
+/// decoder took to get round to that block.
+fn log_traffic(buf: &Arc<Mutex<AudioBuf>>, decodes: &[protocol::Decode]) {
+    if !traffic::is_on() || decodes.is_empty() {
+        return;
+    }
+    // `time_s` counts from global sample 0, which is what `start_unix` dates.
+    let start_unix = buf.lock().unwrap().start_unix();
+    for d in decodes {
+        traffic::log(start_unix + d.time_s, d);
+    }
 }
 
 /// Rebase decode times from window-relative to capture-relative.

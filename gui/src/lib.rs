@@ -12,6 +12,7 @@ pub mod layout;
 pub mod qso;
 pub mod record;
 pub mod scene;
+pub mod traffic;
 pub mod waterfall;
 
 #[cfg(feature = "desktop")]
