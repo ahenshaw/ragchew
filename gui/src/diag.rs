@@ -198,6 +198,51 @@ pub fn stamp_compact(unix: f64) -> String {
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
 }
 
+/// Days since 1970-01-01 for a civil date. The inverse of [`civil`].
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Find a [`stamp_compact`] anywhere in a filename and read it back as UTC.
+///
+/// A recording made by this app is named for the moment it started, which is
+/// the only record of when its audio *was*. Decoding one offline can therefore
+/// date its traffic properly instead of reporting bare offsets into the file.
+///
+/// Deliberately a search rather than a strict parse of `ragchew-<stamp>.wav`:
+/// a file that has been renamed or moved keeps its stamp, and a name with no
+/// stamp in it simply yields `None` and the times stay relative.
+pub fn stamp_in_name(name: &str) -> Option<f64> {
+    let b = name.as_bytes();
+    let digits = |i: usize, n: usize| {
+        b.get(i..i + n).filter(|s| s.iter().all(|c| c.is_ascii_digit()))
+    };
+    for i in 0..b.len() {
+        // YYYYMMDD-HHMMSS
+        let (Some(date), Some(b'-'), Some(time)) =
+            (digits(i, 8), b.get(i + 8).copied(), digits(i + 9, 6))
+        else {
+            continue;
+        };
+        let num = |s: &[u8], a: usize, n: usize| -> i64 {
+            std::str::from_utf8(&s[a..a + n]).unwrap().parse().unwrap()
+        };
+        let (y, mo, d) = (num(date, 0, 4), num(date, 4, 2) as u32, num(date, 6, 2) as u32);
+        let (h, mi, s) = (num(time, 0, 2), num(time, 2, 2), num(time, 4, 2));
+        if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+            continue;
+        }
+        return Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + s) as f64);
+    }
+    None
+}
+
 // ---- panic hook ----
 
 /// Log panics, then hand on to whatever hook was already installed.
@@ -407,6 +452,29 @@ mod tests {
             ]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A recording's own name dates its audio, so decoding one offline can
+    /// report real times. Round-tripped against [`stamp_compact`] rather than
+    /// against hand-computed epochs, and checked on the names this app writes.
+    #[test]
+    fn a_stamp_in_a_filename_reads_back() {
+        for t in [0.0, 951_782_400.0, 1_769_731_200.0, 4_107_542_400.0, 1_769_817_599.0] {
+            let name = format!("ragchew-{}.wav", stamp_compact(t));
+            assert_eq!(stamp_in_name(&name), Some(t), "{name}");
+        }
+        // Renamed, moved, or with the stamp buried: still found.
+        assert_eq!(stamp_in_name("20260130-000000"), Some(1_769_731_200.0));
+        assert_eq!(stamp_in_name("night2/ragchew-20260130-000000.wav"), Some(1_769_731_200.0));
+        assert_eq!(stamp_in_name("copy-of-ragchew-20260130-000000-final.wav"),
+                   Some(1_769_731_200.0));
+
+        // No stamp, or not a real date: times stay relative rather than wrong.
+        assert_eq!(stamp_in_name("recording.wav"), None);
+        assert_eq!(stamp_in_name("ragchew.wav"), None);
+        assert_eq!(stamp_in_name("ragchew-20261330-000000.wav"), None, "month 13");
+        assert_eq!(stamp_in_name("ragchew-20260130-250000.wav"), None, "hour 25");
+        assert_eq!(stamp_in_name("1234567-123456.wav"), None, "too few date digits");
     }
 
     /// `--log-dir` moves the recordings too, so a fault report is one folder

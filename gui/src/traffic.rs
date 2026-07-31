@@ -7,13 +7,21 @@
 //! be worth keeping. It is the answer to "I want the messages, not the audio":
 //! a night of traffic is a few kilobytes here against 700 MB of WAV.
 //!
-//! Columns are `utc,mode,hz,snr_db,quality,text`. The timestamp is when the
-//! transmission was, not when it was decoded — decodes carry the time their
+//! Columns are `utc,t_s,mode,hz,snr_db,quality,text`. Both times are when the
+//! transmission *was*, not when it was decoded — decodes carry the time their
 //! audio began, and a continuous-mode pass reports blocks several seconds old.
 //!
-//! Live capture only. A file being scanned is re-scanned whenever the mode
-//! selection changes, so logging that would write the same traffic again every
-//! time; a file already *is* a record of itself.
+//! `t_s` is the offset into the capture or file and is always present. `utc` is
+//! filled where the origin is known: live, from when capture started; in a
+//! batch decode, from the stamp in a recording's own filename. It is left empty
+//! rather than guessed for a file that carries no such stamp, so one shape of
+//! row serves both and a reader can key on whichever it has.
+//!
+//! Two producers, and no interactive file scanning between them. Live capture
+//! writes as it decodes; [`crate::app::batch_to_csv`] writes a file in one
+//! pass. The interactive file view deliberately does not: it re-scans whenever
+//! the mode selection changes, so logging there would write the same traffic
+//! again on every change.
 
 use std::fs;
 use std::io::Write;
@@ -35,7 +43,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static ROWS: AtomicU64 = AtomicU64::new(0);
 
 /// The header row, and the definition of the format.
-const HEADER: &str = "utc,mode,hz,snr_db,quality,text\n";
+const HEADER: &str = "utc,t_s,mode,hz,snr_db,quality,text\n";
 
 /// Start writing decodes to a new CSV in `dir`. Returns its path.
 ///
@@ -44,15 +52,24 @@ const HEADER: &str = "utc,mode,hz,snr_db,quality,text\n";
 /// and nothing has to guess whether a half-written row belongs to this run.
 pub fn start(dir: &Path) -> Option<PathBuf> {
     fs::create_dir_all(dir).ok()?;
-    let path = dir.join(format!("ragchew-{}.csv", diag::stamp_compact(diag::unix_now())));
-    let mut out = fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
-    if out.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-        out.write_all(HEADER.as_bytes()).ok()?;
+    start_at(&dir.join(format!("ragchew-{}.csv", diag::stamp_compact(diag::unix_now()))))
+}
+
+/// Start writing to a named file, truncating anything already there.
+///
+/// For a batch decode, where the operator has said where the output goes and
+/// re-running the same command should replace its previous answer rather than
+/// append a second copy of it.
+pub fn start_at(path: &Path) -> Option<PathBuf> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).ok()?;
     }
+    let mut out = fs::File::create(path).ok()?;
+    out.write_all(HEADER.as_bytes()).ok()?;
     ROWS.store(0, Ordering::Relaxed);
-    *SINK.lock().unwrap() = Some(Sink { out, path: path.clone() });
+    *SINK.lock().unwrap() = Some(Sink { out, path: path.to_path_buf() });
     ENABLED.store(true, Ordering::Relaxed);
-    Some(path)
+    Some(path.to_path_buf())
 }
 
 /// Stop logging and close the file.
@@ -75,22 +92,26 @@ pub fn rows() -> u64 {
     ROWS.load(Ordering::Relaxed)
 }
 
-/// Append one decode, stamped with the UTC time its audio began.
+/// Append one decode. `t_s` is its offset into the capture or file; `utc` is
+/// the same instant in wall-clock terms where that is known.
 ///
 /// Flushed on every row — the file is opened for append and each row is one
 /// `write_all`, so two decode threads cannot interleave mid-row and a process
 /// killed overnight loses nothing that had been decoded. A few dozen rows an
 /// hour does not need buffering.
-pub fn log(utc: f64, d: &Decode) {
+pub fn log(utc: Option<f64>, t_s: f64, d: &Decode) {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
     let row = format!(
-        "{},{},{:.1},{},{:.2},{}\n",
-        diag::stamp_iso(utc),
+        "{},{:.2},{},{:.1},{},{:.2},{}\n",
+        utc.map_or(String::new(), diag::stamp_iso),
+        t_s,
         field(&d.mode.name()),
         d.hz,
-        d.snr_db.map_or(String::new(), |s| format!("{s:.0}")),
+        // One decimal, not the whole-dB a ham writes on a card: this is a data
+        // file, the precision is free, and rounding to zero produced "-0".
+        d.snr_db.map_or(String::new(), |s| format!("{s:.1}")),
         d.quality,
         field(&d.text)
     );
@@ -164,10 +185,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let path = start(&dir).unwrap();
 
-        log(1_769_731_200.0, &decode("DE W1AW, \"EM73\""));
+        log(Some(1_769_731_200.0), 12.5, &decode("DE W1AW, \"EM73\""));
         let mut quiet = decode("no report here");
         quiet.snr_db = None;
-        log(1_769_731_215.0, &quiet);
+        // No known origin — a batch decode of a file with no stamp in its name.
+        log(None, 27.5, &quiet);
         stop();
 
         let text = fs::read_to_string(&path).unwrap();
@@ -177,16 +199,20 @@ mod tests {
 
         let first = parse_row(lines[1]);
         assert_eq!(first[0], "2026-01-30T00:00:00.000Z");
-        assert_eq!(first[1], "JS8 Normal");
-        assert_eq!(first[2], "1502.3");
-        assert_eq!(first[3], "-11");
-        assert_eq!(first[4], "3.25");
-        assert_eq!(first[5], "DE W1AW, \"EM73\"", "the comma and quotes did not survive");
+        assert_eq!(first[1], "12.50");
+        assert_eq!(first[2], "JS8 Normal");
+        assert_eq!(first[3], "1502.3");
+        assert_eq!(first[4], "-11.4", "SNR is kept to a decimal, not rounded to whole dB");
+        assert_eq!(first[5], "3.25");
+        assert_eq!(first[6], "DE W1AW, \"EM73\"", "the comma and quotes did not survive");
 
-        // An unmeasurable SNR is an empty field, not a made-up number.
+        // Unknowns are empty fields, not made-up numbers: an SNR too weak to
+        // measure, and a file whose start time nothing recorded.
         let second = parse_row(lines[2]);
-        assert_eq!(second[3], "");
-        assert_eq!(second[5], "no report here");
+        assert_eq!(second[0], "", "invented a wall-clock time it could not know");
+        assert_eq!(second[1], "27.50");
+        assert_eq!(second[4], "");
+        assert_eq!(second[6], "no report here");
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -197,7 +223,7 @@ mod tests {
     fn logging_off_writes_nothing() {
         stop();
         assert!(!is_on());
-        log(1_769_731_200.0, &decode("should not appear"));
+        log(Some(1_769_731_200.0), 0.0, &decode("should not appear"));
         assert!(path().is_none());
     }
 

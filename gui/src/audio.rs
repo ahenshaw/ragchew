@@ -1008,7 +1008,7 @@ fn log_traffic(buf: &Arc<Mutex<AudioBuf>>, decodes: &[protocol::Decode]) {
     // `time_s` counts from global sample 0, which is what `start_unix` dates.
     let start_unix = buf.lock().unwrap().start_unix();
     for d in decodes {
-        traffic::log(start_unix + d.time_s, d);
+        traffic::log(Some(start_unix + d.time_s), d.time_s, d);
     }
 }
 

@@ -31,6 +31,7 @@ use crate::channels::{Channel, ChannelSet};
 use crate::diag::{self, Health};
 use crate::layout;
 use crate::record::Recorder;
+use crate::traffic;
 use crate::{diag_info, diag_warn};
 use crate::qso::{Dir, QsoSet};
 use crate::scene::{self, Geometry};
@@ -109,14 +110,24 @@ struct Args {
     #[arg(long)]
     record: bool,
 
-    /// Log every decode to a CSV file alongside the log.
+    /// Log every decode to a CSV file: `utc,t_s,mode,hz,snr_db,quality,text`.
     ///
-    /// The station's own record of what was heard, one row per decode:
-    /// `utc,mode,hz,snr_db,quality,text`. A night of traffic is a few
-    /// kilobytes, against 700 MB for `--record`, so this is the one to leave
-    /// on. Live capture only.
-    #[arg(long)]
-    csv: bool,
+    /// Live, this is the station's own record of what was heard — a night of
+    /// traffic is a few kilobytes, against 700 MB for `--record`, so it is the
+    /// one to leave on.
+    ///
+    /// Given a FILE as well it is a batch job instead: the recording is decoded
+    /// to CSV with no window opened, and the program exits. Writes beside the
+    /// input (`night.wav` -> `night.csv`) unless told otherwise with
+    /// `--csv=<PATH>`. A file this app recorded is named for when it started,
+    /// so its traffic comes out with real timestamps.
+    // A `String` rather than a `PathBuf`: clap's path parser rejects the empty
+    // string, which is exactly what a bare `--csv` has to produce for the value
+    // to be optional at all. `require_equals` is what keeps `ragchew a.wav
+    // --csv` from swallowing a following positional as the output name.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, require_equals = true,
+          default_missing_value = "")]
+    csv: Option<String>,
 
     /// Where the log, the CSV and any recordings are written.
     ///
@@ -132,10 +143,29 @@ struct Args {
 pub fn run() -> eframe::Result<()> {
     let args = <Args as clap::Parser>::parse();
 
-    // First, and before anything that could fail: a fault that takes a night to
-    // appear leaves nothing behind unless the log was already open when it
-    // happened. The panic hook goes in alongside, so a thread that dies on the
-    // way up is recorded too.
+    // A file plus --csv is a conversion, not a session: decode it, write the
+    // rows, say what happened and stop. It runs before the log is opened and
+    // deliberately does not open one — a batch job reports on stderr, where a
+    // batch job's output belongs, and ten conversions must not rotate away the
+    // overnight session logs that the log directory exists to keep.
+    if let (Some(file), Some(csv)) = (&args.file, &args.csv) {
+        let out = Some(Path::new(csv)).filter(|p| !p.as_os_str().is_empty());
+        match batch_to_csv(file, out) {
+            Ok((rows, path)) => {
+                eprintln!("{rows} decodes -> {}", path.display());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // First, and before anything else that could fail: a fault that takes a
+    // night to appear leaves nothing behind unless the log was already open
+    // when it happened. The panic hook goes in alongside, so a thread that dies
+    // on the way up is recorded too.
     if !args.no_log {
         diag::install_panic_hook();
         match diag::start(args.log_dir.as_deref()) {
@@ -197,8 +227,9 @@ pub fn run() -> eframe::Result<()> {
             cc.egui_ctx.set_theme(app.theme.preference());
             // Before `go_live`, which is what reads them.
             app.record = args.record;
-            if args.csv {
-                app.set_csv(true);
+            // A path given here names the live log; bare `--csv` auto-names it.
+            if let Some(csv) = &args.csv {
+                app.set_csv(true, Some(Path::new(csv)).filter(|p| !p.as_os_str().is_empty()));
             }
             if live {
                 app.go_live();
@@ -221,19 +252,27 @@ impl App {
     /// and a flag, and the decode threads consult it when they have something
     /// to write. So it can be switched on before going live, and survives a
     /// change of audio device without a break in the record.
-    fn set_csv(&mut self, on: bool) {
+    /// `at` names the file; `None` puts an auto-named one in the data
+    /// directory, which is what the menu toggle wants and what an overnight
+    /// run should have.
+    fn set_csv(&mut self, on: bool, at: Option<&Path>) {
         if !on {
-            crate::traffic::stop();
+            traffic::stop();
             return;
         }
-        if crate::traffic::is_on() {
+        if traffic::is_on() {
             return;
         }
-        match crate::traffic::start(&diag::data_dir()) {
+        let started = match at {
+            Some(p) => traffic::start_at(p),
+            None => traffic::start(&diag::data_dir()),
+        };
+        match started {
             Some(p) => diag_info!("traffic", "logging decodes to {}", p.display()),
             None => {
-                self.status = Some("could not open the CSV log".to_string());
-                diag_warn!("traffic", "could not open a CSV in {}", diag::data_dir().display());
+                let where_ = at.map_or_else(diag::data_dir, |p| p.to_path_buf());
+                self.status = Some(format!("could not write {}", where_.display()));
+                diag_warn!("traffic", "could not open a CSV at {}", where_.display());
             }
         }
     }
@@ -243,6 +282,76 @@ impl App {
 fn hms(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+
+/// Decode a WAV file straight to CSV and return how many rows were written.
+///
+/// The batch counterpart of the live traffic log, and the other half of
+/// `--record`: a night's recording decoded offline, into the same shape of file
+/// the live run would have produced, so the two can be compared row for row
+/// when the question is why the live one stopped.
+///
+/// Headless — no window is opened — and it prints progress to stderr, because
+/// an eight-hour recording is minutes of decoding and silence would be
+/// indistinguishable from a hang.
+///
+/// One thread per mode, then [`protocol::arbitrate`], exactly as the file view
+/// does it: a mode's own threshold is what keeps a signal out of its results,
+/// so the scans do not need each other to *run* — but they do need reconciling,
+/// since neither a PSK thread nor an Olivia one can tell on its own that they
+/// have both claimed the same signal.
+pub fn batch_to_csv(input: &Path, out: Option<&Path>) -> Result<(usize, PathBuf), String> {
+    let name = input.file_name().unwrap_or(input.as_os_str()).to_string_lossy().to_string();
+    let p = input.to_str().ok_or_else(|| format!("{name}: path is not valid UTF-8"))?;
+    let (samples, rate) = wav::read(p).map_err(|e| format!("{name}: {e}"))?;
+    if rate != SAMPLE_RATE {
+        return Err(format!(
+            "{name} is {rate} Hz; ragchew needs {SAMPLE_RATE} Hz mono \
+             (ffmpeg -i in -ac 1 -ar {SAMPLE_RATE} out.wav)"
+        ));
+    }
+
+    // Default beside the input and named after it, so decoding a directory of
+    // recordings does not need a path invented for each one.
+    let out = out.map(|o| o.to_path_buf()).unwrap_or_else(|| input.with_extension("csv"));
+    // A recording this app made is named for when it started, which is the only
+    // surviving record of when its audio was. Anything else keeps bare offsets.
+    let origin = diag::stamp_in_name(&name);
+
+    let secs = samples.len() as f64 / SAMPLE_RATE as f64;
+    eprintln!(
+        "{name}: {:.0} s of audio, decoding{}...",
+        secs,
+        match origin {
+            Some(t) => format!(" from {}", diag::stamp_iso(t)),
+            None => String::new(),
+        }
+    );
+
+    let samples = Arc::new(samples);
+    let modes = protocol::default_modes();
+    let mut handles = Vec::new();
+    for m in modes {
+        let samples = samples.clone();
+        handles.push(thread::spawn(move || {
+            let found = protocol::decode_all(&samples, 300.0, 2600.0, &[m]);
+            eprintln!("  {:>14}  {} decodes", m.name(), found.len());
+            found
+        }));
+    }
+    let mut found = Vec::new();
+    for h in handles {
+        found.extend(h.join().map_err(|_| "a decode thread panicked".to_string())?);
+    }
+    let kept = protocol::arbitrate(found);
+
+    traffic::start_at(&out).ok_or_else(|| format!("could not write {}", out.display()))?;
+    for d in &kept {
+        traffic::log(origin.map(|t| t + d.time_s), d.time_s, d);
+    }
+    let rows = traffic::rows() as usize;
+    traffic::stop();
+    Ok((rows, out))
 }
 
 /// What a QSO opened by hand starts in until the operator says otherwise.
@@ -2416,7 +2525,7 @@ impl App {
             }
         }
         if csv_toggled {
-            self.set_csv(want_csv);
+            self.set_csv(want_csv, None);
         }
 
         // A different output takes effect on the next send: dropping the stream
