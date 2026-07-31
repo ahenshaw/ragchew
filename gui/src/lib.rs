@@ -7,8 +7,10 @@
 pub mod channels;
 pub mod colormap;
 pub mod demo;
+pub mod diag;
 pub mod layout;
 pub mod qso;
+pub mod record;
 pub mod scene;
 pub mod waterfall;
 

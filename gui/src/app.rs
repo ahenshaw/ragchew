@@ -28,7 +28,10 @@ use ragchew::spectrogram::WINDOW;
 use ragchew::{wav, Spectrogram, SAMPLE_RATE};
 
 use crate::channels::{Channel, ChannelSet};
+use crate::diag::{self, Health};
 use crate::layout;
+use crate::record::Recorder;
+use crate::{diag_info, diag_warn};
 use crate::qso::{Dir, QsoSet};
 use crate::scene::{self, Geometry};
 use crate::tx::{self, Tx};
@@ -96,10 +99,48 @@ struct Args {
     /// Synthetic Olivia band, every station below the noise floor.
     #[arg(long, alias = "olivia", conflicts_with = "file")]
     weak: bool,
+
+    /// Record the live capture to a WAV file alongside the log.
+    ///
+    /// Writes the 12 kHz mono stream the decoders actually see, so the file
+    /// plays a fault back exactly: reopen it with `ragchew <file>` and the same
+    /// audio is decoded again. About 86 MB an hour. Can also be turned on and
+    /// off from the Diagnostics menu while running.
+    #[arg(long)]
+    record: bool,
+
+    /// Where the log and any recordings are written.
+    ///
+    /// Defaults to `$XDG_DATA_HOME/ragchew`, or `~/.local/share/ragchew`.
+    #[arg(long, value_name = "DIR")]
+    log_dir: Option<PathBuf>,
+
+    /// Do not write a log file.
+    #[arg(long, conflicts_with = "log_dir")]
+    no_log: bool,
 }
 
 pub fn run() -> eframe::Result<()> {
     let args = <Args as clap::Parser>::parse();
+
+    // First, and before anything that could fail: a fault that takes a night to
+    // appear leaves nothing behind unless the log was already open when it
+    // happened. The panic hook goes in alongside, so a thread that dies on the
+    // way up is recorded too.
+    if !args.no_log {
+        diag::install_panic_hook();
+        match diag::start(args.log_dir.as_deref()) {
+            Some(p) => eprintln!("logging to {}", p.display()),
+            None => eprintln!("could not open a log file; continuing without one"),
+        }
+    }
+    diag_info!(
+        "start",
+        "ragchew {} on {} — args: {:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::args().skip(1).collect::<Vec<_>>()
+    );
 
     // A monitor with nothing on the command line should be monitoring: opening
     // deaf and waiting to be told to listen is a worse default than the one
@@ -145,6 +186,8 @@ pub fn run() -> eframe::Result<()> {
             // The saved palette has to reach egui before the first frame, or
             // the window flashes the system theme on the way to the wanted one.
             cc.egui_ctx.set_theme(app.theme.preference());
+            // Before `go_live`, which is what reads it.
+            app.record = args.record;
             if live {
                 app.go_live();
             } else if args.weak {
@@ -157,6 +200,12 @@ pub fn run() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     )
+}
+
+/// A duration as `h:mm:ss`, for a recording that may well run all night.
+fn hms(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
 /// What a QSO opened by hand starts in until the operator says otherwise.
@@ -580,6 +629,15 @@ struct LiveMode {
     t_now: f64,
     devices: Vec<crate::audio::AudioDevice>,
     selected: Option<String>, // current device name
+    /// Counters the decode threads, the capture callback and this struct all
+    /// write, and the heartbeat reads. Outlives any one capture, so the totals
+    /// survive a change of device.
+    health: Arc<Health>,
+    /// The recording in progress, if any. Dropping it finalises the file.
+    recorder: Option<Recorder>,
+    /// Retires the heartbeat belonging to the previous capture when the device
+    /// changes, so only one of them is ever writing health lines.
+    heartbeat_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl LiveMode {
@@ -588,6 +646,7 @@ impl LiveMode {
         modes: Vec<ModeId>,
         device: Option<String>,
         show_all_inputs: bool,
+        record: bool,
     ) -> LiveMode {
         let mut lm = LiveMode {
             band,
@@ -605,9 +664,48 @@ impl LiveMode {
             t_now: 0.0,
             devices: Vec::new(),
             selected: None,
+            health: Arc::new(Health::default()),
+            recorder: None,
+            heartbeat_stop: None,
         };
+        // Before opening, so `--record` catches the first sample rather than
+        // whatever is left after the interface has finished starting up.
+        if record {
+            lm.set_recording(true);
+        }
         lm.open(device);
         lm
+    }
+
+    /// Start or stop recording the capture to disk.
+    ///
+    /// The recording is attached to the audio buffer rather than to a stream,
+    /// so it survives the operator changing device mid-run — the new capture
+    /// simply picks up the same tap, and the join in the file is logged.
+    fn set_recording(&mut self, on: bool) {
+        match (on, self.recorder.is_some()) {
+            (true, false) => {
+                match Recorder::start(&diag::data_dir(), SAMPLE_RATE, self.health.clone()) {
+                    Ok(r) => {
+                        if let Some(a) = &self.audio {
+                            a.set_tap(Some(r.tap()));
+                        }
+                        self.recorder = Some(r);
+                    }
+                    Err(e) => {
+                        self.err = Some(format!("could not start recording: {e}"));
+                        diag_warn!("record", "could not start: {e}");
+                    }
+                }
+            }
+            (false, true) => {
+                if let Some(a) = &self.audio {
+                    a.set_tap(None);
+                }
+                self.recorder = None; // finalises the file on drop
+            }
+            _ => {}
+        }
     }
 
     /// (Re)open capture on the given device (or the default), resetting the
@@ -617,6 +715,9 @@ impl LiveMode {
         // makes the old decoder thread exit on its next send.
         self.audio = None;
         self.frames_rx = None;
+        if let Some(stop) = self.heartbeat_stop.take() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.spec = Arc::new(Spectrogram::empty(self.band.0, self.band.1, WINDOW / 4));
         self.next_col = 0;
         self.cols_total = 0;
@@ -628,17 +729,35 @@ impl LiveMode {
         // A remembered device may be gone — a USB interface unplugged, or
         // settings carried to another machine. Falling back to the default
         // input beats refusing to listen at all.
-        let started = crate::audio::LiveAudio::start(name.as_deref())
-            .or_else(|e| if name.is_some() { crate::audio::LiveAudio::start(None) } else { Err(e) });
+        let h = || self.health.clone();
+        let started = crate::audio::LiveAudio::start(name.as_deref(), h()).or_else(|e| {
+            if name.is_some() {
+                crate::audio::LiveAudio::start(None, h())
+            } else {
+                Err(e)
+            }
+        });
         match started {
             Ok(audio) => {
-                self.frames_rx =
-                    Some(crate::audio::spawn_decoder(audio.buf.clone(), self.modes.clone()));
+                // A recording in progress follows the capture to the new
+                // device. The file gets a join at that point, which is worth
+                // saying rather than leaving to be puzzled over later.
+                if let Some(r) = &self.recorder {
+                    audio.set_tap(Some(r.tap()));
+                    diag_info!("record", "capture reopened; recording continues in the same file");
+                }
+                self.frames_rx = Some(crate::audio::spawn_decoder(
+                    audio.buf.clone(),
+                    self.modes.clone(),
+                    h(),
+                ));
+                self.heartbeat_stop = Some(crate::audio::spawn_heartbeat(&audio.buf, h()));
                 self.selected = Some(audio.device_id.clone());
                 self.err = None;
                 self.audio = Some(audio);
             }
             Err(e) => {
+                diag_warn!("audio", "could not open capture: {e}");
                 self.selected = name;
                 self.err = Some(e);
             }
@@ -651,8 +770,11 @@ impl LiveMode {
         self.modes = modes;
         if let Some(audio) = &self.audio {
             // dropping the old receiver retires the old decode threads
-            self.frames_rx =
-                Some(crate::audio::spawn_decoder(audio.buf.clone(), self.modes.clone()));
+            self.frames_rx = Some(crate::audio::spawn_decoder(
+                audio.buf.clone(),
+                self.modes.clone(),
+                self.health.clone(),
+            ));
         }
     }
 
@@ -691,7 +813,12 @@ impl LiveMode {
                 s.columns.drain(0..drop);
             }
             self.cols_since_norm += new_windows.len();
+            // The waterfall's own pulse. The reported fault was that this kept
+            // beating while decoding stopped, and a log that recorded only the
+            // decoders could neither confirm nor contradict that.
+            Health::bump(&self.health.ui_columns, new_windows.len() as u64);
         }
+        Health::bump(&self.health.ui_frames, 1);
 
         self.t_now = global_len as f64 / SAMPLE_RATE as f64;
 
@@ -803,6 +930,14 @@ struct App {
     split_grab_dx: f32,
 
     live: Option<LiveMode>,
+
+    /// Whether live capture should be recorded to disk.
+    ///
+    /// Deliberately not among the persisted [`Settings`]: a monitor that
+    /// silently resumed recording every launch would fill a disk with files
+    /// nobody asked for. It is set for one run, from `--record` or the
+    /// diagnostics menu.
+    record: bool,
 }
 
 impl App {
@@ -850,6 +985,7 @@ impl App {
             split_drag: false,
             split_grab_dx: 0.0,
             live: None,
+            record: false,
         }
     }
 
@@ -920,6 +1056,7 @@ impl App {
             self.enabled_modes(),
             self.preferred_input.clone(),
             self.show_all_inputs,
+            self.record,
         ));
     }
 
@@ -1772,6 +1909,8 @@ impl App {
         let mut live_err = false;
         let mut live_cols_total = 0i64;
         let mut live_devices: Vec<crate::audio::AudioDevice> = Vec::new();
+        // (path, seconds, bytes) of the recording in progress.
+        let mut live_recording: Option<(String, f64, u64)> = None;
         let mut show_all = self.show_all_inputs;
         let mut all_inputs_toggled = false;
         let mut live_selected: Option<String> = None;
@@ -1787,6 +1926,10 @@ impl App {
             live_cols_total = lm.cols_total;
             live_devices = lm.devices.clone();
             live_selected = lm.selected.clone();
+            live_recording = lm
+                .recorder
+                .as_ref()
+                .map(|r| (r.path().display().to_string(), r.seconds(), r.bytes()));
             ctx.request_repaint(); // keep the live view flowing
         }
 
@@ -1847,6 +1990,8 @@ impl App {
         let mut open_file: Option<PathBuf> = None;
         let mut demo_request: Option<bool> = None; // Some(weak?)
         let mut go_live = false;
+        let mut record_toggled = false;
+        let mut want_record = self.record;
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 // Settings live behind the hamburger: they are set once and
@@ -1920,6 +2065,56 @@ impl App {
                             });
                         }
                     });
+                    // Everything needed to report a fault that took a night to
+                    // appear: what was recorded, and where the log went.
+                    ui.separator();
+                    ui.menu_button("Diagnostics", |ui| {
+                        ui.set_min_width(340.0);
+                        ui.add_enabled_ui(live, |ui| {
+                            if ui
+                                .add(elegance::Checkbox::new(
+                                    &mut want_record,
+                                    "record this session to disk",
+                                ))
+                                .on_hover_text(
+                                    "writes the 12 kHz mono audio the decoders see — about \
+                                     86 MB an hour — so a fault can be replayed by opening \
+                                     the file again",
+                                )
+                                .changed()
+                            {
+                                record_toggled = true;
+                            }
+                        });
+                        if !live {
+                            ui.weak("only live capture can be recorded");
+                        }
+                        match &live_recording {
+                            Some((path, secs, bytes)) => {
+                                ui.weak(format!(
+                                    "{}  —  {}, {:.0} MB",
+                                    path,
+                                    hms(*secs),
+                                    *bytes as f64 / 1e6
+                                ));
+                                ui.weak("reopen it with:  ragchew <that file>");
+                            }
+                            None => {
+                                ui.weak(format!("files go to {}", diag::data_dir().display()));
+                            }
+                        }
+                        ui.separator();
+                        match diag::log_path() {
+                            Some(p) => {
+                                ui.weak(format!("log: {}", p.display()));
+                                ui.weak("grep it for WARN or ERROR first");
+                            }
+                            None => {
+                                ui.weak("not logging (--no-log)");
+                            }
+                        }
+                    });
+
                     // The output is where transmissions go — the rig's codec,
                     // for anyone doing this for real.
                     ui.separator();
@@ -2019,6 +2214,14 @@ impl App {
                     };
                     ui.add(elegance::Indicator::new(state));
                     ui.strong(&live_label);
+                    // Recording is easy to leave on by accident and expensive
+                    // when you do, so it says so on the bar rather than only
+                    // inside the menu that started it.
+                    if let Some((path, secs, bytes)) = &live_recording {
+                        let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 120, 120));
+                        ui.colored_label(c, format!("⏺ {} · {:.0} MB", hms(*secs), *bytes as f64 / 1e6))
+                            .on_hover_text(path.as_str());
+                    }
                 } else {
                     // Playable as soon as there is a waterfall to play; the scan
                     // catches up on its own.
@@ -2141,6 +2344,12 @@ impl App {
         }
         if go_live && self.live.is_none() {
             self.go_live();
+        }
+        if record_toggled {
+            self.record = want_record;
+            if let Some(lm) = self.live.as_mut() {
+                lm.set_recording(want_record);
+            }
         }
 
         // A different output takes effect on the next send: dropping the stream
