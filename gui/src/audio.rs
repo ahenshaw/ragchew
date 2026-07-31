@@ -433,6 +433,27 @@ pub fn spawn_decoder(
 /// Cycle-aligned JS8 decoding: each submode has its own UTC grid (Slow 30 s,
 /// Normal 15 s, Fast 10 s, Turbo 6 s) and each cycle is decoded shortly after
 /// its frame would have finished. Decodes carry capture-relative `time_s`.
+///
+/// The grid is the truth for audio off a radio, and it is where every submode
+/// starts. It is *not* the truth for audio piped in from somewhere: a browser
+/// or a WebSDR is seconds behind the clock, frames land nowhere near the grid,
+/// and a window half a second wide around it catches nothing however strong
+/// the signal — the mode simply appears dead. So each submode also carries an
+/// offset, learned from the audio by [`measure_offset`] when several cycles in
+/// a row come back empty, and the window is shifted by it.
+///
+/// Nothing about that disturbs a working radio. The offset starts at zero and
+/// only moves on the evidence of a decoded frame, so a band that is merely
+/// quiet leaves it alone; a move under half a second is ignored as jitter; and
+/// the search is rate-limited to one wide pass a minute across every submode,
+/// so the cost on a silent band is one extra decode a minute rather than one
+/// per cycle. The search itself emits nothing — it is a measurement, and
+/// letting it print would double up whatever the next ordinary pass finds.
+///
+/// What a locked stream costs is honesty about *when*: a delay of more than one
+/// period is indistinguishable from a shorter one, since every cycle looks like
+/// the last, so decodes off a badly delayed stream are stamped a whole number
+/// of cycles late.
 fn spawn_js8(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<protocol::Decode>>) {
     thread::spawn(move || {
         // next cycle-start (UTC seconds) to decode, per mode
@@ -440,6 +461,12 @@ fn spawn_js8(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<proto
         let ready = |m: &ModeId| m.chunk_secs() + 1.0; // frame done, plus slack
         let mut next: Vec<f64> =
             modes.iter().map(|m| (unix_now() / period(m)).floor() * period(m)).collect();
+        // How late each mode's frames arrive, learned from the audio. Zero is
+        // the cycle grid, which is right for a radio and is where every mode
+        // starts; see `measure_offset`.
+        let mut offset = vec![0.0f64; modes.len()];
+        let mut dead = vec![0usize; modes.len()];
+        let mut last_search = unix_now();
 
         loop {
             let now = unix_now();
@@ -461,14 +488,16 @@ fn spawn_js8(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<proto
             let cycle_start = next[best];
             next[best] += period(&mode);
 
-            let wait = cycle_start + ready(&mode) - unix_now();
+            let wait = cycle_start + offset[best] + ready(&mode) - unix_now();
             if wait > 0.0 {
                 thread::sleep(Duration::from_secs_f64(wait));
             }
 
-            // half a second either side of the cycle, for clock skew
+            // half a second either side of the cycle, for clock skew — shifted
+            // by however late this mode's frames are actually arriving, which
+            // is zero off a radio and seconds off a stream.
             let (samples, win_start) =
-                slice_around(&buf, cycle_start - 0.5, period(&mode) + 1.0);
+                slice_around(&buf, cycle_start + offset[best] - 0.5, period(&mode) + 1.0);
             if (samples.len() as f64) < mode.chunk_secs() * RATE as f64 {
                 continue;
             }
@@ -477,6 +506,25 @@ fn spawn_js8(buf: Arc<Mutex<AudioBuf>>, modes: Vec<ModeId>, tx: Sender<Vec<proto
                 protocol::decode_all(&samples, BAND.0, BAND.1, &[mode]),
                 win_start,
             );
+
+            // A mode that has gone quiet may have nothing to hear, or may be
+            // looking in the wrong place. The first is far commoner, so this
+            // waits for several dead cycles and then looks at most once a
+            // minute across every mode.
+            dead[best] = if decodes.is_empty() { dead[best] + 1 } else { 0 };
+            if dead[best] >= DEAD_CYCLES && unix_now() - last_search >= SEARCH_INTERVAL_S {
+                last_search = unix_now();
+                if let Some(found) = measure_offset(&buf, mode, period(&mode)) {
+                    // Only a real move. Frames arrive a few tens of
+                    // milliseconds apart from pass to pass, and chasing that
+                    // would rewrite the offset for no gain.
+                    if (found - offset[best]).abs() > 0.5 {
+                        offset[best] = found;
+                        dead[best] = 0;
+                    }
+                }
+            }
+
             if !decodes.is_empty() && tx.send(decodes).is_err() {
                 break; // UI gone
             }
@@ -584,6 +632,67 @@ fn slice_around(buf: &Arc<Mutex<AudioBuf>>, from: f64, secs: f64) -> (Vec<f32>, 
     (b.slice_global(g0, g1), start as f64 / rate)
 }
 
+/// Consecutive dead cycles before a mode goes looking for where its frames
+/// actually are. Three, so an ordinary quiet spell on a real band does not
+/// trigger it.
+const DEAD_CYCLES: usize = 3;
+
+/// Shortest interval between those searches, across all modes.
+///
+/// A search costs one wide decode and finds nothing on a band that simply has
+/// no JS8 on it, which is the common case — so it is rate-limited hard. Once a
+/// minute is far more often than a stream's latency changes.
+const SEARCH_INTERVAL_S: f64 = 60.0;
+
+/// How far a stream may be behind the clock and still be locked onto.
+///
+/// The search looks at one period plus a frame of the most recent audio, so any
+/// delay is found: what a delay of more than a period costs is only that a
+/// decode is stamped a whole number of cycles late, since one cycle looks
+/// exactly like the next.
+const SEARCH_SPAN_S: f64 = 2.0;
+
+/// Where this mode's frames are actually arriving, as a phase within the cycle.
+///
+/// Live audio off a radio arrives as it is heard, and the cycle grid is the
+/// truth. Audio piped from a browser or a WebSDR is *seconds* late, so frames
+/// land nowhere near the grid and the narrow window around it catches nothing —
+/// the mode is silent no matter how strong the signal. This finds them: it
+/// decodes a period-and-a-frame of the most recent audio, where a frame must
+/// be whatever the delay, and reports the phase the newest one arrived at.
+///
+/// Purely observational. It does not assume where in a cycle a transmission
+/// begins, so it cannot be wrong about that convention, and on undelayed audio
+/// it measures the phase real frames already arrive at — which is what the grid
+/// was approximating anyway.
+///
+/// `None` when nothing decodes, and the caller then leaves the offset alone: a
+/// band with no JS8 on it must not move a working one.
+fn measure_offset(buf: &Arc<Mutex<AudioBuf>>, mode: ModeId, period: f64) -> Option<f64> {
+    let span = period + mode.chunk_secs() + SEARCH_SPAN_S;
+    let start_unix = {
+        let b = buf.lock().unwrap();
+        if !b.started() {
+            return None;
+        }
+        b.start_unix()
+    };
+    let (samples, win_start) = slice_around(buf, unix_now() - span, span);
+    if (samples.len() as f64) < mode.chunk_secs() * RATE as f64 {
+        return None;
+    }
+    // The newest frame, so a stream whose latency just changed locks onto where
+    // it is now rather than where it was.
+    let newest = protocol::decode_all(&samples, BAND.0, BAND.1, &[mode])
+        .into_iter()
+        .map(|d| d.time_s)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !newest.is_finite() {
+        return None;
+    }
+    Some((start_unix + win_start + newest).rem_euclid(period))
+}
+
 /// Rebase decode times from window-relative to capture-relative.
 fn shift_times(decodes: Vec<protocol::Decode>, win_start: f64) -> Vec<protocol::Decode> {
     decodes
@@ -679,6 +788,83 @@ mod tests {
             cap
         );
         assert!(b.global_start > 0, "nothing was ever trimmed");
+    }
+
+    /// A stream that is seconds behind the clock is found and reported as the
+    /// phase its frames actually arrive at.
+    ///
+    /// This is the whole of the auto-lock's cleverness. The rest is applying
+    /// the number, and the number is measured rather than assumed: the test
+    /// places a frame at an arbitrary delay and expects that delay back.
+    #[test]
+    fn a_delayed_stream_is_located() {
+        use ragchew::js8::message::{self, IType};
+        use ragchew::js8::modem;
+
+        let mode = ModeId::Js8(ragchew::js8::Mode::Normal);
+        let period = 15.0;
+        // Deliberately not a whole second and not near a cycle boundary, so
+        // nothing can pass by rounding to the grid it is supposed to ignore.
+        let delay = 6.37;
+        let span = period + mode.chunk_secs() + SEARCH_SPAN_S;
+        let total = span + 4.0;
+
+        let (a87, _) = message::freetext("DE W1AW EM73", IType::None);
+        let frame = modem::encode_audio(&a87, 1500.0);
+
+        // A quiet band rather than a dead one: the Costas sync score is a
+        // ratio against the other tones, and digital silence gives it nothing
+        // to divide by.
+        let mut seed = 0x5EEDu64;
+        let noise: Vec<f32> = (0..(total * RATE as f64) as usize)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((seed >> 40) as f32 / (1u32 << 24) as f32 - 0.5) * 0.02
+            })
+            .collect();
+
+        let buf = Arc::new(Mutex::new(AudioBuf::new(RATE as usize * 120)));
+        {
+            let mut b = buf.lock().unwrap();
+            b.append(&noise);
+            // Anchor the buffer so its newest sample is about now, which is
+            // where `measure_offset` looks.
+            let now = unix_now();
+            b.start_unix = now - total;
+            // The latest whole frame that fits inside the window the search
+            // will ask for, at the phase a stream this late would deliver.
+            let target = now - mode.chunk_secs() - 1.0;
+            let at_unix = ((target - delay) / period).floor() * period + delay;
+            let at = ((at_unix - b.start_unix) * RATE as f64) as usize;
+            for (i, s) in frame.iter().enumerate() {
+                if at + i < b.samples.len() {
+                    b.samples[at + i] += s * 0.5;
+                }
+            }
+        }
+
+        let got = measure_offset(&buf, mode, period).expect("the frame is in there to be found");
+        assert!(
+            (got - delay).abs() < 0.25,
+            "frames arrive at {delay} s into the cycle; measured {got}"
+        );
+    }
+
+    /// A band with no JS8 on it reports nothing, so a mode that is merely quiet
+    /// keeps the offset it has. A search that guessed here would walk a working
+    /// radio off its own frames.
+    #[test]
+    fn silence_moves_nothing() {
+        let mode = ModeId::Js8(ragchew::js8::Mode::Normal);
+        let period = 15.0;
+        let total = period + mode.chunk_secs() + SEARCH_SPAN_S + 4.0;
+        let buf = Arc::new(Mutex::new(AudioBuf::new(RATE as usize * 120)));
+        {
+            let mut b = buf.lock().unwrap();
+            b.append(&vec![0.0f32; (total * RATE as f64) as usize]);
+            b.start_unix = unix_now() - total;
+        }
+        assert!(measure_offset(&buf, mode, period).is_none());
     }
 
     /// Thirty advertised PCMs come down to the handful a person would

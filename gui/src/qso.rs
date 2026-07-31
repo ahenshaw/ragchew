@@ -58,13 +58,15 @@ pub struct Entry {
 /// transcription, not invention, which is the whole test for whether this
 /// should happen at all.
 ///
-/// The keyboard modes get nothing, on purpose. RST and RSQ are not determined
-/// by an SNR: readability and tone quality are separate judgements, and the
-/// strength digit is conventionally read off a meter rather than off the audio.
-/// An operator sending a courtesy 599 is making a choice, and a log has to
-/// record the choice they made rather than a number this crate invented for
-/// them. The measured figure is on the panel beside the field for them to use
-/// as they see fit.
+/// The keyboard modes get nothing, and this is settled rather than pending.
+/// RST and RSQ are not determined by an SNR: readability and tone quality are
+/// separate judgements, and the strength digit is conventionally read off a
+/// meter rather than off the audio. An operator sending a courtesy 599 is
+/// making a choice, and a log has to record the choice they made rather than a
+/// number this crate invented for them. The measured figure is on the panel
+/// beside the field for them to use as they see fit.
+///
+/// So do not add a derived RSQ here. It was considered and ruled out.
 pub fn suggested_report(mode: ModeId, snr_db: f32) -> Option<String> {
     match mode {
         // Two digits and a sign, as JS8Call and WSJT-X write it: "-05", "+13".
