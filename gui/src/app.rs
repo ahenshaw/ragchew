@@ -2137,7 +2137,12 @@ impl App {
         let mut demo_request: Option<bool> = None; // Some(weak?)
         let mut go_live = false;
         let mut record_toggled = false;
-        let mut want_record = self.record;
+        // What is *actually* being recorded, not what was last asked for, so
+        // the button and the menu entry cannot disagree — and so a recording
+        // that failed to start unticks itself rather than sitting there
+        // claiming to be running.
+        let mut want_record =
+            if live { live_recording.is_some() } else { self.record };
         let mut csv_toggled = false;
         let mut want_csv = crate::traffic::is_on();
         egui::Panel::top("bar").show(ui, |ui| {
@@ -2390,10 +2395,45 @@ impl App {
                     // Recording is easy to leave on by accident and expensive
                     // when you do, so it says so on the bar rather than only
                     // inside the menu that started it.
+                    let red = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 120, 120));
+                    let recording = live_recording.is_some();
+                    let dot = egui::RichText::new("⏺")
+                        .color(if recording { red } else { ui.visuals().text_color() });
+                    if ui
+                        .selectable_label(recording, dot)
+                        .on_hover_text(if recording {
+                            "stop recording"
+                        } else {
+                            "record this session to disk — the audio the decoders see, \
+                             about 86 MB an hour"
+                        })
+                        .clicked()
+                    {
+                        want_record = !recording;
+                        record_toggled = true;
+                    }
                     if let Some((path, secs, bytes)) = &live_recording {
-                        let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 120, 120));
-                        ui.colored_label(c, format!("⏺ {} · {:.0} MB", hms(*secs), *bytes as f64 / 1e6))
-                            .on_hover_text(path.as_str());
+                        // A fixed slot. The readout gains a digit as the hours
+                        // and the megabytes climb, and without one everything
+                        // to its right along the bar is shoved along with it —
+                        // once an hour, and again every time the size crosses a
+                        // power of ten.
+                        let font = egui::TextStyle::Body.resolve(ui.style());
+                        let w = ui
+                            .painter()
+                            .layout_no_wrap(
+                                "00:00:00 · 8888 MB".to_owned(),
+                                font,
+                                Color32::PLACEHOLDER,
+                            )
+                            .size()
+                            .x;
+                        let text = format!("{} · {:.0} MB", hms(*secs), *bytes as f64 / 1e6);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(w, ui.spacing().interact_size.y),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| ui.colored_label(red, text).on_hover_text(path.as_str()),
+                        );
                     }
                 } else {
                     // Playable as soon as there is a waterfall to play; the scan
