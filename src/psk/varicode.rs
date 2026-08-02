@@ -235,52 +235,88 @@ const IDLE_RUN: usize = 4;
 /// and what an operator sends while thinking. Counting it as failed words
 /// buries a real signal's framing ratio under its own silence.
 pub fn decode_framed(bits: &[u8]) -> (Vec<Decoded>, Framing) {
-    let mut out = Vec::new();
-    let mut f = Framing::default();
-    let mut run = 0usize;
-    let mut cur = String::new();
-    let mut prev_zero = false;
-    let mut synced = false;
+    let mut s = Stream::new();
+    let out = bits.iter().filter_map(|&b| s.push(b)).collect();
+    (out, s.framing)
+}
 
-    for (i, &b) in bits.iter().enumerate() {
-        if b != 0 {
-            if (2..IDLE_RUN).contains(&run) && synced {
-                f.gaps += 1;
-                if run == 2 {
-                    f.tight_gaps += 1;
-                }
-            }
-            run = 0;
-            cur.push('1');
-            prev_zero = false;
-            continue;
-        }
-        run += 1;
-        if prev_zero {
-            // The second zero of a run: a separator, whatever came before it.
-            if !cur.is_empty() {
-                // `cur` ends with the separator's first zero.
-                if synced {
-                    let code = &cur[..cur.len() - 1];
-                    f.words += 1;
-                    f.word_bits += code.len();
-                    if let Some(ch) = char_of(code) {
-                        f.valid += 1;
-                        out.push(Decoded { bit: i, ch });
-                    }
-                }
-                cur.clear();
-            }
-            synced = true;
-        } else {
-            prev_zero = true;
-            // Leading zeros are idle, not part of any character.
-            if !cur.is_empty() {
-                cur.push('0');
-            }
-        }
+/// The same framing, one bit at a time.
+///
+/// A block decoder has the whole bit stream in front of it; a receiver locked
+/// to a live carrier has one bit and whatever it remembers. Both need to frame
+/// varicode by exactly the same rules — where a character ends, what counts as
+/// idle rather than a failed word, and that the bits before the first separator
+/// are thrown away — so [`decode_framed`] is written in terms of this rather
+/// than beside it. Two implementations of a rule this fiddly would not stay
+/// the same rule for long.
+#[derive(Clone, Debug, Default)]
+pub struct Stream {
+    cur: String,
+    run: usize,
+    prev_zero: bool,
+    synced: bool,
+    n: usize,
+    /// How what has gone past frames, for the gate to weigh.
+    pub framing: Framing,
+}
+
+impl Stream {
+    pub fn new() -> Stream {
+        Stream::default()
     }
-    (out, f)
+
+    /// Feed one bit; yields a character when one completes.
+    ///
+    /// The index in the returned [`Decoded`] counts bits since this stream
+    /// began, so a caller that knows when its first bit was on the air knows
+    /// when the character was.
+    pub fn push(&mut self, bit: u8) -> Option<Decoded> {
+        let i = self.n;
+        self.n += 1;
+        if bit != 0 {
+            if (2..IDLE_RUN).contains(&self.run) && self.synced {
+                self.framing.gaps += 1;
+                if self.run == 2 {
+                    self.framing.tight_gaps += 1;
+                }
+            }
+            self.run = 0;
+            self.cur.push('1');
+            self.prev_zero = false;
+            return None;
+        }
+        self.run += 1;
+        if !self.prev_zero {
+            self.prev_zero = true;
+            // Leading zeros are idle, not part of any character.
+            if !self.cur.is_empty() {
+                self.cur.push('0');
+            }
+            return None;
+        }
+        // The second zero of a run: a separator, whatever came before it.
+        let mut got = None;
+        if !self.cur.is_empty() {
+            // `cur` ends with the separator's first zero.
+            if self.synced {
+                let code = &self.cur[..self.cur.len() - 1];
+                self.framing.words += 1;
+                self.framing.word_bits += code.len();
+                if let Some(ch) = char_of(code) {
+                    self.framing.valid += 1;
+                    got = Some(Decoded { bit: i, ch });
+                }
+            }
+            self.cur.clear();
+        }
+        self.synced = true;
+        got
+    }
+
+    /// Bits pushed so far.
+    pub fn bits(&self) -> usize {
+        self.n
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +409,54 @@ mod tests {
         assert_eq!(idled.valid_ratio(), 1.0, "idle counted against the words");
         assert_eq!(idled.tight_ratio(), 1.0, "idle counted as a loose gap");
         assert_eq!(idled.words, clean.words, "idle invented words");
+    }
+
+    /// A receiver that sees the bits one at a time frames them exactly as a
+    /// block decoder with all of them in front of it does — same characters,
+    /// same bit indices, same framing counters.
+    ///
+    /// [`decode_framed`] is written in terms of [`Stream`], so this cannot fail
+    /// by the two drifting apart. What it does guard is the refactor that
+    /// merged them: it pins the equivalence against inputs — idle, a joined
+    /// stream, three-zero runs, an empty one — whose handling is exactly what a
+    /// hand-rolled second implementation would have got subtly wrong.
+    #[test]
+    fn one_bit_at_a_time_frames_the_same_as_a_whole_block() {
+        let mut seed = 0x1234_5678u64;
+        let mut noise_bits = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((seed >> 60) & 1) as u8
+                })
+                .collect()
+        };
+
+        let text = encode("cq de w1aw, 599 k");
+        let cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0; 12],                                    // pure idle
+            vec![1; 12],                                    // a steady carrier
+            text.clone(),                                   // clean text
+            [vec![0; 8], text.clone(), vec![0; 8]].concat(), // idle either side
+            text[3..].to_vec(),                             // joined mid-character
+            [text.clone(), vec![0, 0, 0], text.clone()].concat(), // a three-zero run
+            noise_bits(500),                                // nonsense
+        ];
+
+        for (i, bits) in cases.iter().enumerate() {
+            let (want, want_framing) = decode_framed(bits);
+            let mut s = Stream::new();
+            let got: Vec<Decoded> = bits.iter().filter_map(|&b| s.push(b)).collect();
+            assert_eq!(got, want, "case {i}: characters differ");
+            assert_eq!(s.bits(), bits.len(), "case {i}: bit count");
+            let (g, w) = (s.framing, want_framing);
+            assert_eq!(
+                (g.words, g.valid, g.gaps, g.tight_gaps, g.word_bits),
+                (w.words, w.valid, w.gaps, w.tight_gaps, w.word_bits),
+                "case {i}: framing differs"
+            );
+        }
     }
 
     /// A receiver joins mid-transmission and after idle: both must resynchronise

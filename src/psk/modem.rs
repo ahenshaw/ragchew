@@ -309,7 +309,7 @@ fn envelope_score(bb: &[Complex32]) -> f64 {
 /// way and the mean magnitude goes to 1, while random phase averages towards
 /// zero as `1/sqrt(symbols)`. The angle that survives is twice the per-symbol
 /// phase step, which is the residual carrier error.
-fn concentration(syms: &[Complex32]) -> (f64, f64) {
+pub(super) fn concentration(syms: &[Complex32]) -> (f64, f64) {
     let mut sum = Complex32::new(0.0, 0.0);
     let mut n = 0.0f64;
     for k in 1..syms.len() {

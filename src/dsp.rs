@@ -274,9 +274,76 @@ pub fn hann(n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// A Hann-windowed sinc low-pass of `n` taps, cutting off at `fc` in cycles
+/// per sample (so `0.5` is Nyquist), normalised to unity gain at DC.
+///
+/// The transition band is roughly `4/n` wide in the same units, which is what
+/// sets the tap count when a decimator has to put everything above the new
+/// Nyquist below the noise before it can fold.
+pub fn low_pass(n: usize, fc: f64) -> Vec<f32> {
+    let n = n.max(1);
+    let mid = (n - 1) as f64 / 2.0;
+    let w = hann(n + 1); // periodic Hann of n+1 has no zero at its right edge
+    let mut h: Vec<f32> = (0..n)
+        .map(|i| {
+            let x = i as f64 - mid;
+            let sinc = if x.abs() < 1e-9 {
+                2.0 * fc
+            } else {
+                (std::f64::consts::TAU * fc * x).sin() / (std::f64::consts::PI * x)
+            };
+            (sinc * w[i] as f64) as f32
+        })
+        .collect();
+    let sum: f32 = h.iter().sum();
+    if sum.abs() > 0.0 {
+        for t in &mut h {
+            *t /= sum;
+        }
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decimator's filter has to actually stop what it claims to, or
+    /// everything above the new Nyquist folds back onto the signal.
+    ///
+    /// The numbers are the PSK31 receiver's: 31.25 baud, decimated to sixteen
+    /// samples a symbol (500 Hz, so a 250 Hz Nyquist), with the signal
+    /// occupying about ±31 Hz of its carrier. The cutoff sits midway between
+    /// the two, which is what leaves the passband flat over the signal *and*
+    /// the stopband clear before anything can fold.
+    #[test]
+    fn the_low_pass_passes_and_stops() {
+        let (n, fc) = (289, 4.6 * 31.25 / 12_000.0); // 144 Hz at 12 kHz
+        let h = low_pass(n, fc);
+        // Response at a normalised frequency, in dB.
+        let at = |f: f64| {
+            let mut re = 0.0f64;
+            let mut im = 0.0f64;
+            for (k, &t) in h.iter().enumerate() {
+                let p = std::f64::consts::TAU * f * k as f64;
+                re += t as f64 * p.cos();
+                im -= t as f64 * p.sin();
+            }
+            20.0 * (re * re + im * im).sqrt().log10()
+        };
+        assert!(at(0.0).abs() < 0.01, "DC gain is {} dB, not unity", at(0.0));
+        // Flat where the signal is: +-31 Hz, and its skirts out to +-47.
+        for hz in [10.0, 20.0, 31.25, 47.0] {
+            let d = at(hz / 12_000.0);
+            assert!(d > -0.5, "passband droop {d} dB at {hz} Hz");
+        }
+        // Dead by the decimated Nyquist, and everything past it, or aliasing
+        // folds it back onto the signal.
+        for hz in [250.0, 400.0, 1000.0, 3000.0, 5000.0] {
+            let d = at(hz / 12_000.0);
+            assert!(d < -60.0, "only {d} dB down at {hz} Hz");
+        }
+    }
 
     /// White noise at a known level, plus a tone scaled to sit a stated number
     /// of dB above it in [`SNR_REF_BW_HZ`].

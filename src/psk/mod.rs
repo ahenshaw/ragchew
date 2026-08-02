@@ -57,6 +57,7 @@
 
 pub mod mode;
 pub mod modem;
+pub mod rx;
 pub mod varicode;
 
 pub use mode::{parse, Mode, COMMON, PSK125, PSK31, PSK63};
