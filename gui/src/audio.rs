@@ -697,16 +697,7 @@ fn spawn_continuous(
             let fresh: Vec<protocol::Decode> =
                 shift_times(protocol::decode_all(&samples, BAND.0, BAND.1, &modes), win_start)
                     .into_iter()
-                    .filter(|d| {
-                        // The same block decoded in the previous window comes
-                        // back at the same time and frequency, give or take the
-                        // sync search's resolution.
-                        !seen.iter().any(|&(m, hz, t)| {
-                            m == d.mode
-                                && (hz - d.hz).abs() < d.mode.bandwidth_hz() / 2.0
-                                && (t - d.time_s).abs() < d.mode.chunk_secs() / 2.0
-                        })
-                    })
+                    .filter(|d| !already_reported(&seen, d))
                     .collect();
 
             seen.extend(fresh.iter().map(|d| (d.mode, d.hz, d.time_s)));
@@ -909,6 +900,27 @@ impl Snapshot {
     }
 }
 
+/// Whether `d` is something already sent to the interface.
+///
+/// Windows overlap heavily on purpose, so the same block of audio is decoded
+/// several times over and the repeats have to be recognised: the same
+/// transmission comes back at the same time and frequency, give or take the
+/// sync search's resolution.
+///
+/// The time tolerance is [`ModeId::dup_tol_s`] rather than half a chunk. Half a
+/// chunk is right for a mode whose chunks are all one length; for PSK, whose
+/// characters vary from one bit to ten, it is an *average* that exceeds the gap
+/// between the closest pair of real characters — so it discarded a decode's
+/// neighbour as if it were the decode, and live PSK31 lost a space wherever two
+/// windows overlapped.
+fn already_reported(seen: &[(ModeId, f64, f64)], d: &protocol::Decode) -> bool {
+    seen.iter().any(|&(m, hz, t)| {
+        m == d.mode
+            && (hz - d.hz).abs() < d.mode.bandwidth_hz() / 2.0
+            && (t - d.time_s).abs() < d.mode.dup_tol_s()
+    })
+}
+
 /// Audio window a continuous-mode pass looks at. It must hold several FEC
 /// blocks of the slowest Olivia mode for that decoder to sync at all, which is
 /// also comfortably several of PSK31's 8.2-second analysis blocks.
@@ -1107,6 +1119,46 @@ mod tests {
             cap
         );
         assert!(b.global_start > 0, "nothing was ever trimmed");
+    }
+
+    /// A live scan must drop a repeat and keep a neighbour, and for PSK those
+    /// are only a few tens of milliseconds apart.
+    ///
+    /// The case that was wrong: `w` at some instant, then a space three symbols
+    /// later — the closest two real PSK31 characters can be. The old rule
+    /// called the space a repeat of the `w` and dropped it, so live text ran
+    /// its words together where two scan windows overlapped, while the same
+    /// audio played from a file read correctly.
+    #[test]
+    fn a_repeat_is_dropped_and_a_neighbour_is_kept() {
+        let mode = ModeId::Psk(ragchew::psk::PSK31);
+        let baud = ragchew::psk::PSK31.baud();
+        let at = |t: f64, text: &str| protocol::Decode {
+            mode,
+            hz: 1500.0,
+            time_s: t,
+            quality: 3.0,
+            snr_db: None,
+            text: text.to_string(),
+        };
+
+        let seen = vec![(mode, 1500.0, 10.0)];
+
+        // The same character, found again by the next overlapping window.
+        assert!(already_reported(&seen, &at(10.0, "w")), "a repeat was not recognised");
+        assert!(already_reported(&seen, &at(10.005, "w")), "a repeat a few ms off was kept");
+
+        // Its neighbour: a space, three symbols later. Nothing real is closer.
+        let closest = 3.0 / baud;
+        assert!(
+            !already_reported(&seen, &at(10.0 + closest, " ")),
+            "the next character was dropped as a repeat of the one before it"
+        );
+
+        // A different station at the same instant is not the same decode.
+        let mut elsewhere = at(10.0, "w");
+        elsewhere.hz = 1700.0;
+        assert!(!already_reported(&seen, &elsewhere), "two stations were merged");
     }
 
     /// Lag measures what it claims to: the gap between how much audio has

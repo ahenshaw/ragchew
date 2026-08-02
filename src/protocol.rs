@@ -109,6 +109,33 @@ impl ModeId {
         }
     }
 
+    /// How far apart in time two decodes at the same frequency may be and still
+    /// be one transmission reported twice.
+    ///
+    /// The time analogue of [`assoc_tol_hz`](Self::assoc_tol_hz), and it exists
+    /// because a live scan re-reads overlapping windows: the same block of
+    /// audio is decoded several times over and the repeats have to be
+    /// recognised. Too tight and text is doubled; too loose and a decode's
+    /// *neighbour* is mistaken for the decode itself and thrown away.
+    ///
+    /// Half a chunk suits a mode whose chunks all take the same time. It does
+    /// not suit PSK, whose "chunk" is a character of *variable* length: the
+    /// figure is an average, while the shortest character — a space, one bit —
+    /// completes three symbols after the one before it, which is less than half
+    /// an average character. Half a chunk therefore swallows every short
+    /// character in a re-read stretch, which is what it was doing: live PSK31
+    /// lost a space wherever two scans overlapped.
+    ///
+    /// So PSK gets one symbol, comfortably inside the three that separate the
+    /// closest pair of real characters. `psk_dedup_survives_adjacent_characters`
+    /// derives that bound from the varicode table rather than assuming it.
+    pub fn dup_tol_s(self) -> f64 {
+        match self {
+            ModeId::Psk(m) => 1.0 / m.baud(),
+            _ => self.chunk_secs() / 2.0,
+        }
+    }
+
     /// Transmission period in seconds for modes that live on a UTC grid; `None`
     /// for continuous modes, which start whenever the operator does.
     pub fn period_s(self) -> Option<u32> {
@@ -407,6 +434,51 @@ fn arbitrate_psk(found: Vec<Decode>, others: &[Decode]) -> Vec<Decode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The duplicate window must be narrower than the closest two real PSK
+    /// characters can be, or a live scan throws away a character every time its
+    /// windows overlap.
+    ///
+    /// The bound is derived from the varicode table, not assumed: a code is at
+    /// least one bit and every code is followed by the two-bit separator, so
+    /// consecutive characters complete at least three symbols apart. The old
+    /// rule — half a chunk, where a PSK chunk is an *average* character of 6.5
+    /// symbols — was 3.25, above that bound, and so ate short characters. A
+    /// space is one bit, which is why spaces were what went missing.
+    #[test]
+    fn psk_dedup_survives_adjacent_characters() {
+        let shortest = crate::psk::varicode::VARICODE
+            .iter()
+            .map(|(_, code)| code.len())
+            .min()
+            .expect("the table is not empty");
+        assert_eq!(shortest, 1, "a one-bit code is the case this is all about");
+        let closest_symbols = (shortest + 2) as f64; // its separator follows it
+
+        for m in [crate::psk::PSK31, crate::psk::PSK63, crate::psk::PSK125] {
+            let mode = ModeId::Psk(m);
+            let closest_s = closest_symbols / m.baud();
+            assert!(
+                mode.dup_tol_s() < closest_s,
+                "{}: a {:.0} ms window would swallow characters {:.0} ms apart",
+                mode.name(),
+                mode.dup_tol_s() * 1e3,
+                closest_s * 1e3
+            );
+            // And the rule it replaced would not have.
+            assert!(
+                mode.chunk_secs() / 2.0 > closest_s,
+                "{}: half a chunk no longer overlaps, so this test guards nothing",
+                mode.name()
+            );
+        }
+
+        // The block-decoded modes keep half a chunk, whose chunks are all the
+        // same length, so nothing about them changes.
+        for m in Protocol::Olivia.modes() {
+            assert_eq!(m.dup_tol_s(), m.chunk_secs() / 2.0);
+        }
+    }
 
     #[test]
     fn default_modes_cover_both_protocols() {
