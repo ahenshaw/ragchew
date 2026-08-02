@@ -6,6 +6,7 @@
 
 pub mod channels;
 pub mod colormap;
+pub mod continuous;
 pub mod demo;
 pub mod diag;
 pub mod layout;

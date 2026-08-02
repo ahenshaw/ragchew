@@ -105,6 +105,17 @@ pub struct Rx {
     last_sym_offset: usize,
 }
 
+/// Input samples a receiver needs before it reports anything: the symbols it
+/// places its clock over, plus the filters' warm-up.
+///
+/// A caller that has to know where a receiver becomes authoritative — because
+/// something else is covering the audio until then — asks for this rather than
+/// assuming. It must be fed signal throughout, not silence: the clock is placed
+/// on whatever is there.
+pub fn lock_samples(mode: Mode) -> usize {
+    (ACQUIRE_SYMBOLS + 4) * mode.symbol_samples()
+}
+
 impl Rx {
     /// Open a receiver on `hz`. `at` is the input sample offset the first
     /// sample handed to [`feed`](Self::feed) will have.
