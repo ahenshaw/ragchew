@@ -14,6 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ragchew::protocol::{self, ModeId};
 use ragchew::spectrogram::WINDOW;
 
+use crate::continuous::Continuous;
 use crate::diag::{self, Health, RunningGuard, ThreadHealth};
 use crate::record::Tap;
 use crate::traffic;
@@ -657,15 +658,20 @@ fn spawn_js8(
     }
 }
 
-/// Rolling-window decoding for the modes that run continuously.
+/// Live decoding of the modes that run continuously.
 ///
-/// Neither Olivia nor PSK31 tells you where a transmission starts, so there is
-/// nothing to align to: the last [`CONTINUOUS_WINDOW_S`] seconds are simply
-/// re-scanned every [`CONTINUOUS_STEP_S`]. Windows overlap heavily, both so a
-/// block straddling a boundary is not lost and because either decoder needs
-/// several consecutive blocks in view before it will trust a signal — so the
-/// same block gets decoded repeatedly and duplicates are filtered on the way
-/// out.
+/// The work is [`Continuous`], which acquires PSK stations on a block scan and
+/// then tracks them with a streaming receiver so their text arrives at the rate
+/// it was typed. This thread's whole job is to hand it *contiguous* audio: a
+/// receiver's timing and phase loops carry from one call to the next, so a gap
+/// in the stream is a gap in its lock.
+///
+/// That is the change from what came before, which asked the buffer for the
+/// last twenty-four seconds every four and let the overlap sort itself out.
+/// Here the thread remembers where it has read up to and takes only what has
+/// arrived since. Olivia is unaffected in substance — same window, same
+/// cadence, same gate — but it now reaches the interface through `Continuous`
+/// rather than through a scan written out here.
 fn spawn_continuous(
     buf: Arc<Mutex<AudioBuf>>,
     modes: Vec<ModeId>,
@@ -675,34 +681,51 @@ fn spawn_continuous(
     let spawned = thread::Builder::new().name("ragchew-cont".into()).spawn(move || {
         let guard = RunningGuard::new(health, |h| &h.continuous);
         let stats = guard.stats();
-        let mut seen: Vec<(ModeId, f64, f64)> = Vec::new(); // (mode, hz, time_s)
-        // Stretches past CONTINUOUS_STEP_S on a machine — or in a build — that
-        // cannot scan the band in that long. See the back-off below.
-        let mut step = CONTINUOUS_STEP_S;
+        let mut cont = Continuous::new(modes.clone(), BAND);
+        // Global index of the next sample to read, and the wall-clock-relative
+        // time of the sample the decoder counts from, so its times come back
+        // capture-relative like every other decode's.
+        let mut next_g: Option<u64> = None;
+        let mut origin_s = 0.0f64;
+
         loop {
-            thread::sleep(Duration::from_secs_f64(step));
+            thread::sleep(Duration::from_secs_f64(FEED_STEP_S));
             let pass = std::time::Instant::now();
-            let now = match buf.lock().unwrap().started() {
-                true => unix_now(),
-                false => continue,
+
+            let (samples, restart_at) = {
+                let b = buf.lock().unwrap();
+                if !b.started() {
+                    continue;
+                }
+                // A hole in the stream if the buffer has rolled past where we
+                // had read to. A receiver cannot be carried across one:
+                // pretending otherwise reads the gap as a step in phase and
+                // timing, and it never recovers.
+                let restart = next_g.is_none_or(|g| g < b.global_start());
+                let g0 = if restart { b.global_start() } else { next_g.unwrap() };
+                let g1 = b.global_len();
+                next_g = Some(g1);
+                (b.slice_global(g0, g1), restart.then_some(g0))
             };
-            stats.pass_begun();
-            let (samples, win_start) =
-                slice_around(&buf, now - CONTINUOUS_WINDOW_S, CONTINUOUS_WINDOW_S);
-            if samples.len() < RATE as usize {
+
+            if let Some(g0) = restart_at {
+                if origin_s != 0.0 {
+                    diag_warn!(
+                        "cont",
+                        "the audio buffer overran the decoder; its receivers are being \
+                         restarted and the audio they missed is gone"
+                    );
+                }
+                cont = Continuous::new(modes.clone(), BAND);
+                origin_s = g0 as f64 / RATE as f64;
+            }
+            if samples.is_empty() {
                 Health::bump(&stats.short, 1);
                 continue;
             }
 
-            let fresh: Vec<protocol::Decode> =
-                shift_times(protocol::decode_all(&samples, BAND.0, BAND.1, &modes), win_start)
-                    .into_iter()
-                    .filter(|d| !already_reported(&seen, d))
-                    .collect();
-
-            seen.extend(fresh.iter().map(|d| (d.mode, d.hz, d.time_s)));
-            let cutoff = win_start - CONTINUOUS_WINDOW_S;
-            seen.retain(|&(_, _, t)| t >= cutoff);
+            stats.pass_begun();
+            let fresh = shift_times(cont.feed(&samples), origin_s);
             stats.pass_done(pass.elapsed().as_secs_f64() * 1e3);
 
             if !fresh.is_empty() {
@@ -727,21 +750,34 @@ fn spawn_continuous(
             }
 
             // Scanning six Olivia modes across the whole band costs 3.5 s in a
-            // release build and forty in a debug one, against a 4 s step —
-            // PSK31 adds a couple of milliseconds a block to that and is not
-            // what makes this expensive. Left
-            // alone the thread runs flat out for ever, and the interface —
-            // sharing a CPU and a buffer lock with it — stops answering. The
-            // step therefore stretches to whatever the pass actually cost:
-            // decoding takes at most half the wall clock, and at 24 s windows
-            // there is still overlap to spare.
-            step = CONTINUOUS_STEP_S.max(pass.elapsed().as_secs_f64());
+            // release build and forty in a debug one. Left alone the thread
+            // runs flat out for ever, and the interface — sharing a CPU and a
+            // buffer lock with it — stops answering. So it yields for as long
+            // as the pass overran, holding decoding to half the wall clock.
+            //
+            // Falling behind now costs latency rather than coverage: the audio
+            // waits in the buffer and is read whole on the next pass, where the
+            // sliding window this replaced simply missed whatever it stepped
+            // over.
+            let owed = pass.elapsed().as_secs_f64() - FEED_STEP_S;
+            if owed > 0.0 {
+                thread::sleep(Duration::from_secs_f64(owed));
+            }
         }
     });
     if let Err(e) = spawned {
         diag_warn!("decode", "could not spawn the continuous thread: {e}");
     }
 }
+
+/// How often the continuous thread collects new audio.
+///
+/// Short, because a streaming receiver can only report a character once the
+/// audio carrying it has been handed over, so this is the floor on how promptly
+/// that happens. It is not the cost of decoding: acquisition keeps its own
+/// four-second cadence inside [`Continuous`], and a pass that merely feeds
+/// receivers is a few milliseconds.
+const FEED_STEP_S: f64 = 0.25;
 
 // ---- the heartbeat ----
 
@@ -899,37 +935,6 @@ impl Snapshot {
         }
     }
 }
-
-/// Whether `d` is something already sent to the interface.
-///
-/// Windows overlap heavily on purpose, so the same block of audio is decoded
-/// several times over and the repeats have to be recognised: the same
-/// transmission comes back at the same time and frequency, give or take the
-/// sync search's resolution.
-///
-/// The time tolerance is [`ModeId::dup_tol_s`] rather than half a chunk. Half a
-/// chunk is right for a mode whose chunks are all one length; for PSK, whose
-/// characters vary from one bit to ten, it is an *average* that exceeds the gap
-/// between the closest pair of real characters — so it discarded a decode's
-/// neighbour as if it were the decode, and live PSK31 lost a space wherever two
-/// windows overlapped.
-fn already_reported(seen: &[(ModeId, f64, f64)], d: &protocol::Decode) -> bool {
-    seen.iter().any(|&(m, hz, t)| {
-        m == d.mode
-            && (hz - d.hz).abs() < d.mode.bandwidth_hz() / 2.0
-            && (t - d.time_s).abs() < d.mode.dup_tol_s()
-    })
-}
-
-/// Audio window a continuous-mode pass looks at. It must hold several FEC
-/// blocks of the slowest Olivia mode for that decoder to sync at all, which is
-/// also comfortably several of PSK31's 8.2-second analysis blocks.
-const CONTINUOUS_WINDOW_S: f64 = 24.0;
-
-/// How often a continuous-mode pass runs. Text appears this long after it is
-/// sent, so shorter is livelier — at the cost of re-scanning the band more
-/// often.
-const CONTINUOUS_STEP_S: f64 = 4.0;
 
 /// `secs` seconds of audio starting at UTC time `from`, plus the capture-relative
 /// time of the first sample returned.
@@ -1119,46 +1124,6 @@ mod tests {
             cap
         );
         assert!(b.global_start > 0, "nothing was ever trimmed");
-    }
-
-    /// A live scan must drop a repeat and keep a neighbour, and for PSK those
-    /// are only a few tens of milliseconds apart.
-    ///
-    /// The case that was wrong: `w` at some instant, then a space three symbols
-    /// later — the closest two real PSK31 characters can be. The old rule
-    /// called the space a repeat of the `w` and dropped it, so live text ran
-    /// its words together where two scan windows overlapped, while the same
-    /// audio played from a file read correctly.
-    #[test]
-    fn a_repeat_is_dropped_and_a_neighbour_is_kept() {
-        let mode = ModeId::Psk(ragchew::psk::PSK31);
-        let baud = ragchew::psk::PSK31.baud();
-        let at = |t: f64, text: &str| protocol::Decode {
-            mode,
-            hz: 1500.0,
-            time_s: t,
-            quality: 3.0,
-            snr_db: None,
-            text: text.to_string(),
-        };
-
-        let seen = vec![(mode, 1500.0, 10.0)];
-
-        // The same character, found again by the next overlapping window.
-        assert!(already_reported(&seen, &at(10.0, "w")), "a repeat was not recognised");
-        assert!(already_reported(&seen, &at(10.005, "w")), "a repeat a few ms off was kept");
-
-        // Its neighbour: a space, three symbols later. Nothing real is closer.
-        let closest = 3.0 / baud;
-        assert!(
-            !already_reported(&seen, &at(10.0 + closest, " ")),
-            "the next character was dropped as a repeat of the one before it"
-        );
-
-        // A different station at the same instant is not the same decode.
-        let mut elsewhere = at(10.0, "w");
-        elsewhere.hz = 1700.0;
-        assert!(!already_reported(&seen, &elsewhere), "two stations were merged");
     }
 
     /// Lag measures what it claims to: the gap between how much audio has
