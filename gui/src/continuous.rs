@@ -9,9 +9,9 @@
 //!
 //! So the two are split here:
 //!
-//! * **Acquisition**, every [`ACQ_STEP_S`] over the last [`ACQ_WINDOW_S`], is
-//!   the existing block scan and is unchanged. It is what finds stations, and
-//!   for PSK it is the only thing entitled to an opinion about whether one is
+//! * **Acquisition**, every [`ACQ_STEP_S`] over the last window, is the
+//!   existing block scan and is unchanged. It is what finds stations, and for
+//!   PSK it is the only thing entitled to an opinion about whether one is
 //!   really there — the gate is a statistical test over 256 symbols and cannot
 //!   be applied to a single character. Olivia's decodes come from here.
 //! * **Tracking**: a PSK station the scan has vouched for gets a
@@ -25,6 +25,16 @@
 //! a receiver. Nothing has to arbitrate a character that arrived three seconds
 //! before the Olivia block it would have been weighed against.
 //!
+//! The window is not one length. Olivia's decoder needs several of the slowest
+//! mode's FEC blocks in front of it before it can sync at all, which is where
+//! [`ACQ_WINDOW_S`] comes from; PSK needs one analysis block, 8.2 s at PSK31
+//! and 4.1 at PSK63, because that is the unit its gate is calibrated over. So
+//! the window is taken from the modes actually enabled, and — more to the point
+//! — the *first* scan runs as soon as the buffer holds the shortest of them.
+//! Nothing is emitted before then, so on a PSK-only band that is the whole of
+//! the startup delay, and with Olivia alongside it PSK text still starts at
+//! 8.2 s rather than waiting out a window sized for something else.
+//!
 //! The audio handed to [`Continuous::feed`] must be contiguous: a receiver's
 //! loops carry across calls, so a gap in the stream is a gap in its lock.
 
@@ -32,14 +42,28 @@ use ragchew::protocol::{self, Decode, ModeId};
 use ragchew::psk;
 use ragchew::SAMPLE_RATE;
 
-/// Audio an acquisition looks at. It must hold several FEC blocks of the
-/// slowest Olivia mode for that decoder to sync at all, which is also several
-/// of PSK31's 8.2-second analysis blocks.
+/// Audio an acquisition looks at for a block-scanned mode. It must hold several
+/// FEC blocks of the slowest Olivia mode for that decoder to sync at all.
 pub const ACQ_WINDOW_S: f64 = 24.0;
 
-/// How often acquisition runs. Olivia text appears this long after it is sent;
-/// PSK no longer waits for it.
+/// How often acquisition runs, at most. Olivia text appears this long after it
+/// is sent; PSK no longer waits for it. A window shorter than twice this is
+/// stepped at half its own length instead, so consecutive scans still overlap
+/// — see [`Continuous::new`].
 pub const ACQ_STEP_S: f64 = 4.0;
+
+/// Audio a mode needs in front of it before a scan can find it at all.
+///
+/// For PSK that is one analysis block — 256 symbols, which is what the gate's
+/// thresholds are calibrated over, and what [`psk::decode_all`] silently skips
+/// a mode for want of. Everything else is scanned over the whole window and
+/// needs all of it.
+fn acq_samples(m: &ModeId) -> usize {
+    match m {
+        ModeId::Psk(p) => p.block_samples(),
+        _ => (ACQ_WINDOW_S * SAMPLE_RATE as f64) as usize,
+    }
+}
 
 /// Acquisitions a PSK station may go unconfirmed before its receiver is closed.
 ///
@@ -87,12 +111,21 @@ struct Station {
 pub struct Continuous {
     modes: Vec<ModeId>,
     band: (f64, f64),
-    /// The acquisition window: the most recent [`ACQ_WINDOW_S`] of audio.
+    /// The acquisition window: the most recent [`Continuous::window`] samples.
     buf: Vec<f32>,
     /// Absolute offset of `buf[0]`.
     at: usize,
     /// Absolute offset at which the next acquisition is due.
     next_acq: usize,
+    /// Audio one acquisition looks at, in samples: what the most demanding
+    /// enabled mode needs.
+    window: usize,
+    /// What the least demanding one needs. Below this a scan can find nothing,
+    /// so there is no point running one; at or above it there is, which is why
+    /// the first scan does not wait for a full window.
+    least: usize,
+    /// How far the window slides between acquisitions.
+    step: usize,
     stations: Vec<Station>,
     /// Decodes already emitted, so overlapping windows do not report the same
     /// thing twice.
@@ -104,12 +137,27 @@ pub struct Continuous {
 
 impl Continuous {
     pub fn new(modes: Vec<ModeId>, band: (f64, f64)) -> Continuous {
+        let full = (ACQ_WINDOW_S * SAMPLE_RATE as f64) as usize;
+        let window = modes.iter().map(acq_samples).max().unwrap_or(full);
+        let least = modes.iter().map(acq_samples).min().unwrap_or(full);
+        // A character straddling the end of one scan's audio has to be whole
+        // inside another's, which within a long window the block scan arranges
+        // for itself by overlapping its blocks by half. A window only one block
+        // long has no room to do that, so the overlap has to come from the
+        // cadence instead: never step by more than half a window. At 24 s this
+        // leaves [`ACQ_STEP_S`] alone; at PSK63's 4.1 s it halves it.
+        let step = ((ACQ_STEP_S * SAMPLE_RATE as f64) as usize).min(window / 2).max(1);
         Continuous {
             modes,
             band,
             buf: Vec::new(),
             at: 0,
-            next_acq: (ACQ_WINDOW_S * SAMPLE_RATE as f64) as usize,
+            // The first scan is due as soon as one can find anything, not when
+            // the window has filled.
+            next_acq: least,
+            window,
+            least,
+            step,
             stations: Vec::new(),
             seen: Vec::new(),
             high_water: Vec::new(),
@@ -132,20 +180,31 @@ impl Continuous {
 
         // Acquisition first, so a station that appears in this stretch of audio
         // gets its receiver before the tracking below feeds it.
-        let window = (ACQ_WINDOW_S * rate) as usize;
-        while self.buf.len() >= window && self.at + window >= self.next_acq {
+        //
+        // A scan looks at a whole window once there is one, and at everything
+        // there is before that. The modes too slow to be found in it are the
+        // ones that decline to decode at all, so an early scan is not a worse
+        // scan — it is the same scan with fewer modes able to answer, and it is
+        // what gets PSK text out at 8.2 s instead of 24.
+        while self.buf.len().min(self.window) >= self.least
+            && self.at + self.buf.len().min(self.window) >= self.next_acq
+        {
             self.acquire(&mut out);
-            self.next_acq += (ACQ_STEP_S * rate) as usize;
-            // Keep exactly the window; anything older cannot be looked at again.
-            let step = (ACQ_STEP_S * rate) as usize;
-            let drop = step.min(self.buf.len());
-            self.buf.drain(..drop);
-            self.at += drop;
+            self.next_acq += self.step;
+            // Keep exactly the window; anything older cannot be looked at
+            // again. Until the buffer has filled there is nothing older, so it
+            // grows into place rather than sliding and each early scan sees a
+            // little more than the last.
+            if self.buf.len() >= self.window {
+                let drop = self.step.min(self.buf.len());
+                self.buf.drain(..drop);
+                self.at += drop;
+            }
         }
-        // Before the buffer has filled, it grows rather than sliding, so it must
-        // still be capped or a capture that never acquires grows without bound.
-        if self.buf.len() > window * 2 {
-            let drop = self.buf.len() - window;
+        // A feed far larger than a window leaves the loop still holding several,
+        // so the buffer is capped rather than trusted to drain a step at a time.
+        if self.buf.len() > self.window * 2 {
+            let drop = self.buf.len() - self.window;
             self.buf.drain(..drop);
             self.at += drop;
         }
@@ -173,7 +232,7 @@ impl Continuous {
     /// The two sources report on very different delays. A tracked receiver
     /// reports a character the moment it finishes, while an acquisition reports
     /// a whole window at once and so hands over decodes up to
-    /// [`ACQ_WINDOW_S`] old. Left alone those interleave: text from half a
+    /// a whole window old. Left alone those interleave: text from half a
     /// minute ago arrives after text from a second ago, and the channels the
     /// interface keeps are explicitly documented to need decodes in time order
     /// — out of order, `ChannelSet` appends to the wrong place and then reads
@@ -237,7 +296,9 @@ impl Continuous {
     /// and open or confirm a receiver for every PSK station it vouched for.
     fn acquire(&mut self, out: &mut Vec<Decode>) {
         let rate = SAMPLE_RATE as f64;
-        let window = (ACQ_WINDOW_S * rate) as usize;
+        // Everything there is, up to a window. Short only while the buffer is
+        // still filling, which is the point.
+        let window = self.buf.len().min(self.window);
         let win_start = self.at as f64 / rate;
 
         // The whole gate, arbitration included, exactly as a file scan runs it.
@@ -350,7 +411,7 @@ impl Continuous {
                 out.push(d);
             }
         }
-        let cutoff = win_start - ACQ_WINDOW_S;
+        let cutoff = win_start - window as f64 / rate;
         self.seen.retain(|(_, _, t)| *t >= cutoff);
 
         self.stations.retain(|s| s.missed <= MISSES_BEFORE_CLOSE);
@@ -361,15 +422,22 @@ impl Continuous {
 mod tests {
     use super::*;
 
-    /// A band with one PSK31 station starting `lead_s` in.
+    /// Noise to put in front of a station: past the window a PSK31-only
+    /// decoder uses, which is one analysis block.
     ///
-    /// The lead has to be longer than [`ACQ_WINDOW_S`] for the test to be
-    /// about anything real: until the buffer has filled, no acquisition has
-    /// run at all, and a station present through that fill is found in one
-    /// gulp by the very first scan. That is a startup transient the app sees
-    /// once. What a monitor actually does for hours afterwards is find a
-    /// station a few seconds after it clears the gate, which is what a lead
-    /// past the window length sets up.
+    /// The lead has to be longer than that window for a test to be about
+    /// anything real. Until the buffer has filled, no acquisition has run at
+    /// all, and a station present through that fill is found in one gulp by the
+    /// very first scan — a startup transient the app sees once, and the subject
+    /// of [`the_first_text_does_not_wait_for_a_window_it_does_not_need`] rather
+    /// than of the tests below. What a monitor actually does for hours
+    /// afterwards is find a station a few seconds after it clears the gate,
+    /// which is what a lead past the window length sets up.
+    fn lead_s() -> f64 {
+        psk::PSK31.block_secs() + 2.0
+    }
+
+    /// A band with one PSK31 station starting `lead_s` in.
     fn band_with_psk(text: &str, hz: f64, lead_s: f64) -> Vec<f32> {
         let sig = psk::encode(text, hz, psk::PSK31);
         let lead = (lead_s * SAMPLE_RATE as f64) as usize;
@@ -386,6 +454,75 @@ mod tests {
         out
     }
 
+    /// Nothing waits for a window sized for a mode that is not enabled.
+    ///
+    /// A PSK31-only decoder can find a station in one analysis block, so that
+    /// — not [`ACQ_WINDOW_S`] — is what the first scan waits for, and on a PSK
+    /// band that wait *is* the startup delay: before this, a monitor started on
+    /// a busy band said nothing for twenty-four seconds and then said all of it
+    /// at once.
+    #[test]
+    fn the_first_text_does_not_wait_for_a_window_it_does_not_need() {
+        let text = "cq cq de w1aw w1aw k  the quick brown fox jumps over the lazy dog  \
+                    de w1aw ur rst 599 599 name andy qth london hw cpy? k  ";
+        // Transmitting almost from the first sample, as a station already in an
+        // over is when the app is started on top of it.
+        let audio = band_with_psk(text, 1500.0, 0.25);
+
+        let mut c = Continuous::new(vec![ModeId::Psk(psk::PSK31)], (300.0, 2600.0));
+        let mut fed = 0usize;
+        let mut first = None;
+        for block in audio.chunks(512) {
+            fed += block.len();
+            let got = c.feed(block);
+            if !got.is_empty() && first.is_none() {
+                first = Some(fed as f64 / SAMPLE_RATE as f64);
+            }
+        }
+
+        let at = first.expect("nothing decoded at all");
+        // One block to find the station, and at worst one more step before the
+        // scan whose window is all signal rather than part lead-in. It measures
+        // 8.19 s — the very first scan finds it — and the headroom is for a
+        // station whose over starts further inside the first block.
+        let bound = psk::PSK31.block_secs() + ACQ_STEP_S + 1.0;
+        assert!(at < bound, "first text after {at:.1}s of audio, wanted under {bound:.1}s");
+    }
+
+    /// The window is what the enabled modes need, and the first scan is what
+    /// the least demanding of them needs.
+    ///
+    /// Mixing the two is the case worth pinning: Olivia still gets its full
+    /// twenty-four seconds, and PSK still does not wait for them. Handing
+    /// Olivia's decoder a short window is safe by the same rule PSK's follows —
+    /// a decoder given less than one block of a mode reports nothing for it,
+    /// rather than reporting something worse.
+    #[test]
+    fn the_window_follows_the_modes_and_the_first_scan_follows_the_quickest() {
+        let secs = |n: usize| n as f64 / SAMPLE_RATE as f64;
+        let psk31 = ModeId::Psk(psk::PSK31);
+        let psk63 = ModeId::Psk(psk::PSK63);
+        let olivia = ModeId::Olivia(ragchew::olivia::OL_8_250);
+
+        let c = Continuous::new(vec![psk31], (300.0, 2600.0));
+        assert_eq!(secs(c.window), psk::PSK31.block_secs());
+        assert_eq!(c.next_acq, c.window, "waited for more than it needed");
+
+        let c = Continuous::new(vec![psk31, psk63], (300.0, 2600.0));
+        assert_eq!(secs(c.window), psk::PSK31.block_secs(), "the slower mode sets the window");
+        assert_eq!(secs(c.next_acq), psk::PSK63.block_secs(), "the quicker one goes first");
+
+        // Half a window at most, so consecutive scans overlap where a single
+        // window is too short for the block scan to overlap inside it.
+        let c = Continuous::new(vec![psk63], (300.0, 2600.0));
+        assert!(secs(c.step) <= psk::PSK63.block_secs() / 2.0, "step {} samples", c.step);
+
+        let c = Continuous::new(vec![psk31, olivia], (300.0, 2600.0));
+        assert_eq!(secs(c.window), ACQ_WINDOW_S, "Olivia lost its window");
+        assert_eq!(secs(c.next_acq), psk::PSK31.block_secs(), "PSK waited for Olivia's window");
+        assert_eq!(secs(c.step), ACQ_STEP_S, "a long window should keep the usual cadence");
+    }
+
     /// The point of the whole exercise: text arrives spread across the capture
     /// instead of a block at a time.
     ///
@@ -397,7 +534,7 @@ mod tests {
     fn psk_text_arrives_spread_out_rather_than_in_blocks() {
         let text = "cq cq de w1aw w1aw k  the quick brown fox jumps over the lazy dog  \
                     de w1aw ur rst 599 599 name andy qth london hw cpy? k  ";
-        let audio = band_with_psk(text, 1500.0, ACQ_WINDOW_S + 2.0);
+        let audio = band_with_psk(text, 1500.0, lead_s());
 
         let mut c = Continuous::new(vec![ModeId::Psk(psk::PSK31)], (300.0, 2600.0));
         let mut per_call: Vec<usize> = Vec::new();
@@ -447,7 +584,7 @@ mod tests {
     fn a_channel_is_never_told_about_its_own_past() {
         let text = "cq cq de w1aw w1aw k  the quick brown fox jumps over the lazy dog  \
                     de w1aw ur rst 599 599 name andy qth london hw cpy? k  ";
-        let audio = band_with_psk(text, 1500.0, ACQ_WINDOW_S + 2.0);
+        let audio = band_with_psk(text, 1500.0, lead_s());
 
         let mut c = Continuous::new(vec![ModeId::Psk(psk::PSK31)], (300.0, 2600.0));
         let mut newest: Vec<(ModeId, f64, f64)> = Vec::new();
@@ -484,7 +621,7 @@ mod tests {
     #[test]
     fn the_callback_size_does_not_change_the_text() {
         let text = "cq de w1aw  test test test  de w1aw k  the quick brown fox  ";
-        let audio = band_with_psk(text, 1500.0, ACQ_WINDOW_S + 2.0);
+        let audio = band_with_psk(text, 1500.0, lead_s());
 
         let read = |chunk: usize| -> String {
             let mut c = Continuous::new(vec![ModeId::Psk(psk::PSK31)], (300.0, 2600.0));
