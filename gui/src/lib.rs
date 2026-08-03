@@ -20,5 +20,9 @@ pub mod waterfall;
 pub mod app;
 #[cfg(feature = "desktop")]
 pub mod audio;
+/// Routing another application's audio into the capture. Desktop-only: it is
+/// about a live capture, which is a thing only the interactive app has.
+#[cfg(feature = "desktop")]
+pub mod pipewire;
 #[cfg(feature = "desktop")]
 pub mod tx;

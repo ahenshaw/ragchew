@@ -325,6 +325,24 @@ pub struct AudioDevice {
 /// `vdownmix`, `oss` — are format converters and routers with no source of
 /// their own, and offering them as recording inputs is just noise.
 const ROUTE_PCMS: &[&str] = &["default", "pipewire", "pulse", "jack"];
+
+/// Whether a device id names a PCM that goes through the sound server rather
+/// than straight at a card.
+///
+/// It is the sound server that makes routing a question at all: opening one of
+/// these puts the capture into a graph, where what feeds it is a separate
+/// choice from which device was opened. `default` counts because on a PipeWire
+/// desktop that is what it resolves to — and it is what most people have
+/// selected without ever choosing it.
+///
+/// Matched whole, not up to the first colon: `default:CARD=PCH` is a *card's*
+/// own default PCM and goes straight at that hardware, while a bare `default`
+/// is the server's.
+pub fn is_pipewire(id: &str) -> bool {
+    let pcm = id.strip_prefix("alsa:").unwrap_or(id);
+    matches!(pcm, "default" | "pipewire" | "pulse")
+}
+
 /// Ways ALSA exposes a hardware PCM, best first.
 ///
 /// `plughw` leads because it converts rate and format, so it opens at the
@@ -1487,6 +1505,25 @@ mod tests {
             assert!(done >= last, "cycle completing at {done} came after {last}");
             last = done;
         }
+    }
+
+    /// Which devices put the capture into a sound server's graph, and so have
+    /// a routing choice behind them that the device name does not settle.
+    #[test]
+    fn the_sound_server_pcms_are_the_routable_ones() {
+        for id in ["alsa:pipewire", "alsa:default", "pipewire", "default", "pulse"] {
+            assert!(is_pipewire(id), "{id} should offer routing");
+        }
+        for id in [
+            "alsa:plughw:CARD=USB,DEV=0",
+            "alsa:hw:CARD=PCH,DEV=2",
+            "alsa:sysdefault:CARD=Audio",
+            "alsa:front:CARD=PCH,DEV=0",
+        ] {
+            assert!(!is_pipewire(id), "{id} is a sound card, not a graph");
+        }
+        // `default:CARD=x` is a card's own default PCM, not the server's.
+        assert!(!is_pipewire("alsa:default:CARD=PCH"), "a card's default is not the server");
     }
 
     /// A decode thread nobody asked for raises no alarm.

@@ -1084,7 +1084,22 @@ struct App {
     /// nobody asked for. It is set for one run, from `--record` or the
     /// diagnostics menu.
     record: bool,
+
+    /// What PipeWire could route into the capture, as of [`App::pw_at`].
+    ///
+    /// Held rather than asked for, because a menu redraws every frame and the
+    /// answer costs a subprocess. Refreshed only while the menu that shows it
+    /// is open — see [`PW_REFRESH_S`].
+    pw: crate::pipewire::Routing,
+    pw_at: Option<std::time::Instant>,
 }
+
+/// How stale the routing list may get while its menu is open.
+///
+/// Long enough that holding the menu open is not a poll loop, short enough that
+/// a browser tab started *because* the menu was empty shows up without the
+/// operator wondering whether the feature works.
+const PW_REFRESH_S: f64 = 1.5;
 
 impl App {
     /// Common view defaults shared by file and live constructors.
@@ -1132,6 +1147,8 @@ impl App {
             split_grab_dx: 0.0,
             live: None,
             record: false,
+            pw: crate::pipewire::Routing::default(),
+            pw_at: None,
         }
     }
 
@@ -2131,6 +2148,14 @@ impl App {
         let t_now = if live { live_t } else { self.t_now };
 
         let mut chosen_device: Option<String> = None;
+        // Routing another application's audio in. `want_pw` is set by the menu
+        // that draws the list and acted on afterwards, so the subprocess it
+        // costs happens once rather than inside a closure that runs per frame.
+        let mut chosen_source: Option<crate::pipewire::Source> = None;
+        let mut want_pw = false;
+        let pw_stale = self
+            .pw_at
+            .is_none_or(|t| t.elapsed().as_secs_f64() > PW_REFRESH_S);
         let mut chosen_output: Option<Option<String>> = None; // Some(None) = default
         let mut modes_changed = false;
         let mut open_file: Option<PathBuf> = None;
@@ -2187,6 +2212,12 @@ impl App {
                     ui.separator();
                     ui.menu_button("Audio input", |ui| {
                         ui.set_min_width(280.0);
+                        // Asked here rather than in the submenu below: whether
+                        // there is a submenu at all is one of the answers, so
+                        // waiting until it is drawn would mean it never was.
+                        if live && pw_stale {
+                            want_pw = true;
+                        }
                         let devices = if live {
                             live_devices.clone()
                         } else {
@@ -2196,7 +2227,36 @@ impl App {
                             if live { live_selected.clone() } else { self.preferred_input.clone() };
                         for d in &devices {
                             let on = current.as_ref() == Some(&d.id);
-                            if ui.selectable_label(on, &d.label).clicked() {
+                            // The PipeWire PCMs get a submenu, because with
+                            // PipeWire the device is only half the answer: the
+                            // capture is a node in a graph and what matters is
+                            // what has been wired to it. Everything else is a
+                            // real sound card, where the device *is* the answer.
+                            if on && self.pw.available && crate::audio::is_pipewire(&d.id) {
+                                // A submenu cannot show itself as selected the
+                                // way the other entries do, and this is always
+                                // the open device — so it says so in the label
+                                // rather than losing the only mark in the list.
+                                ui.menu_button(format!("✓ {}", d.label), |ui| {
+                                    ui.set_min_width(320.0);
+                                    ui.weak("take audio from");
+                                    if self.pw.sources.is_empty() {
+                                        ui.weak("  nothing is playing");
+                                    }
+                                    for s in &self.pw.sources {
+                                        let now = self.pw.current.as_ref() == Some(s);
+                                        if ui.selectable_label(now, s.label()).clicked() {
+                                            chosen_source = Some(s.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                    ui.separator();
+                                    ui.weak(
+                                        "the capture keeps running, so the route \
+                                         survives being made",
+                                    );
+                                });
+                            } else if ui.selectable_label(on, &d.label).clicked() {
                                 chosen_device = Some(d.id.clone());
                                 ui.close();
                             }
@@ -2577,6 +2637,28 @@ impl App {
                     self.tx = None;
                 }
             }
+        }
+
+        // Rewire the graph, if an application was picked to listen to. Note
+        // what this does *not* do: reopen the capture. The stream stays up, so
+        // the route outlives being made — which is the whole point, since the
+        // node a route attaches to dies with the stream that owns it.
+        if let Some(s) = chosen_source {
+            match crate::pipewire::route_from(&s) {
+                Ok(what) => {
+                    diag_info!("audio", "routed {what}");
+                    self.status = Some(format!("listening to {}", s.label()));
+                }
+                Err(e) => {
+                    diag_warn!("audio", "could not route from {}: {e}", s.app);
+                    self.status = Some(format!("could not listen to {}: {e}", s.app));
+                }
+            }
+            want_pw = true;
+        }
+        if want_pw {
+            self.pw = crate::pipewire::survey();
+            self.pw_at = Some(std::time::Instant::now());
         }
 
         // switch input device if the user picked a different one

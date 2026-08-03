@@ -24,6 +24,7 @@ desktop = [
     "dep:clap",
     "dep:rfd",
     "dep:serde",
+    "dep:serde_json",
     "dep:egui-elegance",
 ]
 
@@ -39,6 +40,9 @@ clap = { version = "4", optional = true, features = ["derive"] }
 # "async-std"]` uses the desktop portal instead.
 rfd = { version = "0.17", optional = true }
 serde = { version = "1", optional = true, features = ["derive"] }
+# Reading `pw-dump`, which is how the PipeWire graph is inspected. See
+# `pipewire.rs` for why that is a subprocess rather than libpipewire.
+serde_json = { version = "1", optional = true }
 # Widget styling for the desktop app: an installable theme that the egui
 # built-ins inherit, plus a few widgets of its own. Pinned to the same egui as
 # eframe pulls in — it tracks egui's release cadence, so a bump here has to move
