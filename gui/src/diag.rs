@@ -301,12 +301,30 @@ pub struct ThreadHealth {
     /// window asked for. A count that climbs here means the decoder is asking
     /// for audio the capture has not got — see the heartbeat's `lag`.
     pub short: AtomicU64,
+    /// Wide searches for where a delayed stream's frames are actually landing
+    /// (JS8 only). Zero here while `short` or `passes` climb and `decodes`
+    /// stays flat says the decoder never went looking, which is a fault in the
+    /// decoder rather than a quiet band.
+    pub searches: AtomicU64,
+    /// Cycles that came due and were never decoded, because the thread was
+    /// still working through older ones (JS8 only). Anything but zero here is
+    /// coverage lost — whatever was transmitted in those cycles was never
+    /// looked at, and cannot be recovered.
+    pub skipped: AtomicU64,
     /// When the last pass started.
     pub last_pass: AtomicF64,
     /// What the last pass cost, in milliseconds.
     pub last_ms: AtomicU64,
     /// Cleared when the thread returns, by any route.
     pub running: AtomicBool,
+    /// Whether this thread was ever meant to exist.
+    ///
+    /// A thread is only spawned for modes that are actually enabled, so an
+    /// operator listening for JS8 alone has no continuous thread and never
+    /// had one. Warning that it is "no longer running" every thirty seconds
+    /// buries the log in an alarm about a deliberate choice — and the first
+    /// thing done with a night's log is to grep for exactly that.
+    pub wanted: AtomicBool,
 }
 
 impl ThreadHealth {

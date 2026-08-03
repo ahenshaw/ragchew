@@ -44,12 +44,30 @@ pub struct AudioBuf {
     start_unix: f64,   // wall-clock time of global sample 0
     cap: usize,
     started: bool,
+    /// When the last block of samples arrived, so a block that arrives late
+    /// carrying no more audio than usual can be recognised as a gap.
+    last_append: f64,
+    /// Wall clock the capture has lost to stalls and never made up, total, and
+    /// how much of it the heartbeat has yet to report. See [`AudioBuf::append`].
+    slipped_s: f64,
+    unreported_slip_s: f64,
     /// Where a recording in progress is fed from, if any. It hangs off the
     /// buffer rather than off the stream because the callback already holds
     /// this lock — a separate one would be a second thing for the audio thread
     /// to wait on.
     tap: Option<Tap>,
 }
+
+/// Wall clock unaccounted for by arriving audio before the capture is taken to
+/// have stalled and the anchor is moved.
+///
+/// Well above callback jitter, and it cannot fire on a merely *late* callback:
+/// a block that arrives 300 ms late carrying 300 ms of audio accounts for its
+/// own delay, because the comparison is against the samples in that block
+/// rather than against an expected cadence. Only audio that was never captured
+/// registers. Half a second is the margin the cycle-aligned decoder allows
+/// either side of a cycle, so anything past it is already breaking decodes.
+const STALL_GAP_S: f64 = 0.5;
 
 impl AudioBuf {
     fn new(cap: usize) -> AudioBuf {
@@ -59,6 +77,9 @@ impl AudioBuf {
             start_unix: 0.0,
             cap,
             started: false,
+            last_append: 0.0,
+            slipped_s: 0.0,
+            unreported_slip_s: 0.0,
             tap: None,
         }
     }
@@ -66,11 +87,43 @@ impl AudioBuf {
     pub fn set_tap(&mut self, tap: Option<Tap>) {
         self.tap = tap;
     }
+
+    /// Take a block of captured samples, and keep the wall-clock anchor honest.
+    ///
+    /// Every decoder that asks for a window in UTC gets it through
+    /// `start_unix` plus a sample count at a nominal 12 kHz, so that anchor is
+    /// the only thing tying the audio to the clock. A capture that stalls —
+    /// a browser tab throttled, a PipeWire link that idles, a USB glitch —
+    /// silently breaks it: the samples that were never captured are never made
+    /// up, so from then on every window is cut however many seconds early, and
+    /// eventually off the end of the buffer entirely. The waterfall walks the
+    /// buffer by sample index and is unaffected, which is what makes this look
+    /// like a band that went quiet rather than a fault.
+    ///
+    /// So a stall moves the anchor by what it cost. The alternative — reopening
+    /// the capture, which builds a fresh buffer — is not always available: an
+    /// operator patching audio in from elsewhere may only be able to make that
+    /// route to a stream that is already running, and dropping the stream
+    /// destroys it.
+    ///
+    /// This corrects the mapping for everything captured *after* the stall,
+    /// which is what any decoder is looking at. Audio still held from before it
+    /// is now misdated by the correction — unavoidable with one anchor, and the
+    /// lesser error by far.
     fn append(&mut self, s: &[f32]) {
+        let now = unix_now();
         if !self.started {
-            self.start_unix = unix_now();
+            self.start_unix = now;
             self.started = true;
+        } else {
+            let gap = (now - self.last_append) - s.len() as f64 / RATE as f64;
+            if gap > STALL_GAP_S {
+                self.start_unix += gap;
+                self.slipped_s += gap;
+                self.unreported_slip_s += gap;
+            }
         }
+        self.last_append = now;
         if let Some(t) = &self.tap {
             t.push(s);
         }
@@ -125,6 +178,14 @@ impl AudioBuf {
             return 0.0;
         }
         unix_now() - (self.start_unix + self.global_len() as f64 / RATE as f64)
+    }
+    /// Wall clock lost to stalls in total, and how much of it is new since this
+    /// was last asked. The heartbeat asks, so a stall is reported once and the
+    /// running total says how bad the capture has been overall.
+    fn take_slip(&mut self) -> (f64, f64) {
+        let fresh = self.unreported_slip_s;
+        self.unreported_slip_s = 0.0;
+        (self.slipped_s, fresh)
     }
     /// Copy samples for global index range `[g0, g1)` (clamped to what's held).
     pub fn slice_global(&self, g0: u64, g1: u64) -> Vec<f32> {
@@ -264,7 +325,6 @@ pub struct AudioDevice {
 /// `vdownmix`, `oss` — are format converters and routers with no source of
 /// their own, and offering them as recording inputs is just noise.
 const ROUTE_PCMS: &[&str] = &["default", "pipewire", "pulse", "jack"];
-
 /// Ways ALSA exposes a hardware PCM, best first.
 ///
 /// `plughw` leads because it converts rate and format, so it opens at the
@@ -507,6 +567,10 @@ pub fn spawn_decoder(
         names(&js8),
         names(&continuous)
     );
+    // Set both ways round, not just on: modes are changed while running, and a
+    // thread switched off is as deliberate as one switched on.
+    health.js8.wanted.store(!js8.is_empty(), Ordering::Relaxed);
+    health.continuous.wanted.store(!continuous.is_empty(), Ordering::Relaxed);
     if !js8.is_empty() {
         spawn_js8(buf.clone(), js8, tx.clone(), health.clone());
     }
@@ -540,6 +604,22 @@ pub fn spawn_decoder(
 /// period is indistinguishable from a shorter one, since every cycle looks like
 /// the last, so decodes off a badly delayed stream are stamped a whole number
 /// of cycles late.
+///
+/// # Keeping up
+///
+/// Cycles are queued as their audio completes and worked through oldest first,
+/// rather than the thread taking whichever is due soonest and stepping over the
+/// others. Four submodes on four grids need eleven passes every thirty seconds
+/// — Turbo five, Fast three, Normal two, Slow one — and a pass costs the better
+/// part of a second, so a cycle ripening while another mode is being decoded is
+/// the normal case rather than the exceptional one. Stepping over those lost
+/// one cycle in five, measured off a live capture, which on a band carrying one
+/// frame in twelve minutes is most of the difference between hearing a station
+/// and not.
+///
+/// The queue is bounded by [`MAX_BACKLOG_S`], because a cycle is only worth
+/// decoding while the capture still holds its audio. What gets dropped is
+/// counted rather than lost quietly.
 fn spawn_js8(
     buf: Arc<Mutex<AudioBuf>>,
     modes: Vec<ModeId>,
@@ -560,51 +640,77 @@ fn spawn_js8(
         let mut offset = vec![0.0f64; modes.len()];
         let mut dead = vec![0usize; modes.len()];
         let mut last_search = unix_now();
+        // When each mode's cycle has all its audio: the frame is complete, plus
+        // whatever the stream is running late by.
+        let done = |i: usize, cycle: f64, offset: &[f64]| cycle + offset[i] + ready(&modes[i]);
+        // Cycles whose audio is complete and which have not been decoded yet.
+        let mut queue: Vec<(usize, f64)> = Vec::new();
 
         loop {
             let now = unix_now();
-            // skip any cycles whose decode time already passed
-            for (i, m) in modes.iter().enumerate() {
-                while next[i] + ready(m) <= now {
-                    next[i] += period(m);
-                }
+            // Every cycle that has ripened since the last look goes on the
+            // queue. It used to advance past them instead and decode only the
+            // one due soonest, which quietly threw away every cycle that came
+            // due while another mode's pass was running — with all four
+            // submodes enabled that was one cycle in five, measured, and on a
+            // band where JS8 is sparse it is the difference between catching a
+            // frame and never seeing it.
+            let after: Vec<f64> =
+                (0..modes.len()).map(|i| offset[i] + ready(&modes[i])).collect();
+            let periods: Vec<f64> = modes.iter().map(period).collect();
+            queue.extend(ripe_cycles(&mut next, &periods, &after, now));
+            // A backlog past what the capture buffer holds is not worth
+            // keeping: that audio has rolled away, and the pass would come back
+            // short. Dropped oldest first and counted, so the heartbeat says so
+            // rather than the work silently vanishing as it used to.
+            let stale = queue.len();
+            queue.retain(|&(i, cycle)| now - done(i, cycle, &offset) < MAX_BACKLOG_S);
+            if queue.len() < stale {
+                Health::bump(&stats.skipped, (stale - queue.len()) as u64);
             }
-            // decode whichever mode comes due first
-            let best = (0..modes.len())
-                .min_by(|&a, &b| {
-                    (next[a] + ready(&modes[a]))
-                        .partial_cmp(&(next[b] + ready(&modes[b])))
-                        .unwrap()
-                })
-                .unwrap();
-            let mode = modes[best];
-            let cycle_start = next[best];
-            next[best] += period(&mode);
+            queue.sort_by(|a, b| {
+                done(a.0, a.1, &offset).partial_cmp(&done(b.0, b.1, &offset)).unwrap()
+            });
 
-            let wait = cycle_start + offset[best] + ready(&mode) - unix_now();
-            if wait > 0.0 {
-                thread::sleep(Duration::from_secs_f64(wait));
-            }
+            let Some((best, cycle_start)) = queue.first().copied() else {
+                // Nothing ripe: wait for whichever cycle completes first. An
+                // empty queue means every cycle is still in the future, so this
+                // is positive — floored anyway, since a loop that decides to
+                // sleep for nothing at all would spin.
+                let wait = (0..modes.len())
+                    .map(|i| done(i, next[i], &offset) - unix_now())
+                    .fold(f64::INFINITY, f64::min);
+                thread::sleep(Duration::from_secs_f64(wait.clamp(0.01, 30.0)));
+                continue;
+            };
+            queue.remove(0);
+            let mode = modes[best];
 
             // half a second either side of the cycle, for clock skew — shifted
             // by however late this mode's frames are actually arriving, which
             // is zero off a radio and seconds off a stream.
             stats.pass_begun();
+            let pass = std::time::Instant::now();
             let (samples, win_start) =
                 slice_around(&buf, cycle_start + offset[best] - 0.5, period(&mode) + 1.0);
-            if (samples.len() as f64) < mode.chunk_secs() * RATE as f64 {
-                // The buffer did not hold the window this cycle asked for.
-                // Counted rather than logged: on a lagging capture it happens
-                // every cycle, and the heartbeat's running total says so once.
+            // A window the buffer could not fill is a dead cycle, not a reason
+            // to skip the rest of the loop. It used to `continue` here, which
+            // stepped over the offset search below — so a capture whose clock
+            // had slipped could never learn where its frames were, which is
+            // exactly the case the search was built for. Counted rather than
+            // logged: it happens every cycle when it happens at all, and the
+            // heartbeat's running total says so once.
+            let decodes = if (samples.len() as f64) < mode.chunk_secs() * RATE as f64 {
                 Health::bump(&stats.short, 1);
-                continue;
-            }
-            let pass = std::time::Instant::now();
-            let decodes = shift_times(
-                protocol::decode_all(&samples, BAND.0, BAND.1, &[mode]),
-                win_start,
-            );
-            stats.pass_done(pass.elapsed().as_secs_f64() * 1e3);
+                Vec::new()
+            } else {
+                let found = shift_times(
+                    protocol::decode_all(&samples, BAND.0, BAND.1, &[mode]),
+                    win_start,
+                );
+                stats.pass_done(pass.elapsed().as_secs_f64() * 1e3);
+                found
+            };
 
             // A mode that has gone quiet may have nothing to hear, or may be
             // looking in the wrong place. The first is far commoner, so this
@@ -613,11 +719,20 @@ fn spawn_js8(
             dead[best] = if decodes.is_empty() { dead[best] + 1 } else { 0 };
             if dead[best] >= DEAD_CYCLES && unix_now() - last_search >= SEARCH_INTERVAL_S {
                 last_search = unix_now();
+                Health::bump(&stats.searches, 1);
                 if let Some(found) = measure_offset(&buf, mode, period(&mode)) {
                     // Only a real move. Frames arrive a few tens of
                     // milliseconds apart from pass to pass, and chasing that
                     // would rewrite the offset for no gain.
                     if (found - offset[best]).abs() > 0.5 {
+                        diag_info!(
+                            "js8",
+                            "{} frames are arriving {:+.2}s into the cycle, not {:+.2}s; \
+                             moving the window to follow them",
+                            mode.name(),
+                            found,
+                            offset[best]
+                        );
                         offset[best] = found;
                         dead[best] = 0;
                     }
@@ -644,13 +759,20 @@ fn spawn_js8(
                     break; // UI gone
                 }
             }
-            // Cycles that pass while a decode runs are skipped at the top of
-            // the loop, so falling behind costs coverage rather than building a
-            // backlog — but with four modes due every six to thirty seconds and
-            // a pass costing seconds, the next is always already due and the
-            // thread never sleeps at all. Yielding for as long as the pass took
-            // holds it to half the wall clock.
-            thread::sleep(pass.elapsed());
+            // On a band that is keeping up, yield for as long as the pass took,
+            // so a decoder scanning four submodes is not simply pinning a core
+            // for the whole session.
+            //
+            // With cycles waiting, don't: the yield was doubling the cost of
+            // every pass, which is most of how the thread came to be running
+            // eight passes in the thirty seconds that four submodes need eleven.
+            // A backlog means cycles are about to be dropped for good, and
+            // being a good citizen at that moment costs decodes that do not
+            // come again. The work is bounded either way — the queue is capped,
+            // and a pass is real work rather than a spin.
+            if queue.is_empty() {
+                thread::sleep(pass.elapsed());
+            }
         }
     });
     if let Err(e) = spawned {
@@ -827,9 +949,10 @@ pub fn spawn_heartbeat(buf: &Arc<Mutex<AudioBuf>>, health: Arc<Health>) -> Arc<A
                 diag_info!("health", "capture closed; heartbeat retiring");
                 return;
             };
-            let (lag, held_s, started) = {
-                let b = buf.lock().unwrap();
-                (b.lag_s(), b.samples.len() as f64 / RATE as f64, b.started())
+            let (lag, held_s, started, slipped, fresh_slip) = {
+                let mut b = buf.lock().unwrap();
+                let (slipped, fresh) = b.take_slip();
+                (b.lag_s(), b.samples.len() as f64 / RATE as f64, b.started(), slipped, fresh)
             };
             if !started {
                 continue;
@@ -840,23 +963,27 @@ pub fn spawn_heartbeat(buf: &Arc<Mutex<AudioBuf>>, health: Arc<Health>) -> Arc<A
 
             diag_info!(
                 "health",
-                "lag={lag:+.2}s held={held_s:.0}s cols=+{} frames=+{} | \
+                "lag={lag:+.2}s slipped={slipped:.1}s held={held_s:.0}s cols=+{} frames=+{} | \
                  js8 {} | cont {} | stream_err={} rec_drop={}",
                 d.ui_columns,
                 d.ui_frames,
-                thread_summary(&health.js8, d.js8_passes, d.js8_decodes, d.js8_short),
-                thread_summary(
-                    &health.continuous,
-                    d.cont_passes,
-                    d.cont_decodes,
-                    d.cont_short
-                ),
+                thread_summary(&health.js8, d.js8),
+                thread_summary(&health.continuous, d.cont),
                 diag::get(&health.stream_errors),
                 diag::get(&health.record_dropped)
             );
 
             // Then the same facts as judgements, so the first thing to do with
             // a night's log is `grep -E 'WARN|ERROR'` and the answer is there.
+            if fresh_slip > 0.0 {
+                diag_warn!(
+                    "health",
+                    "the capture stalled and lost {fresh_slip:.1}s of audio ({slipped:.1}s in \
+                     all); the clock anchor has been moved to follow it, so decode windows \
+                     stay on the signal. Anything decoded from before the stall is dated \
+                     {fresh_slip:.1}s early"
+                );
+            }
             if lag.abs() > LAG_WARN_S {
                 diag_warn!(
                     "health",
@@ -874,17 +1001,50 @@ pub fn spawn_heartbeat(buf: &Arc<Mutex<AudioBuf>>, health: Arc<Health>) -> Arc<A
     stop
 }
 
-fn thread_summary(h: &ThreadHealth, passes: u64, decodes: u64, short: u64) -> String {
+fn thread_summary(h: &ThreadHealth, d: ThreadDelta) -> String {
     let ago = h.since_pass().map_or("never".to_string(), |s| format!("{s:.0}s ago"));
+    // Searching and skipping are JS8's alone, so they are left off a thread
+    // that does neither rather than reported as permanent zeros.
+    let searches = if d.searches > 0 || h.searches.load(Ordering::Relaxed) > 0 {
+        format!(" searches=+{}", d.searches)
+    } else {
+        String::new()
+    };
+    // Skipped cycles are coverage lost, so once any have been they stay on
+    // every line — a rate that has gone back to zero is the thing to see.
+    let skipped = if h.skipped.load(Ordering::Relaxed) > 0 {
+        format!(" skipped=+{}", d.skipped)
+    } else {
+        String::new()
+    };
     format!(
-        "passes=+{passes} decodes=+{decodes} short=+{short} last={ago} cost={}ms run={}",
+        "passes=+{} decodes=+{} short=+{}{searches}{skipped} last={ago} cost={}ms run={}",
+        d.passes,
+        d.decodes,
+        d.short,
         h.last_ms.load(Ordering::Relaxed),
         u8::from(h.running.load(Ordering::Relaxed))
     )
 }
 
+/// One thread's counters over one heartbeat.
+#[derive(Clone, Copy, Default)]
+struct ThreadDelta {
+    passes: u64,
+    decodes: u64,
+    short: u64,
+    searches: u64,
+    skipped: u64,
+}
+
 /// Say so, loudly, when a decode thread has stopped or gone quiet for too long.
 fn check_stall(h: &ThreadHealth, what: &str, limit: f64) {
+    // A thread nobody asked for is not a fault: with every mode of one kind
+    // switched off, its thread is never spawned and saying so every heartbeat
+    // only drowns the warnings that mean something.
+    if !h.wanted.load(Ordering::Relaxed) {
+        return;
+    }
     if !h.running.load(Ordering::Relaxed) {
         diag_warn!("health", "the {what} decode thread is no longer running");
         return;
@@ -901,12 +1061,29 @@ fn check_stall(h: &ThreadHealth, what: &str, limit: f64) {
 struct Snapshot {
     ui_columns: u64,
     ui_frames: u64,
-    js8_passes: u64,
-    js8_decodes: u64,
-    js8_short: u64,
-    cont_passes: u64,
-    cont_decodes: u64,
-    cont_short: u64,
+    js8: ThreadDelta,
+    cont: ThreadDelta,
+}
+
+impl ThreadDelta {
+    fn of(h: &ThreadHealth) -> ThreadDelta {
+        ThreadDelta {
+            passes: diag::get(&h.passes),
+            decodes: diag::get(&h.decodes),
+            short: diag::get(&h.short),
+            searches: diag::get(&h.searches),
+            skipped: diag::get(&h.skipped),
+        }
+    }
+    fn since(&self, then: &ThreadDelta) -> ThreadDelta {
+        ThreadDelta {
+            passes: self.passes - then.passes,
+            decodes: self.decodes - then.decodes,
+            short: self.short - then.short,
+            searches: self.searches - then.searches,
+            skipped: self.skipped - then.skipped,
+        }
+    }
 }
 
 impl Snapshot {
@@ -914,24 +1091,16 @@ impl Snapshot {
         Snapshot {
             ui_columns: diag::get(&h.ui_columns),
             ui_frames: diag::get(&h.ui_frames),
-            js8_passes: diag::get(&h.js8.passes),
-            js8_decodes: diag::get(&h.js8.decodes),
-            js8_short: diag::get(&h.js8.short),
-            cont_passes: diag::get(&h.continuous.passes),
-            cont_decodes: diag::get(&h.continuous.decodes),
-            cont_short: diag::get(&h.continuous.short),
+            js8: ThreadDelta::of(&h.js8),
+            cont: ThreadDelta::of(&h.continuous),
         }
     }
     fn since(&self, then: &Snapshot) -> Snapshot {
         Snapshot {
             ui_columns: self.ui_columns - then.ui_columns,
             ui_frames: self.ui_frames - then.ui_frames,
-            js8_passes: self.js8_passes - then.js8_passes,
-            js8_decodes: self.js8_decodes - then.js8_decodes,
-            js8_short: self.js8_short - then.js8_short,
-            cont_passes: self.cont_passes - then.cont_passes,
-            cont_decodes: self.cont_decodes - then.cont_decodes,
-            cont_short: self.cont_short - then.cont_short,
+            js8: self.js8.since(&then.js8),
+            cont: self.cont.since(&then.cont),
         }
     }
 }
@@ -949,6 +1118,46 @@ fn slice_around(buf: &Arc<Mutex<AudioBuf>>, from: f64, secs: f64) -> (Vec<f32>, 
     let start = g0.max(b.global_start());
     (b.slice_global(g0, g1), start as f64 / rate)
 }
+
+/// Every cycle whose audio was complete at or before `now` and which has not
+/// been handed out yet, in the order the cycles completed. `next` is advanced
+/// past them, so no cycle is ever returned twice.
+///
+/// `complete_after` is how long past a cycle's start its audio is all in: the
+/// frame's own length, slack, and however late the stream is running.
+///
+/// Split out from the decode loop because it is the rule that had the bug — the
+/// loop used to advance `next` past a ripe cycle without decoding it whenever
+/// another mode's pass had been running, which lost one cycle in five with four
+/// submodes enabled. As a function it can be tested against a clock that jumps,
+/// which is what a busy decoder looks like from here.
+fn ripe_cycles(
+    next: &mut [f64],
+    period: &[f64],
+    complete_after: &[f64],
+    now: f64,
+) -> Vec<(usize, f64)> {
+    let mut out: Vec<(usize, f64)> = Vec::new();
+    for i in 0..next.len() {
+        while next[i] + complete_after[i] <= now {
+            out.push((i, next[i]));
+            next[i] += period[i];
+        }
+    }
+    out.sort_by(|a, b| {
+        (a.1 + complete_after[a.0]).partial_cmp(&(b.1 + complete_after[b.0])).unwrap()
+    });
+    out
+}
+
+/// How far behind the cycle-aligned decoder may fall before it gives up on the
+/// oldest cycles rather than working through them.
+///
+/// A queued cycle is worth decoding only while its audio is still held, and the
+/// capture buffer keeps five minutes. Two is well inside that, and a decoder
+/// two minutes behind has bigger problems than the cycles it is about to drop —
+/// which the heartbeat's `skipped` now counts rather than losing silently.
+const MAX_BACKLOG_S: f64 = 120.0;
 
 /// Consecutive dead cycles before a mode goes looking for where its frames
 /// actually are. Three, so an ordinary quiet spell on a real band does not
@@ -988,14 +1197,20 @@ const SEARCH_SPAN_S: f64 = 2.0;
 /// band with no JS8 on it must not move a working one.
 fn measure_offset(buf: &Arc<Mutex<AudioBuf>>, mode: ModeId, period: f64) -> Option<f64> {
     let span = period + mode.chunk_secs() + SEARCH_SPAN_S;
-    let start_unix = {
+    // Addressed by sample index rather than by UTC, unlike every ordinary pass.
+    // What this looks at has to be the newest audio the buffer actually holds:
+    // asking for it in wall-clock time goes through the very anchor whose being
+    // wrong is half of what the search exists to recover from, and on a capture
+    // that has slipped it returns nothing at all.
+    let (samples, win_start, start_unix) = {
         let b = buf.lock().unwrap();
         if !b.started() {
             return None;
         }
-        b.start_unix()
+        let g1 = b.global_len();
+        let g0 = g1.saturating_sub((span * RATE as f64) as u64).max(b.global_start());
+        (b.slice_global(g0, g1), g0 as f64 / RATE as f64, b.start_unix())
     };
-    let (samples, win_start) = slice_around(buf, unix_now() - span, span);
     if (samples.len() as f64) < mode.chunk_secs() * RATE as f64 {
         return None;
     }
@@ -1159,6 +1374,222 @@ mod tests {
         // index, so it still finds every window it has ever been given.
         assert!(b.window_at(0).is_some());
         assert!(b.window_at(RATE as u64 * 9).is_some());
+    }
+
+    /// The four JS8 submodes as the scheduler sees them: cycle period, and how
+    /// long past a cycle's start its audio is all in.
+    fn js8_grids() -> (Vec<f64>, Vec<f64>) {
+        let modes = [
+            ragchew::js8::Mode::Turbo,
+            ragchew::js8::Mode::Fast,
+            ragchew::js8::Mode::Normal,
+            ragchew::js8::Mode::Slow,
+        ];
+        let ids: Vec<ModeId> = modes.iter().map(|m| ModeId::Js8(*m)).collect();
+        let period = ids.iter().map(|m| m.period_s().unwrap() as f64).collect();
+        let after = ids.iter().map(|m| m.chunk_secs() + 1.0).collect();
+        (period, after)
+    }
+
+    /// No cycle is lost because the decoder was busy when it ripened.
+    ///
+    /// This is the bug the recordings caught. The loop used to take only the
+    /// cycle due soonest and step `next` past the rest, so every cycle that
+    /// completed while another submode's pass was running was thrown away
+    /// unlooked-at. With all four submodes enabled that measured one in five:
+    /// eight passes in the thirty seconds the grids demand eleven. On a band
+    /// carrying one JS8 frame in twelve minutes it is the difference between
+    /// catching it and never knowing it was there.
+    #[test]
+    fn no_cycle_is_lost_because_the_decoder_was_busy() {
+        let (period, after) = js8_grids();
+        let span = 300.0;
+
+        // A decoder that wakes once in five minutes must still be handed every
+        // cycle of those five minutes.
+        let mut next = vec![0.0; period.len()];
+        let slow = ripe_cycles(&mut next, &period, &after, span);
+        let want: usize = period.iter().map(|p| (span / p) as usize).sum();
+        assert_eq!(slow.len(), want, "a busy decoder was handed {} of {want} cycles", slow.len());
+
+        // And one that wakes constantly must be handed exactly the same ones.
+        let mut next = vec![0.0; period.len()];
+        let mut brisk = Vec::new();
+        let mut t = 0.0;
+        while t <= span {
+            brisk.extend(ripe_cycles(&mut next, &period, &after, t));
+            t += 0.25;
+        }
+        assert_eq!(brisk, slow, "how often the decoder looks changed which cycles it got");
+
+        // Every cycle exactly once, on its own grid.
+        for (i, p) in period.iter().enumerate() {
+            let mine: Vec<f64> = slow.iter().filter(|c| c.0 == i).map(|c| c.1).collect();
+            let mut want = 0.0;
+            for (k, got) in mine.iter().enumerate() {
+                assert_eq!(*got, want, "mode {i} cycle {k} is not on its grid");
+                want += p;
+            }
+        }
+    }
+
+    /// All four submodes fit in the time available, at the pass cost a real
+    /// capture measured.
+    ///
+    /// Queueing the cycles is only worth anything if the decoder can then work
+    /// through them; otherwise it moves the loss from cycles skipped to cycles
+    /// gone stale. The live heartbeats put a pass at 0.79–1.08 s, so this walks
+    /// a virtual clock through ten minutes at the worst of that and checks
+    /// almost every cycle is decoded and the backlog never approaches
+    /// [`MAX_BACKLOG_S`].
+    #[test]
+    fn the_four_submodes_fit_in_the_time_available() {
+        let (period, after) = js8_grids();
+        let pass_cost = 1.08;
+        let span = 600.0;
+
+        let mut next = vec![0.0; period.len()];
+        let mut queue: Vec<(usize, f64)> = Vec::new();
+        let (mut now, mut decoded, mut worst_wait) = (0.0f64, 0usize, 0.0f64);
+        while now < span {
+            queue.extend(ripe_cycles(&mut next, &period, &after, now));
+            let Some(&(i, cycle)) = queue.first() else {
+                now += 0.25;
+                continue;
+            };
+            worst_wait = worst_wait.max(now - (cycle + after[i]));
+            queue.remove(0);
+            decoded += 1;
+            now += pass_cost;
+        }
+
+        let want: usize = period.iter().map(|p| (span / p) as usize).sum();
+        assert!(decoded * 100 >= want * 99, "decoded {decoded} of {want} cycles");
+        assert!(
+            worst_wait < MAX_BACKLOG_S / 4.0,
+            "a cycle waited {worst_wait:.1}s to be decoded; the cap is {MAX_BACKLOG_S}"
+        );
+    }
+
+    /// Cycles come back in the order their audio completed, so a backlog is
+    /// worked through oldest first and the interface is told things in the
+    /// order they were said.
+    #[test]
+    fn a_backlog_is_handed_over_in_the_order_it_arrived() {
+        let (period, after) = js8_grids();
+        let mut next = vec![0.0; period.len()];
+        let got = ripe_cycles(&mut next, &period, &after, 120.0);
+        assert!(got.len() > 20, "only {} cycles; the test proved little", got.len());
+
+        let mut last = f64::NEG_INFINITY;
+        for &(i, cycle) in &got {
+            let done = cycle + after[i];
+            assert!(done >= last, "cycle completing at {done} came after {last}");
+            last = done;
+        }
+    }
+
+    /// A decode thread nobody asked for raises no alarm.
+    ///
+    /// Switching every mode of one kind off is a thing an operator does — the
+    /// recordings that found the scheduler bug were made with the continuous
+    /// modes off on purpose — and it used to put a WARN in the log every thirty
+    /// seconds for the rest of the session, which is exactly what `grep WARN`
+    /// then finds instead of the fault being looked for.
+    #[test]
+    fn a_thread_that_was_never_wanted_is_not_reported_as_a_fault() {
+        let h = Health::default();
+        assert!(!h.continuous.wanted.load(Ordering::Relaxed));
+        assert!(!h.continuous.running.load(Ordering::Relaxed));
+        // Nothing to say about a thread that was never asked for.
+        check_stall(&h.continuous, "continuous (Olivia/PSK)", CONT_STALL_S);
+
+        // But one that was asked for and is not running is still a fault, and
+        // the counters behind that judgement are the ones the heartbeat reads.
+        h.continuous.wanted.store(true, Ordering::Relaxed);
+        assert!(
+            h.continuous.wanted.load(Ordering::Relaxed)
+                && !h.continuous.running.load(Ordering::Relaxed),
+            "the state check_stall warns on"
+        );
+    }
+
+    /// A capture that stalls moves its own anchor, instead of keeping the lost
+    /// time for ever.
+    ///
+    /// The reported case, from a log: audio piped in from a browser through
+    /// PipeWire stopped for ninety seconds and then resumed. Nothing in the
+    /// stream says so — no error, no gap in the samples, and the waterfall kept
+    /// scrolling — but every decode window is cut by translating UTC through
+    /// this anchor, so from then on each one was asked for ninety seconds past
+    /// the newest sample held and came back empty. JS8 went to `short=+55` of
+    /// 55 passes and stayed there.
+    #[test]
+    fn a_stalled_capture_moves_its_anchor_rather_than_losing_the_clock() {
+        let mut b = AudioBuf::new(RATE as usize * 300);
+
+        // Ten seconds of audio, which arrived starting a hundred seconds ago
+        // and stopped ninety seconds ago. That is the broken state: the buffer
+        // is ninety seconds adrift and nothing in it knows.
+        b.append(&vec![0.0f32; RATE as usize * 10]);
+        b.start_unix = unix_now() - 100.0;
+        b.last_append = unix_now() - 90.0;
+        assert!((b.lag_s() - 90.0).abs() < 0.1, "set up wrong: lag is {:.1}s", b.lag_s());
+
+        // The stream resumes with one ordinary block.
+        b.append(&vec![0.0f32; 512]);
+        assert!(
+            b.lag_s().abs() < 0.1,
+            "still {:.1}s adrift after the anchor should have caught up",
+            b.lag_s()
+        );
+
+        // Reported once, with a running total — the heartbeat says "this
+        // happened", not "this is happening", every thirty seconds for ever.
+        let (total, fresh) = b.take_slip();
+        assert!((total - 90.0).abs() < 0.2, "lost {total:.1}s, expected 90");
+        assert!((fresh - 90.0).abs() < 0.2, "reported {fresh:.1}s as new");
+        assert_eq!(b.take_slip().1, 0.0, "reported the same stall twice");
+    }
+
+    /// And a window asked for in UTC then lands on audio again, which is the
+    /// only thing any of it was for.
+    #[test]
+    fn a_decode_window_lands_on_audio_after_a_stall() {
+        let buf = Arc::new(Mutex::new(AudioBuf::new(RATE as usize * 300)));
+        {
+            let mut b = buf.lock().unwrap();
+            b.append(&vec![0.1f32; RATE as usize * 10]);
+            b.start_unix = unix_now() - 100.0;
+            b.last_append = unix_now() - 90.0;
+            // Before the anchor moves, the window is cut ninety seconds past
+            // the end of the buffer and there is nothing there at all.
+            drop(b);
+            let (early, _) = slice_around(&buf, unix_now() - 5.0, 4.0);
+            assert!(early.is_empty(), "expected the broken case to return nothing");
+        }
+        buf.lock().unwrap().append(&vec![0.1f32; 512]);
+
+        let (samples, _) = slice_around(&buf, unix_now() - 5.0, 4.0);
+        let got = samples.len() as f64 / RATE as f64;
+        assert!((got - 4.0).abs() < 0.1, "asked for 4s of audio and got {got:.2}s");
+    }
+
+    /// A merely *late* block is not a stall. A capture that hiccups and then
+    /// delivers the audio it owed accounts for its own delay, and moving the
+    /// anchor for that would walk a healthy capture off the clock a hiccup at a
+    /// time.
+    #[test]
+    fn a_late_block_that_brings_its_audio_with_it_moves_nothing() {
+        let mut b = AudioBuf::new(RATE as usize * 300);
+        b.append(&vec![0.0f32; RATE as usize]);
+        b.start_unix = unix_now() - 1.0;
+
+        // Three seconds late, carrying three seconds of audio.
+        b.last_append = unix_now() - 3.0;
+        b.append(&vec![0.0f32; RATE as usize * 3]);
+
+        assert_eq!(b.take_slip().0, 0.0, "a late block was counted as lost audio");
     }
 
     /// Recording taps the buffer, so what reaches the file is what reached the
