@@ -271,7 +271,7 @@ impl App {
             Some(p) => diag_info!("traffic", "logging decodes to {}", p.display()),
             None => {
                 let where_ = at.map_or_else(diag::data_dir, |p| p.to_path_buf());
-                self.status = Some(format!("could not write {}", where_.display()));
+                self.warn(format!("could not write {}", where_.display()));
                 diag_warn!("traffic", "could not open a CSV at {}", where_.display());
             }
         }
@@ -1037,8 +1037,8 @@ struct App {
     samples: Arc<Vec<f32>>,
     /// What is being monitored, for the title bar.
     source: String,
-    /// Why the last open failed, if it did.
-    status: Option<String>,
+    /// The last thing worth saying, for the status bar.
+    status: Option<Note>,
     /// Identifier of the audio input to prefer when going live, remembered
     /// across restarts.
     preferred_input: Option<String>,
@@ -1101,7 +1101,91 @@ struct App {
 /// operator wondering whether the feature works.
 const PW_REFRESH_S: f64 = 1.5;
 
+/// One line for the status bar.
+///
+/// Two kinds, because they had been one and it showed: a failed open and a
+/// successful "listening to …" both came out under a red warning triangle, so
+/// the app announced good news as a fault.
+#[derive(Clone, Debug, PartialEq)]
+struct Note {
+    text: String,
+    /// Something went wrong, as against something merely happened.
+    bad: bool,
+}
+
 impl App {
+    /// Say what just happened.
+    fn say(&mut self, text: impl Into<String>) {
+        self.status = Some(Note { text: text.into(), bad: false });
+    }
+
+    /// Say what just went wrong.
+    fn warn(&mut self, text: impl Into<String>) {
+        self.status = Some(Note { text: text.into(), bad: true });
+    }
+
+    /// The status line along the bottom of the window.
+    ///
+    /// What lives here is what the operator glances at rather than acts on: how
+    /// many conversations the band is carrying, and the last thing that
+    /// happened. Both were on the toolbar, which has to stay on one line and
+    /// was competing for it with the controls — and a message long enough to be
+    /// useful ("could not listen to Firefox: …") had nowhere to go.
+    ///
+    /// The row is allocated whether or not there is anything to say. A bar that
+    /// appears when a message does would resize the panorama above it, and a
+    /// waterfall that jumps every time the app mentions something is worse than
+    /// no message at all.
+    fn status_bar(&mut self, ui: &mut egui::Ui, live: bool, n_channels: usize) {
+        egui::Panel::bottom("status").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(ui.spacing().interact_size.y);
+                // A counting readout that sets its own width drags everything
+                // after it along each time a station appears, so the slot is
+                // sized once for the widest thing it will ever hold. Measured
+                // in the font actually in force, so it survives text scaling.
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let width = ui
+                    .painter()
+                    .layout_no_wrap("⏳ 8888 channels".to_owned(), font, Color32::PLACEHOLDER)
+                    .size()
+                    .x;
+                let text = if !live && self.samples.is_empty() {
+                    // Nothing loaded is not the same state as something still
+                    // decoding: the slot stays reserved but empty.
+                    String::new()
+                } else if !live && self.pending_scans > 0 {
+                    // Counting while the scan is still running: the count is
+                    // real, it is just not final yet.
+                    format!("⏳ {n_channels} channels")
+                } else {
+                    format!("{n_channels} channels")
+                };
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| ui.label(text),
+                );
+                ui.separator();
+                match &self.status {
+                    Some(n) if n.bad => {
+                        let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 150, 150));
+                        ui.colored_label(c, format!("⚠ {}", n.text));
+                    }
+                    Some(n) => {
+                        ui.label(&n.text);
+                    }
+                    // With nothing to say, the file being read is worth saying.
+                    // Live, the toolbar already names the device.
+                    None if !live && !self.source.is_empty() => {
+                        ui.weak(&self.source);
+                    }
+                    None => {}
+                }
+            });
+        });
+    }
+
     /// Common view defaults shared by file and live constructors.
     fn base(band: (f64, f64)) -> App {
         let (_a, spec_rx) = channel();
@@ -1231,18 +1315,18 @@ impl App {
     fn open_file(&mut self, path: &Path) {
         let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().to_string();
         let Some(p) = path.to_str() else {
-            self.status = Some(format!("{name}: path is not valid UTF-8"));
+            self.warn(format!("{name}: path is not valid UTF-8"));
             return;
         };
         match wav::read(p) {
             Ok((samples, rate)) if rate == SAMPLE_RATE => self.set_source(samples, &name),
             Ok((_, rate)) => {
-                self.status = Some(format!(
+                self.warn(format!(
                     "{name} is {rate} Hz; ragchew needs {SAMPLE_RATE} Hz mono \
                      (ffmpeg -i in -ac 1 -ar {SAMPLE_RATE} out.wav)"
                 ));
             }
-            Err(e) => self.status = Some(format!("{name}: {e}")),
+            Err(e) => self.warn(format!("{name}: {e}")),
         }
     }
 
@@ -1837,7 +1921,7 @@ impl App {
             match Tx::start(self.preferred_output.as_deref()) {
                 Ok(t) => self.tx = Some(t),
                 Err(e) => {
-                    self.status = Some(format!("cannot transmit: {e}"));
+                    self.warn(format!("cannot transmit: {e}"));
                     return;
                 }
             }
@@ -2518,47 +2602,6 @@ impl App {
                     });
                 }
                 ui.separator();
-                {
-                    // A counting readout that sets its own width drags the rest
-                    // of the bar along every time a station appears, so the slot
-                    // is sized once for the widest thing it will ever hold.
-                    // Measured rather than guessed, so it survives text scaling.
-                    let font = egui::TextStyle::Body.resolve(ui.style());
-                    let width = ui
-                        .painter()
-                        .layout_no_wrap("⏳ 8888 channels".to_owned(), font, Color32::PLACEHOLDER)
-                        .size()
-                        .x;
-                    let n = channels.channels().len();
-                    let text = if !live && self.samples.is_empty() {
-                        // Nothing loaded is not the same state as something
-                        // still decoding: the slot stays reserved but empty.
-                        String::new()
-                    } else if !live && self.pending_scans > 0 {
-                        // Counting while the scan is still running: the count is
-                        // real, it is just not final yet.
-                        format!("⏳ {n} channels")
-                    } else {
-                        format!("{n} channels")
-                    };
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(width, ui.spacing().interact_size.y),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| ui.label(text),
-                    );
-                }
-                ui.separator();
-                match &self.status {
-                    Some(err) => {
-                        let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 150, 150));
-                        ui.colored_label(c, format!("⚠ {err}"));
-                    }
-                    None if !live && !self.source.is_empty() => {
-                        ui.weak(&self.source);
-                    }
-                    None => {}
-                }
-                ui.separator();
                 modes_changed = self.modes_menu(ui);
 
                 // Last on the bar, deliberately. Its readout gains and loses
@@ -2647,11 +2690,11 @@ impl App {
             match crate::pipewire::route_from(&s) {
                 Ok(what) => {
                     diag_info!("audio", "routed {what}");
-                    self.status = Some(format!("listening to {}", s.label()));
+                    self.say(format!("listening to {}", s.label()));
                 }
                 Err(e) => {
                     diag_warn!("audio", "could not route from {}: {e}", s.app);
-                    self.status = Some(format!("could not listen to {}: {e}", s.app));
+                    self.warn(format!("could not listen to {}: {e}", s.app));
                 }
             }
             want_pw = true;
@@ -2680,6 +2723,11 @@ impl App {
                 None => self.rescan(),
             }
         }
+
+        // The status line spans the window, so it is claimed before the QSO
+        // panel takes the left of it — shown after the toolbar's handlers above
+        // so that something said this frame is read this frame.
+        self.status_bar(ui, live, channels.channels().len());
 
         // Conversations sit to the left of the panorama, before the central
         // panel claims what is left. New text reaches them here, so a QSO logs
@@ -3444,6 +3492,70 @@ mod tests {
         assert_eq!(app.wf_col, travel + per_px as i64, "travel was not recorded");
     }
 
+    /// Every text the app drew, with where it was drawn.
+    fn drawn(out: &egui::FullOutput) -> Vec<(String, f32)> {
+        out.shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) => Some((t.galley.text().to_string(), t.pos.y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What the app has to say goes along the foot of the window, with the
+    /// channel count, and not on the toolbar.
+    ///
+    /// The toolbar has to stay on one line and was competing for it with the
+    /// controls, so a message long enough to be useful — "could not listen to
+    /// Firefox: …" — had nowhere to go.
+    #[test]
+    fn what_the_app_has_to_say_goes_at_the_foot_of_the_window() {
+        let mut app = app_with_traffic(30.0);
+        app.say("listening to Firefox — Northern Utah WebSDR");
+        let out = lay_out(&mut app);
+        let drawn = drawn(&out);
+
+        let find = |needle: &str| {
+            drawn
+                .iter()
+                .find(|(s, _)| s.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} was not drawn at all; saw {drawn:?}"))
+                .1
+        };
+        let msg = find("listening to Firefox");
+        let count = find("channels");
+
+        // 800 tall, per `lay_out`. Both on the same row at the bottom.
+        assert!(msg > 700.0, "the message sits at y={msg} of 800, not at the foot");
+        assert!(
+            (msg - count).abs() < 1.0,
+            "the message ({msg}) and the channel count ({count}) are not on one line"
+        );
+    }
+
+    /// News that something worked is not dressed up as a fault.
+    ///
+    /// Both went through one `Option<String>` before, so "listening to Firefox"
+    /// came out under the same red warning triangle as a failed open — the app
+    /// announcing good news as a problem.
+    #[test]
+    fn good_news_is_not_shown_as_a_warning() {
+        let mut app = app_with_traffic(30.0);
+        app.say("listening to Firefox");
+        assert!(
+            drawn(&lay_out(&mut app)).iter().any(|(s, _)| s == "listening to Firefox"),
+            "an ordinary note should be drawn as it was written"
+        );
+
+        let mut app = app_with_traffic(30.0);
+        app.warn("could not listen to Firefox");
+        assert!(
+            drawn(&lay_out(&mut app)).iter().any(|(s, _)| s == "⚠ could not listen to Firefox"),
+            "a fault should be marked as one"
+        );
+    }
+
     /// The whole composer sits at the foot of the QSO panel — the reply box as
     /// well as the button under it — and the log fills the space above.
     ///
@@ -3460,11 +3572,13 @@ mod tests {
         let window_h = 800.0f32; // per `lay_out`
         let out = lay_out(&mut app);
         let (mut reply_y, mut send_y, mut lowest_log_y) = (None, None, f32::MIN);
+        let mut status_y = None;
         for cs in &out.shapes {
             if let egui::Shape::Text(t) = &cs.shape {
                 match t.galley.text() {
                     "Send" => send_y = Some(t.pos.y),
                     "reply…" => reply_y = Some(t.pos.y),
+                    s if s.ends_with("channels") => status_y = Some(t.pos.y),
                     s if s.contains("K2N") => lowest_log_y = lowest_log_y.max(t.pos.y),
                     _ => {}
                 }
@@ -3472,12 +3586,17 @@ mod tests {
         }
         let send_y = send_y.expect("the Send button should be drawn");
         let reply_y = reply_y.expect("the reply box should be drawn");
-
-        // Measured at 725 and 777 of 800. The margin covers padding and font
-        // metrics; real space left below the composer should fail this.
+        // The status line is the floor now, not the window's edge. Measured at
+        // 784 of 800, with Send at 754.5 just above it.
+        let floor = status_y.expect("the status bar should be drawn");
         assert!(
-            send_y > window_h - 40.0,
-            "Send sits at y={send_y} in an {window_h}-tall window, not at the foot of it"
+            send_y < floor,
+            "Send at y={send_y} is below the status line at {floor}"
+        );
+        assert!(
+            send_y > floor - 40.0,
+            "Send sits at y={send_y}, adrift of the status line at {floor} rather than \
+             at the foot of the panel"
         );
         assert!(
             reply_y > window_h - 120.0,
