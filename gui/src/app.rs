@@ -35,6 +35,7 @@ use crate::traffic;
 use crate::{diag_info, diag_warn};
 use crate::qso::{Dir, QsoSet};
 use crate::scene::{self, Geometry};
+use crate::sparkline;
 use crate::tx::{self, Tx};
 use crate::waterfall::{self, Viewport};
 
@@ -1835,6 +1836,22 @@ impl App {
             }
             ui.end_row();
 
+            // How that SNR has been behaving, under the number it is the
+            // history of. A row of its own rather than the end of the one
+            // above: those numbers already want more width than the narrowest
+            // panel has, and the trace is worth more wide than it is squeezed.
+            // The row appears only once there is a shape in it.
+            let fade = sparkline::Snr::new(&q.snr_history, q.mode, now_s)
+                .color(mode_text_color(ui.visuals().dark_mode, q.mode));
+            if bound && fade.would_draw() {
+                ui.label("");
+                // Capped rather than simply taking the width: a widget that
+                // eats whatever a grid cell offers can ratchet the column wider
+                // every frame, since the offer is made from the last one.
+                fade.size(ui.available_width().min(220.0), 18.0).show(ui);
+                ui.end_row();
+            }
+
             ui.label("Mode");
             if bound {
                 let c = mode_text_color(ui.visuals().dark_mode, q.mode);
@@ -3101,6 +3118,13 @@ impl App {
                             }
                             _ => ui.weak("SNR not measured"),
                         };
+                        // Bigger here than in a QSO, because this is the card
+                        // you read while deciding who to call, and how a
+                        // station has been fading is most of that decision.
+                        sparkline::Snr::new(&ch.snr_history, ch.mode, t_now)
+                            .size(200.0, 32.0)
+                            .color(color)
+                            .show(ui);
                         ui.weak(format!(
                             "confidence ×{:.1} of the mode's noise floor (best ×{:.1})",
                             ch.quality, ch.best_quality
@@ -3736,6 +3760,44 @@ mod tests {
         assert_eq!(drawn, text.chars().count(), "the panel drew {drawn} of {} characters", text.chars().count());
     }
 
+
+    /// A station's fading reaches the screen, and only once there is fading to
+    /// show.
+    ///
+    /// The sparkline is the one thing in the QSO panel that draws no text, so a
+    /// broken one is invisible to every other test here — and it is drawn from
+    /// a series the panel is handed rather than one it can see being built.
+    /// Counting the paths it puts on the screen is what tells the two apart.
+    #[test]
+    fn a_fading_station_is_drawn_in_the_qso_panel() {
+        let paths = |out: &egui::FullOutput| {
+            out.shapes.iter().filter(|cs| matches!(cs.shape, egui::Shape::Path(_))).count()
+        };
+
+        let mut app = app_with_traffic(30.0);
+        lay_out(&mut app);
+        let channels = app.channels_now();
+        app.qsos.open_for_channel(&channels.channels()[0], app.t_now);
+        // Nothing measured yet: the panel is the same panel it was.
+        let bare = paths(&lay_out(&mut app));
+
+        // Twenty frames of a station swinging 14 dB, ending at the clock.
+        app.qsos.qsos_mut()[0].snr_history = (0..20)
+            .map(|i| (app.t_now - (19 - i) as f64 * 1.5, -10.0 + 7.0 * (i as f32 * 0.7).sin()))
+            .collect();
+        let fading = paths(&lay_out(&mut app));
+        assert!(fading > bare, "the SNR history drew nothing ({bare} paths either way)");
+
+        // It has a row to itself, so the narrowest panel the operator can drag
+        // to is still a panel it lays out in. The plot takes the width it is
+        // offered there rather than the width it would like.
+        app.qso_w = MIN_QSO_W;
+        assert!(paths(&lay_out(&mut app)) > bare, "nothing drawn in a narrow panel");
+
+        // Four samples is not a shape, and the row does not appear for it.
+        app.qsos.qsos_mut()[0].snr_history.truncate(sparkline::MIN_POINTS - 1);
+        assert_eq!(paths(&lay_out(&mut app)), bare, "a plot was drawn from too little");
+    }
 
     /// The file view reconciles what its per-mode scans found, once they are
     /// all in.

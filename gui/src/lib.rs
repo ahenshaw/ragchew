@@ -26,5 +26,8 @@ pub mod audio;
 /// about a live capture, which is a thing only the interactive app has.
 #[cfg(feature = "desktop")]
 pub mod pipewire;
+/// A station's SNR history, drawn small. Desktop-only: it is a widget.
+#[cfg(feature = "desktop")]
+pub mod sparkline;
 #[cfg(feature = "desktop")]
 pub mod tx;

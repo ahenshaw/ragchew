@@ -22,8 +22,9 @@ use ragchew::protocol::{Decode, ModeId};
 /// of thousands of characters to miss any: see [`Channel::text_dropped`].
 const MAX_TEXT_CHARS: usize = 4096;
 
-/// How many (time, frequency) samples a channel keeps, beyond the first.
-const MAX_HISTORY: usize = 256;
+/// How many (time, frequency) and (time, SNR) samples a channel keeps, beyond
+/// the first.
+pub const MAX_HISTORY: usize = 256;
 
 /// A tracked signal accumulating text across transmissions.
 #[derive(Clone, Debug)]
@@ -87,6 +88,20 @@ pub struct Channel {
     /// kept: a station fading in and out is better summarised by its peak than
     /// by wherever it happened to be on the last block.
     pub best_snr_db: Option<f32>,
+    /// Recent (time_s, snr_db) samples, for drawing how the station has been
+    /// fading. Bounded to [`MAX_HISTORY`]; the oldest are dropped.
+    ///
+    /// Recorded here for the reason [`Channel::breaks`] is: this is the only
+    /// place a decode still has its own instant. A reader sampling `snr_db`
+    /// once a frame would be sampling a series it cannot see the clock of —
+    /// too slow for PSK, where several characters land between frames, and
+    /// aliased against the cycle on JS8.
+    ///
+    /// Decodes that could not be measured leave no sample rather than a zero:
+    /// see [`ragchew::protocol::Decode::snr_db`]. The gaps that matter — a
+    /// station that stopped transmitting — are read off the times, since a
+    /// silence is a stretch with no samples in it either way.
+    pub snr_history: Vec<(f64, f32)>,
     /// Number of decodes accumulated.
     pub chunks: usize,
 }
@@ -208,6 +223,10 @@ impl ChannelSet {
                 if let Some(snr) = d.snr_db {
                     ch.snr_db = Some(snr);
                     ch.best_snr_db = Some(ch.best_snr_db.map_or(snr, |b: f32| b.max(snr)));
+                    ch.snr_history.push((d.time_s, snr));
+                    if ch.snr_history.len() > MAX_HISTORY {
+                        ch.snr_history.remove(0);
+                    }
                 }
                 ch.chunks += 1;
             }
@@ -229,6 +248,7 @@ impl ChannelSet {
                     best_quality: d.quality,
                     snr_db: d.snr_db,
                     best_snr_db: d.snr_db,
+                    snr_history: d.snr_db.map_or_else(Vec::new, |s| vec![(d.time_s, s)]),
                     chunks: 1,
                     breaks: Vec::new(),
                 });
@@ -412,6 +432,64 @@ mod tests {
             "drift {} should be {expected} from where it started",
             ch.drift_hz()
         );
+    }
+
+    /// The SNR series is recorded against each decode's own time, keeps only
+    /// what was measured, and is bounded like the frequency history beside it.
+    ///
+    /// The gap in the middle is what a station going quiet leaves behind: no
+    /// samples at all, rather than samples at nothing. A reader that drew a
+    /// zero there would be drawing a collapse into the noise that never
+    /// happened — the station simply stopped talking.
+    #[test]
+    fn snr_history_records_only_what_was_measured() {
+        let mut set = ChannelSet::new(15.0);
+        let snr = |i: usize| match i {
+            10..=20 => None,
+            _ => Some(-6.0 - i as f32 * 0.1),
+        };
+        for i in 0..(MAX_HISTORY * 2) {
+            set.add(Decode {
+                snr_db: snr(i),
+                hz: 1000.0,
+                time_s: i as f64 * 15.0,
+                text: "x".to_string(),
+                mode: ModeId::Js8(js8::Mode::Normal),
+                quality: 4.0,
+            });
+        }
+        let ch = &set.channels()[0];
+        assert_eq!(ch.snr_history.len(), MAX_HISTORY, "the series is not at its bound");
+        // The newest sample is the one kept, and it is the one reported.
+        let &(t, db) = ch.snr_history.last().expect("something was recorded");
+        assert_eq!(t, (MAX_HISTORY * 2 - 1) as f64 * 15.0, "the wrong end was trimmed");
+        assert_eq!(Some(db), ch.snr_db);
+        // Times are strictly increasing and each carries its own decode's
+        // value — no interpolation, no filler for the unmeasured ones.
+        assert!(
+            ch.snr_history.windows(2).all(|w| w[1].0 > w[0].0),
+            "samples are out of order"
+        );
+        for &(t, db) in &ch.snr_history {
+            let i = (t / 15.0).round() as usize;
+            assert_eq!(Some(db), snr(i), "sample at {t} s does not match its decode");
+        }
+    }
+
+    /// A channel that has never been measured has no series at all, rather than
+    /// a series of nothing.
+    #[test]
+    fn an_unmeasured_channel_has_no_series() {
+        let mut set = ChannelSet::new(15.0);
+        set.add(Decode {
+            snr_db: None,
+            hz: 1000.0,
+            time_s: 0.0,
+            text: "x".to_string(),
+            mode: ModeId::Js8(js8::Mode::Normal),
+            quality: 4.0,
+        });
+        assert!(set.channels()[0].snr_history.is_empty());
     }
 
     /// Text longer than the bound in a single decode still leaves the channel

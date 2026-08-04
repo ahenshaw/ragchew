@@ -50,6 +50,15 @@ pub struct Entry {
     pub text: String,
 }
 
+/// How many (time, SNR) samples a QSO keeps.
+///
+/// Twice what a channel holds, because this is the record of one conversation
+/// rather than a rolling window over the band, and a long ragchew on PSK — a
+/// sample per character — would otherwise lose its first half hour. At the far
+/// end it is still bounded: the set is cloned once a frame like everything else
+/// here.
+pub const MAX_SNR_POINTS: usize = 512;
+
 /// The signal report this mode's exchange is made of, for a station measured
 /// at `snr_db` — or `None` where a measurement does not determine one.
 ///
@@ -168,6 +177,14 @@ pub struct Qso {
     /// which is what makes it worth offering as a signal report.
     pub snr_db: Option<f32>,
     pub best_snr_db: Option<f32>,
+    /// Live from the bound channel: (time_s, snr_db) for every decode measured
+    /// since the QSO opened, oldest first, bounded to [`MAX_SNR_POINTS`].
+    ///
+    /// Kept here rather than read off the channel because a QSO outlives what
+    /// the channel holds — [`Channel::snr_history`] is trimmed to its own
+    /// bound, and a conversation is entitled to the shape of the whole path,
+    /// not to the last few minutes of it.
+    pub snr_history: Vec<(f64, f32)>,
     /// Audio-clock time the station was first heard (or the tab was opened, for
     /// a blank one), and when it was last heard from.
     pub started_s: f64,
@@ -241,6 +258,27 @@ impl Qso {
         }
     }
 
+    /// Take the SNR samples the channel has recorded since last time.
+    ///
+    /// Separate from the text, and taken by time rather than by count, because
+    /// the two series are trimmed against different bounds: a channel that has
+    /// dropped the front of its history is not a channel that has decoded
+    /// anything new.
+    fn take_snr(&mut self, ch: &Channel) {
+        // Scrubbing the playback clock backwards rebuilds the channel out of
+        // less audio, and samples we hold from beyond where it now ends are
+        // from a future that has not been decoded yet. Dropping them is the
+        // same rewind `absorb` guards against for the text, and it is why this
+        // sits above that guard rather than after it.
+        self.snr_history.retain(|&(t, _)| t <= ch.last_heard_s);
+        let last = self.snr_history.last().map_or(f64::NEG_INFINITY, |&(t, _)| t);
+        self.snr_history.extend(ch.snr_history.iter().filter(|&&(t, _)| t > last));
+        if self.snr_history.len() > MAX_SNR_POINTS {
+            let over = self.snr_history.len() - MAX_SNR_POINTS;
+            self.snr_history.drain(..over);
+        }
+    }
+
     /// Take whatever the followed channel has decoded since last time.
     ///
     /// The channel accumulates one long string, so the new tail is the whole of
@@ -263,6 +301,7 @@ impl Qso {
         self.quality = ch.quality;
         self.snr_db = ch.snr_db;
         self.best_snr_db = ch.best_snr_db;
+        self.take_snr(ch);
         // The report follows the most recent decode rather than the best one:
         // what you send is what you just copied, which is also what WSJT-X and
         // JS8Call report.
@@ -403,6 +442,7 @@ impl QsoSet {
             quality: ch.quality,
             snr_db: ch.snr_db,
             best_snr_db: ch.best_snr_db,
+            snr_history: Vec::new(),
             started_s: ch.first_heard_s,
             last_s: ch.last_heard_s,
             started_utc: backdated(now_s - ch.first_heard_s),
@@ -445,6 +485,7 @@ impl QsoSet {
             quality: 0.0,
             snr_db: None,
             best_snr_db: None,
+            snr_history: Vec::new(),
             started_s: now_s,
             last_s: now_s,
             started_utc: SystemTime::now(),
@@ -614,6 +655,86 @@ mod tests {
         t
     }
 
+
+    fn measured(t: f64, snr: f32) -> Decode {
+        Decode {
+            snr_db: Some(snr),
+            mode: ModeId::Js8(js8::Mode::Normal),
+            hz: 1000.0,
+            time_s: t,
+            quality: 4.0,
+            text: "DE K2N ".to_string(),
+        }
+    }
+
+    /// A QSO takes the whole series the channel has, keeps it in time order,
+    /// and takes each sample once however often it looks.
+    ///
+    /// Absorbing runs every frame — hundreds of times between two JS8 frames —
+    /// so "once" is the property that matters: a series that grew by a sample
+    /// per frame would draw its own refresh rate rather than the path.
+    #[test]
+    fn a_qso_takes_each_snr_sample_once() {
+        let mut set = ChannelSet::from_decodes([measured(0.0, -12.0)], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        assert_eq!(qsos.qsos()[0].snr_history, vec![(0.0, -12.0)], "the QSO opened empty");
+
+        for (i, snr) in [-9.0f32, -14.5, -3.0].iter().enumerate() {
+            set.add(measured((i + 1) as f64 * 15.0, *snr));
+            // Several times over, as the app does between one decode and the next.
+            for _ in 0..5 {
+                qsos.absorb(&set);
+            }
+        }
+        assert_eq!(
+            qsos.qsos()[0].snr_history,
+            vec![(0.0, -12.0), (15.0, -9.0), (30.0, -14.5), (45.0, -3.0)]
+        );
+    }
+
+    /// Scrubbing the playback clock backwards un-hears what was heard after it.
+    ///
+    /// The file view rebuilds its channels from the decodes up to the clock, so
+    /// a rewind hands the QSO a channel that ends earlier than the series it is
+    /// holding. Those samples are of audio that has not been played yet.
+    #[test]
+    fn rewinding_drops_snr_from_the_future() {
+        let all = [
+            measured(0.0, -12.0),
+            measured(15.0, -9.0),
+            measured(30.0, -14.5),
+            measured(45.0, -3.0),
+        ];
+        let mut qsos = QsoSet::new();
+        let set = ChannelSet::from_decodes(all.clone(), 15.0);
+        qsos.open_for_channel(&set.channels()[0], 45.0);
+        assert_eq!(qsos.qsos()[0].snr_history.len(), 4);
+
+        // Back to 20 s: the channel is rebuilt from the first two decodes only.
+        let rewound = ChannelSet::from_decodes(all[..2].to_vec(), 15.0);
+        qsos.absorb(&rewound);
+        assert_eq!(qsos.qsos()[0].snr_history, vec![(0.0, -12.0), (15.0, -9.0)]);
+
+        // And playing forward again re-takes them, once each.
+        qsos.absorb(&set);
+        assert_eq!(qsos.qsos()[0].snr_history.len(), 4, "the series did not come back");
+    }
+
+    /// A long conversation stays bounded, and it is the oldest that goes.
+    #[test]
+    fn the_snr_series_is_bounded() {
+        let mut set = ChannelSet::from_decodes([measured(0.0, -12.0)], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        for i in 1..(MAX_SNR_POINTS * 2) {
+            set.add(measured(i as f64 * 15.0, -6.0));
+            qsos.absorb(&set);
+        }
+        let h = &qsos.qsos()[0].snr_history;
+        assert_eq!(h.len(), MAX_SNR_POINTS, "the series is not at its bound");
+        assert_eq!(h.last().expect("bounded, not empty").0, (MAX_SNR_POINTS * 2 - 1) as f64 * 15.0);
+    }
 
     /// A JS8 report is transcription: the exchange *is* the SNR, so the field
     /// is filled from the measurement and follows the station while it is
