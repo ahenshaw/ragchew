@@ -139,6 +139,35 @@ struct Args {
     #[arg(long, conflicts_with = "log_dir")]
     no_log: bool,
 
+    /// Add ragchew to the desktop's application menu, and exit.
+    ///
+    /// Writes a launcher entry and its icons under `$XDG_DATA_HOME`
+    /// (`~/.local/share`), pointing at the binary this was run from — so run
+    /// the one you mean to keep, and run it again if you move it. Needs no
+    /// privileges, and is undone by deleting the files it names.
+    #[arg(long)]
+    install: bool,
+}
+
+/// Write the launcher entry, for this binary, where the desktop looks.
+///
+/// The path recorded is [`std::env::current_exe`] — the copy being run right
+/// now. That is the only path that is certainly right, and it is why this is a
+/// flag on the app rather than a script that would have to be told.
+fn install_launcher() -> Result<Vec<std::path::PathBuf>, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot tell where this binary is: {e}"))?;
+    // Resolved, so a launcher started months later does not follow a symlink
+    // into a build directory that has been rebuilt under it.
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let root = if let Some(x) = std::env::var_os("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+        std::path::PathBuf::from(x)
+    } else if let Some(h) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        std::path::PathBuf::from(h).join(".local/share")
+    } else {
+        return Err("neither XDG_DATA_HOME nor HOME is set; nowhere to install".into());
+    };
+    crate::desktop::install(&root, &exe)
 }
 
 /// Side of the window icon handed to the window manager, in pixels.
@@ -149,6 +178,28 @@ const ICON_PX: usize = 256;
 
 pub fn run() -> eframe::Result<()> {
     let args = <Args as clap::Parser>::parse();
+
+    // Installing is an errand, not a session: do it, say what was written, and
+    // stop. Before the log is opened, for the same reason the batch job below
+    // is — an errand has no business rotating away an overnight session's log.
+    if args.install {
+        match install_launcher() {
+            Ok(wrote) => {
+                for p in &wrote {
+                    eprintln!("wrote {}", p.display());
+                }
+                eprintln!(
+                    "\nragchew is now in the application menu. If it does not appear at \
+                     once, log out and back in — some desktops only rescan then."
+                );
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // A file plus --csv is a conversion, not a session: decode it, write the
     // rows, say what happened and stop. It runs before the log is opened and

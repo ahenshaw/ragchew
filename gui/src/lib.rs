@@ -8,6 +8,7 @@ pub mod channels;
 pub mod colormap;
 pub mod continuous;
 pub mod demo;
+pub mod desktop;
 pub mod diag;
 pub mod icon;
 pub mod layout;
