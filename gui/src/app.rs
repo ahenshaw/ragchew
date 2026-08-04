@@ -138,7 +138,14 @@ struct Args {
     /// Do not write a log file.
     #[arg(long, conflicts_with = "log_dir")]
     no_log: bool,
+
 }
+
+/// Side of the window icon handed to the window manager, in pixels.
+///
+/// Larger than anything a title bar or a task switcher asks for, since they
+/// scale down from what they are given and scaling up looks like a mistake.
+const ICON_PX: usize = 256;
 
 pub fn run() -> eframe::Result<()> {
     let args = <Args as clap::Parser>::parse();
@@ -206,7 +213,15 @@ pub fn run() -> eframe::Result<()> {
         // separate settings and none of them would agree.
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_app_id("ragchew"),
+            .with_app_id("ragchew")
+            // Drawn here rather than carried as a file, so it cannot drift away
+            // from the palette it is made of. 256 is the largest a window
+            // manager asks for; see `icon` for what it costs.
+            .with_icon(egui::IconData {
+                rgba: crate::icon::rgba(ICON_PX),
+                width: ICON_PX as u32,
+                height: ICON_PX as u32,
+            }),
         persist_window: true,
         ..Default::default()
     };

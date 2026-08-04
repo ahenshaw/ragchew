@@ -9,6 +9,7 @@ pub mod colormap;
 pub mod continuous;
 pub mod demo;
 pub mod diag;
+pub mod icon;
 pub mod layout;
 pub mod qso;
 pub mod record;
