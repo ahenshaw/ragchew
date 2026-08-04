@@ -1734,6 +1734,61 @@ impl App {
             });
     }
 
+    /// One entry's text, with a dim bar wherever two packets were joined.
+    ///
+    /// A JS8 over is several frames a cycle apart, and the log now reads them
+    /// as one paragraph — which is how a station means them and how it types
+    /// them, but it does hide something real. Where the seams fall says how the
+    /// message was carried: a short sentence split across four cycles took a
+    /// minute of air time and was probably being repeated by its own software.
+    /// So the seams stay visible, at the weight of punctuation rather than of
+    /// text, and each carries the time its frame started.
+    ///
+    /// One galley for the lot, rather than a row of labels, so that the entry
+    /// wraps as the paragraph it is: a run of side-by-side widgets would break
+    /// at every seam instead of at the edge of the panel.
+    fn entry_text(ui: &mut egui::Ui, e: &crate::qso::Entry, color: Color32, from_s: f64) {
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        let body = egui::TextFormat { font_id: font.clone(), color, ..Default::default() };
+        let seam = egui::TextFormat {
+            font_id: font,
+            // Half the weight of the text it separates: present when looked
+            // for, invisible when read past.
+            color: color.gamma_multiply(0.4),
+            ..Default::default()
+        };
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = ui.available_width();
+        let mut from = 0usize;
+        for &(at, _) in &e.marks {
+            let cut = e.text.char_indices().nth(at).map_or(e.text.len(), |(i, _)| i);
+            let head = e.text.get(from..cut).unwrap_or("");
+            job.append(head, 0.0, body.clone());
+            job.append("│", 0.0, seam.clone());
+            from = cut;
+        }
+        job.append(e.text.get(from..).unwrap_or(""), 0.0, body.clone());
+
+        // `.wrap()` as well as the job's own width: a label in a horizontal
+        // layout extends by default, and that default overrides the width set
+        // on the job rather than deferring to it. Without it a long over lays
+        // itself out past the edge of the window.
+        let resp = ui.add(egui::Label::new(job).wrap());
+        // The times go on the hover rather than into the line, where they would
+        // cost more width than the text they annotate.
+        if !e.marks.is_empty() {
+            // `clock` rather than `offset`, which pads for the log's column and
+            // would set the times ragged inside a sentence.
+            let times: Vec<String> = e.marks.iter().map(|&(_, t)| clock(t - from_s)).collect();
+            resp.on_hover_text(format!(
+                "{} frames — this one began at {}, the rest at {}",
+                e.marks.len() + 1,
+                clock(e.at_s - from_s),
+                times.join(", ")
+            ));
+        }
+    }
+
     /// The RX/TX marker on a log line: the tag set smaller than the body text
     /// and boxed in a thin outline, so it reads as a label on the line rather
     /// than as the first word of what was said. Colour alone did not separate
@@ -1980,12 +2035,7 @@ impl App {
                         ui.horizontal_top(|ui| {
                             ui.monospace(offset(e.at_s - q.started_s));
                             Self::dir_badge(ui, tag, color);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&e.text).monospace().color(color),
-                                )
-                                .wrap(),
-                            );
+                            Self::entry_text(ui, e, color, q.started_s);
                         });
                     }
                 });
@@ -3761,6 +3811,69 @@ mod tests {
     }
 
 
+    /// The seams between joined frames reach the screen, in the text and not
+    /// beside it.
+    ///
+    /// The bar is drawn as part of the entry's own galley so the paragraph
+    /// wraps at the panel edge rather than at every join — which means it has
+    /// to turn up *inside* the laid-out text, and a test that only counted
+    /// shapes would not know the difference.
+    #[test]
+    fn joined_frames_are_drawn_with_their_seams() {
+        let mut app = app_with_traffic(40.0);
+        lay_out(&mut app);
+        let channels = app.channels_now();
+        app.qsos.open_for_channel(&channels.channels()[0], app.t_now);
+        let out = lay_out(&mut app);
+
+        let q = &app.qsos.qsos()[0];
+        assert_eq!(q.log.len(), 1, "the two frames did not join");
+        assert_eq!(q.log[0].marks.len(), 1, "no seam between them");
+
+        let drawn: String = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("FN20") => {
+                    Some(t.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!drawn.is_empty(), "the joined entry never reached the screen");
+        assert!(drawn.contains('│'), "the entry was drawn without its seam: {drawn:?}");
+        // The text itself stays what the station said, bars and all being the
+        // panel's business: what is logged and copied has none in it.
+        assert!(!q.log[0].text.contains('│'), "a seam got into the log text");
+
+        // And a long over still wraps inside the panel. The seams are drawn by
+        // laying the whole entry out as one galley, which is what keeps the
+        // paragraph wrapping at the panel edge — a row of labels, one per
+        // frame, would wrap at the seams instead and would pass every
+        // assertion above.
+        let long = "FN20 5W ".repeat(20);
+        let marks = (1..8).map(|i| (i * 40, i as f64)).collect();
+        app.qsos.qsos_mut()[0].log[0] = crate::qso::Entry {
+            at_s: 0.0,
+            dir: Dir::Rx,
+            text: long,
+            marks,
+        };
+        let out = lay_out(&mut app);
+        let widest = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("FN20") => {
+                    Some(t.galley.size().x)
+                }
+                _ => None,
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(widest > 0.0, "the long entry never reached the screen");
+        assert!(widest <= app.qso_w, "the entry laid out {widest:.0} wide in {} points", app.qso_w);
+    }
+
     /// A station's fading reaches the screen, and only once there is fading to
     /// show.
     ///
@@ -3817,6 +3930,7 @@ mod tests {
             time_s: at,
             quality: 4.0,
             text: text.to_string(),
+            ends_over: false,
         };
         let olivia = ModeId::Olivia(ragchew::olivia::OL_4_125);
         let psk = ModeId::Psk(ragchew::psk::PSK31);
@@ -3855,6 +3969,7 @@ mod tests {
             time_s: at,
             quality: 4.2,
             text: text.to_string(),
+            ends_over: false,
         };
         app.frames = [
             d(1000.0, 1.0, "CQ CQ DE K2N "),
@@ -3904,8 +4019,12 @@ mod tests {
         app.t_now = 40.0;
         lay_out(&mut app);
         let q = &app.qsos.qsos()[0];
-        assert_eq!(q.log.len(), 2, "second decode did not reach the log");
-        assert!(q.log[1].text.contains("FN20"), "logged {:?}", q.log[1].text);
+        // One over, still: the two frames are 15 s apart on a 15 s cycle, and
+        // the station never said it had finished. The seam between them is
+        // what shows there were two.
+        assert_eq!(q.log.len(), 1, "one over came out as {} entries", q.log.len());
+        assert!(q.log[0].text.contains("FN20"), "logged {:?}", q.log[0].text);
+        assert_eq!(q.log[0].marks.len(), 1, "the join between the frames is unmarked");
     }
 
     /// Every step is a round number a reader can do arithmetic with.

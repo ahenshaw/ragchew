@@ -59,8 +59,24 @@ pub struct Channel {
     /// that sees each decode's own time. By the time a reader has the channel,
     /// the text is one string and the silences in it are gone.
     ///
-    /// Empty for cycle-aligned modes: a JS8 frame is a whole utterance already.
+    /// A cycle-aligned mode gets them too, and for the same purpose, though it
+    /// arrives at them differently: JS8 frames carry a flag for the end of an
+    /// over, so most breaks here are the station's own word for it rather than
+    /// a timing. See [`Channel::over_ended`].
     pub breaks: Vec<(usize, f64)>,
+    /// Where each frame of a cycle-aligned mode begins: `(character index, the
+    /// time it started)`, indexed and trimmed like [`Channel::breaks`].
+    ///
+    /// A JS8 frame is a fixed-size packet, and a sentence is several of them a
+    /// cycle apart. Joined into a paragraph the seams are invisible, which is
+    /// how it should read — but the seams are also where the timing is, and on
+    /// this mode the timing is diagnostic: a station that took four cycles to
+    /// say six words was being repeated by its own software. So they are kept,
+    /// for the log to mark rather than to break on.
+    ///
+    /// Empty for the continuous modes, where a "frame" is a character or a
+    /// two-second block and marking them would be marking nothing.
+    pub frames: Vec<(usize, f64)>,
     /// Character count of the most recently appended chunk (for the scroll-in
     /// animation).
     pub last_chunk_chars: usize,
@@ -104,6 +120,46 @@ pub struct Channel {
     pub snr_history: Vec<(f64, f32)>,
     /// Number of decodes accumulated.
     pub chunks: usize,
+    /// Whether the last decode said it finished what the station was saying.
+    ///
+    /// The next decode to arrive therefore starts a new over, whatever the
+    /// clock says — see [`ragchew::protocol::Decode::ends_over`]. Held rather
+    /// than acted on at once because an over ends where the *following* frame
+    /// begins, and that index does not exist until the following frame does.
+    pub over_ended: bool,
+    /// Who is talking, if a frame in this over said so.
+    ///
+    /// Two stations working each other on JS8 usually share one offset — the
+    /// answering station replies where it heard the call — so a channel is a
+    /// frequency, not a speaker. Joining frames into a paragraph without
+    /// watching this would put both halves of the exchange in one paragraph.
+    pub over_sender: Option<String>,
+}
+
+/// The callsign a JS8 frame names as its sender, if it names one.
+///
+/// Two of the four frame types this crate parses carry one where a reader can
+/// see it: a heartbeat or CQ renders as `KN4CRD: CQ CQ CQ EM73`, and a directed
+/// message as `[KN4CRD JY1 SNR -12]`. Free text and dense frames carry no
+/// callsign at all, which is why this returns an option and why nothing may
+/// conclude from `None` that the speaker changed.
+///
+/// The shape test is deliberately loose — something with both a letter and a
+/// digit in it — rather than the ITU pattern [`crate::qso::callsign_in`]
+/// applies. It is guarding against a free-text frame that happens to open with
+/// a word and a colon, and the cost of being wrong either way is small: a
+/// missed split reads as one long over, and a spurious one reads as the log
+/// already read before any of this.
+pub fn sender_in(text: &str) -> Option<&str> {
+    let token = match text.strip_prefix('[') {
+        Some(rest) => rest.split([' ', ']']).next()?,
+        None => text.split_whitespace().next()?.strip_suffix(':')?,
+    };
+    let call_ish = (3..=11).contains(&token.len())
+        && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+        && token.chars().any(|c| c.is_ascii_digit())
+        && token.chars().any(|c| c.is_ascii_alphabetic());
+    call_ish.then_some(token)
 }
 
 impl Channel {
@@ -129,8 +185,10 @@ impl Channel {
         let cut = self.text.char_indices().nth(drop).map_or(self.text.len(), |(i, _)| i);
         self.text.drain(..cut);
         self.text_dropped += drop;
-        // A break in text nobody can read any more says nothing.
+        // A break in text nobody can read any more says nothing, and neither
+        // does a seam between two frames that have both gone.
         self.breaks.retain(|&(i, _)| i >= self.text_dropped);
+        self.frames.retain(|&(i, _)| i >= self.text_dropped);
     }
 
     /// Absolute index of the next character this channel will take.
@@ -139,8 +197,7 @@ impl Channel {
     }
 }
 
-/// How long a station must go quiet before what it sends next is a new over —
-/// or `None` for a mode whose decodes are whole utterances already.
+/// How long a station must go quiet before what it sends next is a new over.
 ///
 /// Five seconds is long enough to type a word badly and short enough to be a
 /// pause rather than a hesitation. Fast modes are held to it as a floor:
@@ -149,16 +206,19 @@ impl Channel {
 /// room to be slow — Olivia sends a block every two seconds, and two of those
 /// in a row are not a pause.
 ///
-/// Cycle-aligned modes are exempt rather than merely slow. A JS8 frame is a
-/// packed, self-contained message sent on a UTC boundary, so one frame is one
-/// thing said. The split is the same one the decode threads make
-/// ([`audio::spawn_decoder`](crate::audio::spawn_decoder)), for the same
-/// reason: a schedule is either there to be used or it is not.
-pub fn over_gap_s(mode: ModeId) -> Option<f64> {
-    if mode.period_s().is_some() {
-        return None;
+/// A cycle-aligned mode is measured against its *period* rather than the length
+/// of its frame, and given only half a cycle of slack: consecutive frames start
+/// exactly one period apart, and JS8 Turbo spends under four seconds of its six
+/// transmitting, so anything looser than this would count a frame that failed
+/// to decode as continued speech. This is the weakest of the three things that
+/// end an over there — the station's own end-of-over flag is the first, and a
+/// change of sender the second — and it exists for the case those cannot cover:
+/// a final frame lost to the noise, which in this mode is an ordinary evening.
+pub fn over_gap_s(mode: ModeId) -> f64 {
+    match mode.period_s() {
+        Some(p) => p as f64 * 1.5,
+        None => (4.0 * mode.chunk_secs()).max(MIN_OVER_GAP_S),
     }
-    Some((4.0 * mode.chunk_secs()).max(MIN_OVER_GAP_S))
 }
 
 /// Shortest silence that ends an over, however fast the mode is.
@@ -208,14 +268,33 @@ impl ChannelSet {
                     ch.hz_history.remove(0);
                 }
                 ch.last_chunk_chars = d.text.chars().count();
-                // Measured here because here is the only place the times are
+                // Decided here because here is the only place the times are
                 // still separate: one decode, one instant. Recorded before the
                 // text goes on, so the index is where the new over starts.
-                if let Some(limit) = over_gap_s(d.mode) {
-                    if d.time_s - ch.last_heard_s > limit {
-                        ch.breaks.push((ch.next_index(), d.time_s));
-                    }
+                let sender = sender_in(&d.text).map(str::to_string);
+                let changed_hands = match (&ch.over_sender, &sender) {
+                    (Some(was), Some(now)) => was != now,
+                    // A frame with no callsign in it — free text, which is most
+                    // of a JS8 ragchew — is nobody new. Claiming otherwise would
+                    // split every over that started with a directed frame and
+                    // carried on in free text, which is the shape of an ordinary
+                    // reply.
+                    _ => false,
+                };
+                let quiet = d.time_s - ch.last_heard_s > over_gap_s(d.mode);
+                if ch.over_ended || changed_hands || quiet {
+                    ch.breaks.push((ch.next_index(), d.time_s));
+                    ch.over_sender = sender;
+                } else if ch.over_sender.is_none() {
+                    // An over that began without a name can still acquire one:
+                    // free text followed by a directed frame is one station, and
+                    // the second frame is the one that says which.
+                    ch.over_sender = sender;
                 }
+                if d.mode.period_s().is_some() {
+                    ch.frames.push((ch.next_index(), d.time_s));
+                }
+                ch.over_ended = d.ends_over;
                 ch.push_text(&d.text);
                 ch.last_heard_s = d.time_s;
                 ch.quality = d.quality;
@@ -251,6 +330,9 @@ impl ChannelSet {
                     snr_history: d.snr_db.map_or_else(Vec::new, |s| vec![(d.time_s, s)]),
                     chunks: 1,
                     breaks: Vec::new(),
+                    frames: if d.mode.period_s().is_some() { vec![(0, d.time_s)] } else { Vec::new() },
+                    over_ended: d.ends_over,
+                    over_sender: sender_in(&d.text).map(str::to_string),
                 });
                 // Through `push_text`, so a single outsized decode cannot put
                 // a brand-new channel over the limit either.
@@ -294,6 +376,7 @@ mod tests {
             hz,
             time_s: t,
             text: s.to_string(),
+            ends_over: false,
             mode: ModeId::Js8(js8::Mode::Normal),
             quality: 1.0,
         }
@@ -308,6 +391,7 @@ mod tests {
             hz,
             time_s: t,
             text: "x".to_string(),
+            ends_over: false,
             mode: ModeId::Js8(js8::Mode::Normal),
             quality,
         };
@@ -351,6 +435,7 @@ mod tests {
             hz: 1000.0,
             time_s: 0.0,
             text: "OL".to_string(),
+            ends_over: false,
             mode: ModeId::Olivia(olivia::OL_32_1000),
             quality: 4.0,
         };
@@ -367,6 +452,7 @@ mod tests {
             hz,
             time_s: t,
             text: s.to_string(),
+            ends_over: false,
             mode: ModeId::Olivia(olivia::OL_16_500),
             quality: 5.0,
         };
@@ -392,6 +478,7 @@ mod tests {
                 hz: 1000.0,
                 time_s: i as f64,
                 text: chunk.to_string(),
+                ends_over: false,
                 mode: ModeId::Js8(js8::Mode::Normal),
                 quality: 4.0,
             });
@@ -421,6 +508,7 @@ mod tests {
                 hz: 1000.0 + i as f64 * 0.01,
                 time_s: i as f64,
                 text: "x".to_string(),
+                ends_over: false,
                 mode: ModeId::Js8(js8::Mode::Normal),
                 quality: 4.0,
             });
@@ -454,6 +542,7 @@ mod tests {
                 hz: 1000.0,
                 time_s: i as f64 * 15.0,
                 text: "x".to_string(),
+                ends_over: false,
                 mode: ModeId::Js8(js8::Mode::Normal),
                 quality: 4.0,
             });
@@ -486,6 +575,7 @@ mod tests {
             hz: 1000.0,
             time_s: 0.0,
             text: "x".to_string(),
+            ends_over: false,
             mode: ModeId::Js8(js8::Mode::Normal),
             quality: 4.0,
         });
@@ -502,6 +592,7 @@ mod tests {
             hz: 1000.0,
             time_s: 0.0,
             text: "y".repeat(MAX_TEXT_CHARS * 2),
+            ends_over: false,
             mode: ModeId::Js8(js8::Mode::Normal),
             quality: 4.0,
         });
@@ -519,6 +610,7 @@ mod tests {
             hz: 620.0,
             time_s: t,
             text: c.to_string(),
+            ends_over: false,
             mode: ModeId::Psk(ragchew::psk::PSK31),
             quality: 4.0,
         };
@@ -546,16 +638,60 @@ mod tests {
         assert_eq!(ch.text, "hi om back ", "the text itself is untouched");
     }
 
-    /// A cycle-aligned mode records none: every frame is a whole utterance, so
-    /// there is nothing for a gap to tell anyone.
+    /// A cycle-aligned mode runs its frames together and marks each one, so a
+    /// reader can join them into a paragraph and still see how it was carried.
     #[test]
-    fn a_cycle_aligned_mode_marks_nothing() {
+    fn consecutive_frames_are_one_over_with_the_seams_kept() {
         let mut set = ChannelSet::new(15.0);
+        let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
         for i in 0..4 {
-            set.add(d(1000.0, i as f64 * 15.0, "DE K2N "));
+            set.add(d(1000.0, i as f64 * period, "DE K2N "));
         }
-        assert!(set.channels()[0].breaks.is_empty());
-        assert!(over_gap_s(ModeId::Js8(js8::Mode::Normal)).is_none());
+        let ch = &set.channels()[0];
+        assert!(ch.breaks.is_empty(), "an unbroken over was split");
+        assert_eq!(ch.frames.len(), 4, "four frames left {} marks", ch.frames.len());
+        assert_eq!(ch.frames[0], (0, 0.0));
+        assert_eq!(ch.frames[1].0, "DE K2N ".chars().count());
+        assert_eq!(ch.frames[3].1, 3.0 * period);
+    }
+
+    /// The station's own flag ends the over, whatever the clock says — and the
+    /// break lands where the next frame starts, so the frame that carried the
+    /// flag stays in the over it finished.
+    #[test]
+    fn an_end_of_over_flag_breaks_where_the_next_frame_starts() {
+        let mut set = ChannelSet::new(15.0);
+        let mut first = d(1000.0, 0.0, "DE K2N ");
+        first.ends_over = true;
+        set.add(first);
+        set.add(d(1000.0, 15.0, "HI OM "));
+        let ch = &set.channels()[0];
+        assert_eq!(ch.breaks.len(), 1, "the flag was not acted on");
+        assert_eq!(ch.breaks[0], ("DE K2N ".chars().count(), 15.0));
+    }
+
+    /// Two stations on one carrier are two overs, which is the ordinary shape
+    /// of a JS8 QSO: the answering station replies on the offset it heard.
+    #[test]
+    fn a_change_of_sender_breaks_the_over() {
+        let mut set = ChannelSet::new(15.0);
+        set.add(d(1000.0, 0.0, "K2N: CQ CQ CQ "));
+        // Free text names nobody, and nobody is not somebody else.
+        set.add(d(1000.0, 15.0, "FN20 "));
+        assert!(set.channels()[0].breaks.is_empty(), "free text was read as a new speaker");
+        set.add(d(1000.0, 30.0, "[W1AW K2N SNR -12]"));
+        assert_eq!(set.channels()[0].breaks.len(), 1, "the second station was not separated");
+    }
+
+    /// The two shapes a JS8 frame names its sender in, and the ones that name
+    /// nobody.
+    #[test]
+    fn a_sender_is_read_only_where_a_frame_gives_one() {
+        assert_eq!(sender_in("KN4CRD: CQ CQ CQ EM73"), Some("KN4CRD"));
+        assert_eq!(sender_in("[KN4CRD JY1 SNR -12]"), Some("KN4CRD"));
+        assert_eq!(sender_in("HELLO OM HW CPY"), None, "free text named a sender");
+        assert_eq!(sender_in("TNX: FB"), None, "a word and a colon is not a call");
+        assert_eq!(sender_in(""), None);
     }
 
     /// Breaks are indexed from the start of the conversation, like the text
@@ -567,6 +703,7 @@ mod tests {
             hz: 1000.0,
             time_s: t,
             text: s.to_string(),
+            ends_over: false,
             mode: ModeId::Olivia(olivia::OL_8_250),
             quality: 4.0,
         };

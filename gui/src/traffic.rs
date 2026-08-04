@@ -161,6 +161,7 @@ mod tests {
             quality: 3.25,
             snr_db: Some(-11.4),
             text: text.to_string(),
+            ends_over: false,
         }
     }
 

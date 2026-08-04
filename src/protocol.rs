@@ -217,6 +217,24 @@ pub struct Decode {
     pub snr_db: Option<f32>,
     /// The decoded text.
     pub text: String,
+    /// Whether the station said this finishes what it was saying.
+    ///
+    /// JS8 carries the answer: the itype bits at `a87[72..75]` mark the first
+    /// and last frames of an over, and a station sending three frames of one
+    /// message flags the third — see [`js8::message::IType`]. It is the only
+    /// reliable end of an over there is, because the alternative is timing a
+    /// silence, and a silence is also what a station that lost a frame to the
+    /// noise leaves behind.
+    ///
+    /// `false` for the continuous modes, which have no such thing: an Olivia
+    /// block or a PSK character is a piece of a stream and says nothing about
+    /// where the stream stops. There, silence really is the only evidence.
+    ///
+    /// Kept here rather than read back out of [`Decode::text`] — where JS8
+    /// renders it as a trailing `<>`, and only for two of the four frame types
+    /// it can parse — because this is a fact about the frame and that is a
+    /// string of what somebody said.
+    pub ends_over: bool,
 }
 
 /// Parse a mode name.
@@ -272,6 +290,7 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
                         quality: (r.sync / js8::modem::NOISE_SYNC) as f32,
                         snr_db: measure_snr(samples, r.offset, r.hz, mode),
                         text: js8::message::unpack(&r.a87).text(),
+                        ends_over: js8::message::ends_over(&r.a87),
                     }
                 },
             ));
@@ -297,6 +316,8 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
                 quality: (r.snr / olivia::modem::NOISE_FLOOR) as f32,
                 snr_db: measure_snr(samples, r.offset, r.hz, mode),
                 text: r.text(),
+                // A block of a stream says nothing about where the stream ends.
+                ends_over: false,
             }
         }));
     }
@@ -321,6 +342,7 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
                     quality: (r.score / psk::modem::NOISE_FLOOR) as f32,
                     snr_db: measure_snr(samples, r.offset, r.hz, mode),
                     text: r.text,
+                    ends_over: false,
                 }
             })
             .collect();

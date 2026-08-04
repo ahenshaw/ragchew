@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use ragchew::protocol::ModeId;
 
-use crate::channels::{over_gap_s, Channel, ChannelSet};
+use crate::channels::{Channel, ChannelSet};
 
 /// Which way a log entry went.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,6 +48,18 @@ pub struct Entry {
     pub at_s: f64,
     pub dir: Dir,
     pub text: String,
+    /// Seams inside `text`: `(character offset, the time the frame there
+    /// started)`, for an entry built out of several packets.
+    ///
+    /// One JS8 frame is a packet, not a sentence, so the log joins consecutive
+    /// frames of an over into one entry and marks where they met. The offsets
+    /// are into this entry's own text, and never zero — the start of an entry
+    /// needs no mark, since the entry is one.
+    ///
+    /// Kept out of the text itself so that the log, the traffic CSV and
+    /// anything copied out of the panel stay what the station said. This is how
+    /// it was *carried*, which is the interface's business alone.
+    pub marks: Vec<(usize, f64)>,
 }
 
 /// How many (time, SNR) samples a QSO keeps.
@@ -96,7 +108,7 @@ pub fn suggested_report(mode: ModeId, snr_db: f32) -> Option<String> {
 /// last token is finished by definition, and trimming it would lose the call in
 /// a frame that ends on one.
 fn settled_text(text: &str, mode: ModeId) -> &str {
-    if over_gap_s(mode).is_none() {
+    if mode.period_s().is_some() {
         return text;
     }
     match text.char_indices().rfind(|(_, c)| c.is_whitespace()) {
@@ -233,7 +245,12 @@ impl Qso {
 
     /// Add something we sent (or queued to send).
     pub fn push_tx(&mut self, text: &str, at_s: f64) {
-        self.log.push(Entry { at_s, dir: Dir::Tx, text: text.trim().to_string() });
+        self.log.push(Entry {
+            at_s,
+            dir: Dir::Tx,
+            text: text.trim().to_string(),
+            marks: Vec::new(),
+        });
         self.last_s = at_s.max(self.last_s);
     }
 
@@ -243,7 +260,20 @@ impl Qso {
     /// Our own transmission always ends the entry it interrupts, whatever the
     /// timing — the last thing in the log being a TX is exactly what "the other
     /// station started a new over" looks like, so nothing joins across it.
-    fn push_rx(&mut self, chars: &[char], began: Option<f64>, now_s: f64) {
+    ///
+    /// `frames` are the frame starts of the whole stretch being absorbed, at
+    /// their conversation indices, and `base` is the conversation index of
+    /// `chars[0]` — which is what turns one into the other. A frame starting
+    /// exactly where the entry does is not a seam inside it: the entry's own
+    /// beginning is already the mark.
+    fn push_rx(
+        &mut self,
+        chars: &[char],
+        began: Option<f64>,
+        now_s: f64,
+        frames: &[(usize, f64)],
+        base: usize,
+    ) {
         if chars.is_empty() {
             return;
         }
@@ -252,9 +282,29 @@ impl Qso {
             Some(e) if began.is_none() && e.dir == Dir::Rx => Some(self.log.len() - 1),
             _ => None,
         };
-        match open {
-            Some(i) => self.log[i].text.push_str(&text),
-            None => self.log.push(Entry { at_s: began.unwrap_or(now_s), dir: Dir::Rx, text }),
+        let i = match open {
+            Some(i) => {
+                self.log[i].text.push_str(&text);
+                i
+            }
+            None => {
+                self.log.push(Entry {
+                    at_s: began.unwrap_or(now_s),
+                    dir: Dir::Rx,
+                    text,
+                    marks: Vec::new(),
+                });
+                self.log.len() - 1
+            }
+        };
+        let start = self.log[i].text.chars().count() - chars.len();
+        for &(at, t) in frames {
+            if at >= base && at < base + chars.len() {
+                let off = start + (at - base);
+                if off > 0 {
+                    self.log[i].marks.push((off, t));
+                }
+            }
         }
     }
 
@@ -332,25 +382,32 @@ impl Qso {
         // still arriving is the same over as the character before it.
         let starts = ch.breaks.iter().filter(|&&(i, _)| i >= seen && i < have);
 
+        // Where each frame of this stretch starts, for the log to mark the
+        // seams between them; empty on a continuous mode, which has none.
+        let frames: Vec<(usize, f64)> =
+            ch.frames.iter().copied().filter(|&(i, _)| i >= seen && i < have).collect();
+
         let mut from = 0usize;
         // `None` continues the entry already open; `Some` is a fresh over, and
         // carries the time it began so the log stamps it with that rather than
         // with whenever this happened to be noticed.
         //
-        // A cycle-aligned mode starts as one: it records no breaks because it
-        // needs none — every decode is a whole message and takes its own line,
-        // which is how the log has always shown JS8.
-        let mut began: Option<f64> =
-            over_gap_s(ch.mode).is_none().then_some(ch.last_heard_s);
+        // JS8 continues an entry too. A frame is a packet rather than an
+        // utterance — a sentence is three of them a cycle apart — so a line
+        // apiece read as a station talking in fragments. What ends the entry
+        // now is what ends an over: the flag the station sets on its last
+        // frame, a change of speaker, or a real silence, all of them recorded
+        // as breaks by `channels`.
+        let mut began: Option<f64> = None;
         for &(i, at_s) in starts {
             let cut = i - seen;
             if cut > from {
-                self.push_rx(&new[from..cut], began, ch.last_heard_s);
+                self.push_rx(&new[from..cut], began, ch.last_heard_s, &frames, seen + from);
             }
             from = cut;
             began = Some(at_s);
         }
-        self.push_rx(&new[from..], began, ch.last_heard_s);
+        self.push_rx(&new[from..], began, ch.last_heard_s, &frames, seen + from);
 
         // Looked for in the whole entry rather than in what just arrived: on a
         // continuous mode what just arrived is one character, and a call sign
@@ -626,6 +683,7 @@ mod tests {
             time_s: t,
             quality: 4.0,
             text: text.to_string(),
+            ends_over: false,
         }
     }
 
@@ -638,6 +696,7 @@ mod tests {
             time_s: t,
             quality: 4.0,
             text: ch.to_string(),
+            ends_over: false,
         }
     }
 
@@ -664,6 +723,7 @@ mod tests {
             time_s: t,
             quality: 4.0,
             text: "DE K2N ".to_string(),
+            ends_over: false,
         }
     }
 
@@ -748,6 +808,7 @@ mod tests {
             time_s: t,
             quality: 4.0,
             text: "DE K2N ".to_string(),
+            ends_over: false,
         };
         let mut set = ChannelSet::from_decodes([decode(0.0, -12.4)], 15.0);
         let mut qsos = QsoSet::new();
@@ -773,6 +834,7 @@ mod tests {
             time_s: t,
             quality: 4.0,
             text: "DE K2N ".to_string(),
+            ends_over: false,
         };
         let mut set = ChannelSet::from_decodes([decode(0.0, -12.0)], 15.0);
         let mut qsos = QsoSet::new();
@@ -805,6 +867,7 @@ mod tests {
                     time_s: 0.0,
                     quality: 4.0,
                     text: "cq de w1aw ".to_string(),
+                    ends_over: false,
                 }],
                 15.0,
             );
@@ -902,13 +965,18 @@ mod tests {
         assert_eq!(q.log[0].text, "CQ CQ DE K2N FN20 5W ");
         assert_eq!(q.log[0].at_s, 5.0);
 
-        // and the next decode on that channel arrives as its own line
+        // and the next frame joins the over it continues, seam and all
         set.add(js8_decode(1000.0, 35.0, "73 GL "));
         qsos.absorb(&set);
         let q = &qsos.qsos()[0];
-        assert_eq!(q.log.len(), 2);
-        assert_eq!(q.log[1].text, "73 GL ");
-        assert_eq!(q.log[1].at_s, 35.0);
+        assert_eq!(q.log.len(), 1, "the over came out as {} entries", q.log.len());
+        assert_eq!(q.log[0].text, "CQ CQ DE K2N FN20 5W 73 GL ");
+        assert_eq!(q.log[0].at_s, 5.0, "the entry is stamped when the over began");
+        assert_eq!(
+            q.log[0].marks.last().map(|&(_, t)| t),
+            Some(35.0),
+            "the newest seam does not carry its frame's time"
+        );
     }
 
     /// A PSK over is one line in the log, not one line per character.
@@ -1018,6 +1086,7 @@ mod tests {
             time_s: t,
             quality: 4.0,
             text: text.to_string(),
+            ends_over: false,
         };
         let mut set = ChannelSet::new(15.0);
         set.add(block(0.0, "gm om "));
@@ -1036,23 +1105,96 @@ mod tests {
         assert_eq!(qsos.qsos()[0].log.len(), 2, "a minute of silence did not split");
     }
 
-    /// JS8 is exempt: a frame is a packed message sent on a UTC boundary, so it
-    /// stays one entry per frame however close together the frames come. This
-    /// is the behaviour the tests above it depend on, stated on its own.
+    /// JS8 frames of one over read as one thing said, with the seams kept.
+    ///
+    /// A frame is a packet, not a sentence: three of them a cycle apart are a
+    /// station saying one thing slowly. They used to take a line each, which
+    /// read as a station talking in fragments. What joins them is the log, and
+    /// what still separates them is a mark carrying the time each frame
+    /// started — the log's text is what was said, and the marks are how it
+    /// came.
     #[test]
-    fn js8_frames_stay_one_entry_each() {
+    fn js8_frames_of_one_over_join_up() {
+        let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
         let mut set = ChannelSet::new(15.0);
-        set.add(js8_decode(1000.0, 0.0, "CQ DE K2N "));
+        set.add(js8_decode(1000.0, 0.0, "K2N: HW CPY "));
         let mut qsos = QsoSet::new();
         qsos.open_for_channel(&set.channels()[0], 0.0);
-        // Consecutive cycles: closer together than MIN_OVER_GAP_S would allow a
-        // continuous mode, and still three separate things said.
         for (i, text) in ["FN20 5W ", "PSE K "].iter().enumerate() {
-            set.add(js8_decode(1000.0, 1.0 + i as f64, text));
+            set.add(js8_decode(1000.0, (i + 1) as f64 * period, text));
             qsos.absorb(&set);
         }
-        assert_eq!(qsos.qsos()[0].log.len(), 3);
-        assert!(over_gap_s(ModeId::Js8(js8::Mode::Normal)).is_none());
+
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.log.len(), 1, "one over came out as {} entries", q.log.len());
+        assert_eq!(q.log[0].text, "K2N: HW CPY FN20 5W PSE K ");
+        // Two seams for three frames, at the joins, timed by their own cycles.
+        let marks: Vec<(usize, f64)> = q.log[0].marks.clone();
+        assert_eq!(marks.len(), 2, "three frames left {} seams", marks.len());
+        assert_eq!(marks[0].1, period);
+        assert_eq!(marks[1].1, 2.0 * period);
+        for &(at, _) in &marks {
+            assert!(at > 0 && at < q.log[0].text.chars().count(), "seam at {at} is outside");
+        }
+        // And they are where the text actually joins.
+        let cut: String = q.log[0].text.chars().skip(marks[0].0).collect();
+        assert!(cut.starts_with("FN20"), "the first seam fell mid-frame: {cut:?}");
+    }
+
+    /// The station's own end-of-over flag closes the entry, even when the next
+    /// frame follows in the very next cycle.
+    ///
+    /// This is the case a timing rule cannot get right: a reply that comes back
+    /// immediately is exactly what a good QSO looks like, and joining it to the
+    /// call it answers would merge the two halves of the exchange.
+    #[test]
+    fn an_over_ends_where_the_station_says_it_does() {
+        let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
+        let mut done = js8_decode(1000.0, 0.0, "K2N: CQ CQ ");
+        done.ends_over = true;
+        let mut set = ChannelSet::from_decodes([done], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        set.add(js8_decode(1000.0, period, "W1AW: K2N SNR -12 "));
+        qsos.absorb(&set);
+
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.log.len(), 2, "the answer joined the call it was answering");
+        assert_eq!(q.log[1].at_s, period, "the new entry is stamped with its own cycle");
+        assert!(q.log[0].marks.is_empty() && q.log[1].marks.is_empty());
+    }
+
+    /// Two stations sharing one offset — which is how JS8 replies work — keep
+    /// their own entries even with no flag between them.
+    #[test]
+    fn a_change_of_speaker_starts_a_new_entry() {
+        let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
+        let mut set = ChannelSet::new(15.0);
+        set.add(js8_decode(1000.0, 0.0, "K2N: CQ CQ CQ "));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        // Free text in between carries no callsign and is not somebody new.
+        set.add(js8_decode(1000.0, period, "FN20 "));
+        set.add(js8_decode(1000.0, 2.0 * period, "W1AW: K2N HW CPY "));
+        qsos.absorb(&set);
+
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.log.len(), 2, "expected the two stations to be two entries");
+        assert_eq!(q.log[0].text, "K2N: CQ CQ CQ FN20 ");
+        assert_eq!(q.log[1].text, "W1AW: K2N HW CPY ");
+    }
+
+    /// A lost last frame is the case the flag cannot cover, and the clock
+    /// covers it: in this mode, losing one is an ordinary evening.
+    #[test]
+    fn a_silence_still_ends_an_over_without_a_flag() {
+        let mut set = ChannelSet::new(15.0);
+        set.add(js8_decode(1000.0, 0.0, "K2N: HW CPY "));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        set.add(js8_decode(1000.0, 120.0, "W1AW DE K2N "));
+        qsos.absorb(&set);
+        assert_eq!(qsos.qsos()[0].log.len(), 2, "two minutes of silence did not split");
     }
 
     /// The UTC stamp is the moment the station was first heard, not the moment
@@ -1119,7 +1261,7 @@ mod tests {
         let mut qsos = QsoSet::new();
         set.add(js8_decode(1000.0, 0.0, "start "));
         qsos.open_for_channel(&set.channels()[0], 0.0);
-        let logged_first = qsos.qsos()[0].log.len();
+        let logged_first = qsos.qsos()[0].log[0].text.chars().count();
 
         // A long stretch with nobody reading it: the channel trims text this
         // QSO has never seen.
@@ -1130,12 +1272,14 @@ mod tests {
         qsos.absorb(&set);
 
         let q = &qsos.qsos()[0];
-        assert!(q.log.len() > logged_first, "nothing was absorbed after the gap");
         let last = q.log.last().expect("a log entry");
+        assert!(last.text.chars().count() > logged_first, "nothing was absorbed after the gap");
         assert!(last.text.ends_with("end "), "resumed at the wrong place: {:?}", last.text);
-        // What it took is exactly what the channel still had beyond its mark.
+        // What it took is exactly what the channel still had, on the end of
+        // what it had already logged: nothing invented to bridge the hole, and
+        // nothing double-counted across it.
         let ch = &set.channels()[0];
-        assert_eq!(last.text.chars().count(), ch.text.chars().count());
+        assert_eq!(last.text, format!("start {}", ch.text));
     }
 
     /// Text is struck through as it goes out: nothing while the burst is still

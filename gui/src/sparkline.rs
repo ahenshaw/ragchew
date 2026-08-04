@@ -90,21 +90,12 @@ pub fn copy_floor_db(mode: ModeId) -> f32 {
 
 /// The longest silence that is still one continuous transmission.
 ///
-/// A continuous mode already has an answer to this — it is what decides where
-/// one over ends and the next begins, and the text panel splits on the same
-/// rule. A cycle-aligned mode has none, and the figure to use is its *period*
-/// rather than the length of a frame: consecutive frames start one period
-/// apart, and JS8 Turbo spends only 3.95 seconds of its six-second cycle
-/// transmitting, so a frame and a half breaks every over it has.
-///
-/// Past a period and a half is a frame that did not decode, or a station that
-/// stopped. Either way there is no measurement in that window, and the hole is
-/// worth seeing: patchy copy looks patchy.
+/// The same figure the log splits overs on, and for the same reason: past it
+/// there is a frame that did not decode or a station that stopped, and either
+/// way no measurement was taken in that window. The hole is worth seeing —
+/// patchy copy should look patchy.
 pub fn gap_s(mode: ModeId) -> f64 {
-    match over_gap_s(mode) {
-        Some(g) => g,
-        None => mode.period_s().expect("only a cycle-aligned mode has no over gap") as f64 * 1.5,
-    }
+    over_gap_s(mode)
 }
 
 /// The samples inside the window ending at `now_s`.

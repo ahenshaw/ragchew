@@ -86,6 +86,7 @@ fn streamed(mode: psk::Mode, hz: f64, quality: f32, c: psk::rx::Char, rate: f64)
         quality,
         snr_db: None,
         text: c.ch.to_string(),
+        ends_over: false,
     }
 }
 
