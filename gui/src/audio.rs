@@ -649,7 +649,7 @@ fn spawn_js8(
         let stats = guard.stats();
         // next cycle-start (UTC seconds) to decode, per mode
         let period = |m: &ModeId| m.period_s().unwrap_or(15) as f64;
-        let ready = |m: &ModeId| m.chunk_secs() + 1.0; // frame done, plus slack
+        let ready = window_ready_s; // the whole window captured, not just the frame
         let mut next: Vec<f64> =
             modes.iter().map(|m| (unix_now() / period(m)).floor() * period(m)).collect();
         // How late each mode's frames arrive, learned from the audio. Zero is
@@ -710,7 +710,7 @@ fn spawn_js8(
             stats.pass_begun();
             let pass = std::time::Instant::now();
             let (samples, win_start) =
-                slice_around(&buf, cycle_start + offset[best] - 0.5, period(&mode) + 1.0);
+                slice_around(&buf, cycle_start + offset[best] - 0.5, window_len_s(&mode));
             // A window the buffer could not fill is a dead cycle, not a reason
             // to skip the rest of the loop. It used to `continue` here, which
             // stepped over the offset search below — so a capture whose clock
@@ -1177,6 +1177,29 @@ fn ripe_cycles(
 /// which the heartbeat's `skipped` now counts rather than losing silently.
 const MAX_BACKLOG_S: f64 = 120.0;
 
+/// The audio one cycle-aligned pass reads: the cycle, and half a second either
+/// side of it for clock skew.
+fn window_len_s(m: &ModeId) -> f64 {
+    m.period_s().unwrap_or(15) as f64 + 1.0
+}
+
+/// How long after a cycle starts that whole window has been captured.
+///
+/// Derived from the window rather than from the frame, because asking for audio
+/// that has not arrived yet is precisely what this used to do: it waited for
+/// the *frame* to finish, `chunk_secs + 1.0`, and then asked for a window
+/// running 1.86 s past that. [`slice_around`] clamps to what is held without
+/// complaining, so what came back was a window with its end cut off, and a
+/// frame arriving more than a second after the grid lost its tail and did not
+/// decode. Off a WebSDR running 1.2 s late that was eight frames in nine over
+/// six minutes, every one of them recoverable from the audio.
+///
+/// Waiting the extra second and a half buys about 2.5 s of stream latency
+/// tolerated with no learning at all. Past that the offset search takes over.
+fn window_ready_s(m: &ModeId) -> f64 {
+    window_len_s(m) - 0.5
+}
+
 /// Consecutive dead cycles before a mode goes looking for where its frames
 /// actually are. Three, so an ordinary quiet spell on a real band does not
 /// trigger it.
@@ -1405,8 +1428,58 @@ mod tests {
         ];
         let ids: Vec<ModeId> = modes.iter().map(|m| ModeId::Js8(*m)).collect();
         let period = ids.iter().map(|m| m.period_s().unwrap() as f64).collect();
-        let after = ids.iter().map(|m| m.chunk_secs() + 1.0).collect();
+        let after = ids.iter().map(window_ready_s).collect();
         (period, after)
+    }
+
+    /// Cycles of one mode whose audio is all in by `span`, counting from a
+    /// cycle starting at zero. Not simply `span / period`: a cycle is not ripe
+    /// until `after` seconds past its start, so the last one or two to begin
+    /// are still being captured when the clock runs out.
+    fn ripe_by(span: f64, period: f64, after: f64) -> usize {
+        ((span - after) / period).floor() as usize + 1
+    }
+
+    /// A pass never asks for audio that has not been captured yet.
+    ///
+    /// It used to. The window a pass reads is the cycle plus half a second
+    /// either side, but the pass ran as soon as the *frame* would have
+    /// finished — 1.86 s before the end of the window it then asked for, at
+    /// JS8 Normal. `slice_around` clamps to what is held without complaining,
+    /// so the window came back with its tail cut off, and any frame arriving
+    /// more than a second after the cycle grid lost symbols and failed to
+    /// decode. Off a WebSDR running 1.2 s late that cost eight frames in nine
+    /// over six minutes, every one of them sitting in the recording.
+    ///
+    /// The tolerance this buys is worth stating: how late a stream may run
+    /// before frames stop fitting the window, before the offset search has
+    /// learned anything at all.
+    #[test]
+    fn a_pass_waits_for_the_window_it_reads() {
+        for m in [
+            ragchew::js8::Mode::Turbo,
+            ragchew::js8::Mode::Fast,
+            ragchew::js8::Mode::Normal,
+            ragchew::js8::Mode::Slow,
+        ] {
+            let id = ModeId::Js8(m);
+            // The window starts half a second before the cycle, so this much
+            // of it exists by the time the pass runs.
+            let captured = window_ready_s(&id) + 0.5;
+            assert!(
+                captured >= window_len_s(&id),
+                "{}: reads {:.2}s but only {captured:.2}s has arrived",
+                id.name(),
+                window_len_s(&id)
+            );
+
+            let slack = window_len_s(&id) - 0.5 - id.chunk_secs();
+            assert!(
+                slack > 2.5,
+                "{}: a stream more than {slack:.2}s late loses its frames",
+                id.name()
+            );
+        }
     }
 
     /// No cycle is lost because the decoder was busy when it ripened.
@@ -1427,7 +1500,8 @@ mod tests {
         // cycle of those five minutes.
         let mut next = vec![0.0; period.len()];
         let slow = ripe_cycles(&mut next, &period, &after, span);
-        let want: usize = period.iter().map(|p| (span / p) as usize).sum();
+        let want: usize =
+            period.iter().zip(&after).map(|(p, a)| ripe_by(span, *p, *a)).sum();
         assert_eq!(slow.len(), want, "a busy decoder was handed {} of {want} cycles", slow.len());
 
         // And one that wakes constantly must be handed exactly the same ones.
@@ -1481,7 +1555,8 @@ mod tests {
             now += pass_cost;
         }
 
-        let want: usize = period.iter().map(|p| (span / p) as usize).sum();
+        let want: usize =
+            period.iter().zip(&after).map(|(p, a)| ripe_by(span, *p, *a)).sum();
         assert!(decoded * 100 >= want * 99, "decoded {decoded} of {want} cycles");
         assert!(
             worst_wait < MAX_BACKLOG_S / 4.0,
