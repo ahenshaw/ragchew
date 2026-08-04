@@ -89,16 +89,20 @@ fn which(cmd: &str) -> bool {
 /// keeps running, so the route outlives the making of it. Returns what the
 /// route now is, for the log.
 pub fn route_from(source: &Source) -> Result<String, String> {
+    // Port ids do not survive a renegotiation, and the graph can renegotiate
+    // between reading it and acting on it. One retry, on a fresh reading of
+    // the graph, because by then whatever moved has finished moving.
+    match once(source) {
+        Err(e) if e.contains("No such file or directory") => once(source),
+        other => other,
+    }
+}
+
+fn once(source: &Source) -> Result<String, String> {
     let g = dump()?;
     let plan = g.plan(source.node).map_err(|e| format!("{}: {e}", source.app))?;
-
-    // The old links go first. Left in place PipeWire sums them with the new
-    // ones, and a microphone mixed into a WebSDR is not a band, it is a room.
-    for id in &plan.remove {
-        run("pw-link", &["-d".into(), id.to_string()])?;
-    }
-    for (out, inp) in &plan.link {
-        run("pw-link", &[out.to_string(), inp.to_string()])?;
+    for args in plan.commands() {
+        run("pw-link", &args)?;
     }
     Ok(format!("{} -> this capture, {} channel(s)", source.label(), plan.link.len()))
 }
@@ -113,6 +117,27 @@ pub fn route_from(source: &Source) -> Result<String, String> {
 struct Plan {
     remove: Vec<u32>,
     link: Vec<(u32, u32)>,
+}
+
+impl Plan {
+    /// The `pw-link` calls, in the order they have to happen.
+    ///
+    /// **New links before old ones are cut.** A capture stream with no links at
+    /// all is one PipeWire may suspend, and a suspended stream comes back with
+    /// its ports destroyed and recreated under new ids — so cutting first left
+    /// the second half of the plan holding ids for ports that no longer
+    /// existed. Off a live capture that showed up as the front-left channel
+    /// linking and the front-right failing with `No such file or directory`.
+    ///
+    /// The cost of this order is that both sources feed the capture for the
+    /// instant in between, where the other order would have fed it nothing.
+    /// A moment of a microphone summed into a WebSDR is a moment of nonsense;
+    /// a route that half happened is a fault to work out.
+    fn commands(&self) -> Vec<Vec<String>> {
+        let link = self.link.iter().map(|(o, i)| vec![o.to_string(), i.to_string()]);
+        let cut = self.remove.iter().map(|id| vec!["-d".to_string(), id.to_string()]);
+        link.chain(cut).collect()
+    }
 }
 
 /// The channel part of a port name: `output_FL` and `input_FL` are both `FL`.
@@ -404,14 +429,40 @@ mod tests {
     /// The whole of routing a browser in, as port ids.
     ///
     /// These are the exact `pw-link` calls that were run by hand against the
-    /// live daemon this fixture was taken from — drop the two microphone links,
-    /// join Firefox's stereo pair to the capture's — so the test pins the
+    /// live daemon this fixture was taken from — join Firefox's stereo pair to
+    /// the capture's, drop the two microphone links — so the test pins the
     /// behaviour to something that was watched working rather than to what the
     /// code happens to do.
     #[test]
-    fn routing_a_browser_in_is_two_links_out_and_two_in() {
+    fn routing_a_browser_in_is_two_links_in_and_two_out() {
         let want = Plan { remove: vec![96, 89], link: vec![(118, 107), (91, 117)] };
         assert_eq!(graph().plan(115).unwrap(), want);
+    }
+
+    /// The new links are made before the old ones are cut.
+    ///
+    /// Not a detail: a capture left with no links at all can be suspended, and
+    /// a suspended stream comes back with new port ids, so the rest of the plan
+    /// is then addressing ports that no longer exist. That is not hypothetical
+    /// — it is what the first routing attempt off a live capture did, linking
+    /// the left channel and then failing on the right.
+    #[test]
+    fn links_are_made_before_the_old_ones_are_cut() {
+        let cmds = graph().plan(115).unwrap().commands();
+        assert_eq!(
+            cmds,
+            vec![
+                vec!["118", "107"],
+                vec!["91", "117"],
+                vec!["-d", "96"],
+                vec!["-d", "89"],
+            ]
+        );
+        let first_cut = cmds.iter().position(|c| c[0] == "-d").unwrap();
+        assert!(
+            cmds[..first_cut].iter().all(|c| c[0] != "-d"),
+            "a link was cut before the replacements were in place"
+        );
     }
 
     /// The capture here has a rear-right input that the browser has nothing to
