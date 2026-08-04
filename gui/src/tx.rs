@@ -60,24 +60,46 @@ pub fn modulate(text: &str, hz: f64, mode: ModeId) -> Vec<f32> {
             let sm = submode::of(m);
             let period = sm.period_s as usize * RATE as usize;
             let offset = (JS8_CYCLE_OFFSET_S * RATE as f64) as usize;
-            let mut out: Vec<f32> = Vec::new();
+            // How the message divides into frames, found by packing each in
+            // turn to see how much it takes. A pass of its own because the
+            // last frame has to be *marked* as the last, and which one that is
+            // cannot be known until the division is done: the itype flags go
+            // in before the CRC is computed over them, so a frame cannot be
+            // flagged after it is packed.
+            let mut parts: Vec<&str> = Vec::new();
             let mut rest = text;
-            let mut cycle = 0;
             while !rest.trim().is_empty() {
-                let (a87, used) = message::freetext(rest, IType::None);
+                let (_, used) = message::freetext(rest, IType::None);
                 // `freetext` reporting nothing consumed would spin forever on
                 // text it cannot pack at all, so that ends the transmission.
                 if used == 0 {
                     break;
                 }
+                let cut = rest.char_indices().nth(used).map_or(rest.len(), |(i, _)| i);
+                let (head, tail) = rest.split_at(cut);
+                parts.push(head);
+                rest = tail;
+            }
+
+            let mut out: Vec<f32> = Vec::new();
+            for (cycle, part) in parts.iter().enumerate() {
+                // The end of an over is the receiving station's only reliable
+                // sign that we have finished talking — JS8Call draws it, and
+                // this crate now splits its log on it. A station that never
+                // flags one is a station whose overs run together at the far
+                // end, which is what ours did.
+                let itype = match (cycle + 1 == parts.len(), parts.len()) {
+                    (true, 1) => IType::FirstAndLast,
+                    (true, _) => IType::Last,
+                    _ => IType::None,
+                };
+                let (a87, _) = message::freetext(part, itype);
                 let burst = modem::encode_audio_sm(&a87, hz, &sm);
                 let start = cycle * period + offset;
                 if out.len() < start + burst.len() {
                     out.resize(start + burst.len(), 0.0);
                 }
                 out[start..start + burst.len()].copy_from_slice(&burst);
-                rest = &rest[rest.char_indices().nth(used).map_or(rest.len(), |(i, _)| i)..];
-                cycle += 1;
             }
             out
         }
@@ -327,6 +349,31 @@ mod tests {
         let joined: String =
             got.iter().map(|r| js8::message::unpack(&r.a87).text()).collect::<Vec<_>>().join("");
         assert!(joined.contains("CQ CQ CQ DE W1AW"), "decoded {joined:?}");
+    }
+
+    /// Our own overs say where they end, and only the last frame says it.
+    ///
+    /// This is the flag the far end splits its log on — JS8Call draws it, and
+    /// so does this crate now. A transmitter that never sets it is a
+    /// transmitter whose overs run into whatever it says next, at every station
+    /// receiving it. Ours never set it until this test existed.
+    #[test]
+    fn only_the_last_frame_of_an_over_is_flagged_as_last() {
+        let sm = submode::NORMAL;
+        let long = "CQ CQ CQ DE W1AW W1AW W1AW FN31 PSE K TNX FOR THE CALL 73 GL ";
+        let audio = modulate(long, 1200.0, ModeId::Js8(sm.mode));
+        let mut got = js8::modem::decode_all_sm(&audio, 1000.0, 1400.0, 30, &sm);
+        got.sort_by_key(|r| r.offset);
+        assert!(got.len() > 1, "long message fitted in {} frame(s)", got.len());
+        let flags: Vec<bool> = got.iter().map(|r| js8::message::ends_over(&r.a87)).collect();
+        let want: Vec<bool> = (0..got.len()).map(|i| i + 1 == got.len()).collect();
+        assert_eq!(flags, want, "end-of-over flags across {} frames", got.len());
+
+        // And a message that fits in one frame is that frame: first and last.
+        let audio = modulate("CQ DE W1AW ", 1200.0, ModeId::Js8(sm.mode));
+        let got = js8::modem::decode_all_sm(&audio, 1000.0, 1400.0, 30, &sm);
+        assert_eq!(got.len(), 1, "expected one frame");
+        assert!(js8::message::ends_over(&got[0].a87), "a single-frame over did not end");
     }
 
     /// Continuous modes go now; cycle-aligned ones wait for their grid.

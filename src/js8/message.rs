@@ -83,6 +83,19 @@ impl Message {
     }
 }
 
+/// Whether this frame's itype flags say it is the last of an over.
+///
+/// [`IType::Last`] and [`IType::FirstAndLast`] are 2 and 3, so the flag is the
+/// middle bit of the three at `a87[72..75]` — which is the same bit the
+/// unpackers test before appending `<>` to their text.
+///
+/// The frame type does not come into it: the flags sit outside the payload, so
+/// a directed frame carries them as plainly as a free-text one even though only
+/// two of the unpackers render them.
+pub fn ends_over(a87: &[u8; 87]) -> bool {
+    a87[73] != 0
+}
+
 /// Write `n` bits of `x` (MSB first) into `a[off..off+n]`. Mirrors `setbits()`.
 fn setbits(a: &mut [u8], off: usize, n: usize, x: u64) {
     for i in 0..n {
