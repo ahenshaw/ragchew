@@ -41,17 +41,45 @@ pub enum Message {
 }
 
 impl Message {
-    /// Render to the reference textual form.
+    /// Render for a reader: what the station said, or a note that we cannot say.
+    ///
+    /// The two compound frames are the ones we recognise but cannot yet parse,
+    /// and what they render as matters, because this string is what reaches the
+    /// conversation log, the traffic CSV and the interface. The reference — and
+    /// this, until it was seen on the air — returns the frame type's own name,
+    /// so `CompoundDirected` appeared in a QSO as though a station had typed
+    /// it, in a panel where every other line is something somebody sent.
+    ///
+    /// Parenthesised and in lower case, then. JS8 message text is upper case
+    /// and unbracketed, so this cannot be read as coming from the air, and the
+    /// sighting is still reported — a compound-callsign station is at that
+    /// frequency at that moment, which is worth knowing even unread.
     pub fn text(&self) -> String {
         match self {
             Message::FreeText(s)
             | Message::HeartbeatCq(s)
             | Message::Directed(s)
             | Message::Dense(s) => s.clone(),
-            Message::Compound => "Compound".to_string(),
-            Message::CompoundDirected => "CompoundDirected".to_string(),
+            Message::Compound => "(compound callsign)".to_string(),
+            Message::CompoundDirected => "(compound callsign, directed)".to_string(),
             Message::Unknown => String::new(),
         }
+    }
+
+    /// Whether this is something a station said, as against a note from the
+    /// decoder about a frame it could not read.
+    ///
+    /// The distinction the interface needs: a station's own words can be
+    /// answered, logged and searched; a note about an unparsed frame cannot,
+    /// and should not be counted as traffic.
+    pub fn is_from_the_air(&self) -> bool {
+        matches!(
+            self,
+            Message::FreeText(_)
+                | Message::HeartbeatCq(_)
+                | Message::Directed(_)
+                | Message::Dense(_)
+        )
     }
 }
 
@@ -297,4 +325,47 @@ fn unpack_dense(a87: &[u8; 87]) -> String {
         ret.push_str("<>");
     }
     ret
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frame types we recognise but cannot parse must not read as though a
+    /// station sent them.
+    ///
+    /// This string goes into the conversation log, the traffic CSV and the
+    /// interface, all of which present it as what was said. `CompoundDirected`
+    /// turned up in a QSO panel on 14.078 looking exactly like a word somebody
+    /// had typed — the first thing asked about it was what it meant.
+    #[test]
+    fn an_unparsed_frame_does_not_read_as_something_a_station_said() {
+        for m in [Message::Compound, Message::CompoundDirected] {
+            let t = m.text();
+            assert!(!t.is_empty(), "{m:?} says nothing at all, which hides a real station");
+            assert!(t.starts_with('(') && t.ends_with(')'), "{m:?} renders as {t:?}");
+            // JS8 message text is upper case and unbracketed, so lower case
+            // inside parentheses cannot be mistaken for something off the air.
+            assert!(
+                t.chars().any(|c| c.is_ascii_lowercase()),
+                "{t:?} could pass for a transmission"
+            );
+            assert!(!m.is_from_the_air(), "{m:?} is the decoder talking, not a station");
+        }
+    }
+
+    /// And what a station really did send is passed through untouched — the
+    /// note above must not become a general wrapper.
+    #[test]
+    fn what_a_station_said_is_passed_through_as_it_was_sent() {
+        let said = "KN4CRD: CQ CQ CQ EM73";
+        assert_eq!(Message::HeartbeatCq(said.to_string()).text(), said);
+        assert!(Message::HeartbeatCq(said.to_string()).is_from_the_air());
+        assert_eq!(Message::FreeText("HELLO WORLD".into()).text(), "HELLO WORLD");
+        assert!(Message::Directed("[A B C]".into()).is_from_the_air());
+        // A frame whose leading bits match nothing is not a sighting worth
+        // reporting, and stays silent.
+        assert_eq!(Message::Unknown.text(), "");
+        assert!(!Message::Unknown.is_from_the_air());
+    }
 }
