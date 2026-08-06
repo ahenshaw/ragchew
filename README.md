@@ -42,9 +42,9 @@ menu: *Open audio file…* for a native file picker, or straight to the demo
 bands. `--help` lists the lot.
 
 Window size and position, the panel splits, text size, playback and waterfall
-settings, the modes being scanned, the chosen audio input and output, the
-palette (dark, light, or following the desktop), and where in the band the view
-is pointed all persist between runs
+settings, how long text stays on a row, the modes being scanned, the chosen
+audio input and output, the palette (dark, light, or following the desktop),
+and where in the band the view is pointed all persist between runs
 (`~/.local/share/ragchew/app.ron` on Linux). A saved view is fitted to the band
 on the way in, so a settings file from another build — or one edited by hand —
 cannot reopen the app zoomed into 50 Hz of nothing. Conversations are not saved:
@@ -78,13 +78,25 @@ The toolbar is one line: **☰** holds the display settings, the audio input and
 output, *Reset view* and *Quit*; **Source** opens a recording or switches what
 is being listened to; the mode
 menus on the right control what is scanned for, and each protocol's channels are
-coloured by mode.
+coloured by mode. **clear**, under a red ✕, takes every station's text off the
+rows.
 
 Everything else is done on the canvas. Scroll to pan, pinch (or ctrl+scroll) to
 zoom, shift+scroll to size the text. The frequency axis — scale and band
 position — is overlaid on the waterfall's right edge; drag the bar there to move
 around the whole band whatever the zoom. Drag the gutter between the text and
-the waterfall to give either side more room.
+the waterfall to give either side more room. Right-click a row to clear that one
+station.
+
+A band left running fills up with conversations that finished an hour ago, so
+the window can be told to forget: **☰ ▸ forget** is how long a station's text
+stays on its row, and **fade** is how long it takes to go once it is that old.
+The oldest text goes first, a piece at a time, so a station still talking keeps
+what it has just said and loses only what it said too long ago; a station that
+has been quiet for the whole timeout leaves the window altogether. It is off
+until you set it — zero minutes keeps everything, which is what the app did
+before. None of this touches the decoding or the logs: an open conversation
+keeps every word it took, cleared or not.
 
 ## Working a station
 

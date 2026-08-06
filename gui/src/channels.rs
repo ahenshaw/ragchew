@@ -26,6 +26,15 @@ const MAX_TEXT_CHARS: usize = 4096;
 /// the first.
 pub const MAX_HISTORY: usize = 256;
 
+/// How finely a channel times the text it took on: a new mark is written only
+/// once this much has passed since the last one.
+///
+/// A second is far below any silence worth noticing — see [`MIN_OVER_GAP_S`] —
+/// and far above the resolution anything reading these needs. What it buys is
+/// a bound on the fastest mode: PSK decodes a character at a time, and one mark
+/// per character would be sixteen bytes of bookkeeping for every byte of text.
+pub const ARRIVAL_QUANTUM_S: f64 = 1.0;
+
 /// A tracked signal accumulating text across transmissions.
 #[derive(Clone, Debug)]
 pub struct Channel {
@@ -77,6 +86,27 @@ pub struct Channel {
     /// Empty for the continuous modes, where a "frame" is a character or a
     /// two-second block and marking them would be marking nothing.
     pub frames: Vec<(usize, f64)>,
+    /// When each stretch of the text arrived: `(character index, the time it
+    /// was decoded)`, indexed and trimmed like [`Channel::breaks`], and never
+    /// written more often than [`ARRIVAL_QUANTUM_S`].
+    ///
+    /// This is what lets old text be aged off a row a piece at a time. A reader
+    /// holding the channel has one string and one [`Channel::last_heard_s`],
+    /// which says when the *end* of it arrived and nothing about the rest: a
+    /// station that talked for a minute an hour ago and has been quiet since
+    /// would have to go all at once or not at all.
+    ///
+    /// Coalescing cannot span a pause, which is the property that matters: a
+    /// mark is written whenever a decode lands a quantum or more after the last
+    /// one, so text from after a silence never inherits the age of the text
+    /// before it.
+    ///
+    /// On a cycle-aligned mode this holds the same indices as
+    /// [`Channel::frames`], frames being further apart than the quantum, but it
+    /// is not the same fact: that one is where the seams are and exists only
+    /// where there are packets, this one is how old the text is and exists on
+    /// every mode.
+    pub arrivals: Vec<(usize, f64)>,
     /// Character count of the most recently appended chunk (for the scroll-in
     /// animation).
     pub last_chunk_chars: usize,
@@ -176,24 +206,83 @@ impl Channel {
     fn push_text(&mut self, chunk: &str) {
         self.text.push_str(chunk);
         let len = self.text.chars().count();
-        if len <= MAX_TEXT_CHARS {
-            return;
+        if len > MAX_TEXT_CHARS {
+            self.drop_front(len - MAX_TEXT_CHARS);
         }
-        let drop = len - MAX_TEXT_CHARS;
+    }
+
+    /// Drop `n` characters off the front of the text, and with them everything
+    /// indexed into what has gone.
+    fn drop_front(&mut self, n: usize) {
+        let n = n.min(self.text.chars().count());
         // By character, not by byte: a callsign is ASCII but decoded text need
         // not be, and splitting a multi-byte character would panic.
-        let cut = self.text.char_indices().nth(drop).map_or(self.text.len(), |(i, _)| i);
+        let cut = self.text.char_indices().nth(n).map_or(self.text.len(), |(i, _)| i);
         self.text.drain(..cut);
-        self.text_dropped += drop;
+        self.text_dropped += n;
         // A break in text nobody can read any more says nothing, and neither
         // does a seam between two frames that have both gone.
         self.breaks.retain(|&(i, _)| i >= self.text_dropped);
         self.frames.retain(|&(i, _)| i >= self.text_dropped);
+        // Arrivals are the exception: the cut usually lands *inside* the
+        // stretch the oldest surviving mark covers, and text with no mark at or
+        // before it has no age at all — it would read as older than anything on
+        // record and be forgotten on the next pass, which is text disappearing
+        // for want of bookkeeping. So that mark is carried up to the new front
+        // rather than dropped with the characters it used to point at.
+        let head = self.arrivals.iter().rev().find(|&&(i, _)| i <= self.text_dropped);
+        let head = head.map(|&(_, t)| (self.text_dropped, t));
+        self.arrivals.retain(|&(i, _)| i > self.text_dropped);
+        if let (Some(mark), false) = (head, self.text.is_empty()) {
+            self.arrivals.insert(0, mark);
+        }
     }
 
     /// Absolute index of the next character this channel will take.
     fn next_index(&self) -> usize {
         self.text_dropped + self.text.chars().count()
+    }
+
+    /// How the tail of the text divides by age: `(how many characters, when
+    /// they arrived)`, oldest first, covering the last `n` characters — or all
+    /// of them, if the channel holds fewer.
+    ///
+    /// The time is `None` where the text is older than the oldest arrival still
+    /// on record. That can only be the very front of the buffer, and it is by
+    /// construction the stalest text there is.
+    pub fn tail_ages(&self, n: usize) -> Vec<(usize, Option<f64>)> {
+        let have = self.next_index();
+        let held = self.text.chars().count();
+        let mut out = Vec::new();
+        let mut i = have - held.min(n);
+        while i < have {
+            // The mark covering `i`, and the index at which the next one takes
+            // over from it.
+            let k = self.arrivals.partition_point(|&(j, _)| j <= i);
+            let at = k.checked_sub(1).map(|k| self.arrivals[k].1);
+            let end = self.arrivals.get(k).map_or(have, |&(j, _)| j.min(have));
+            out.push((end - i, at));
+            i = end;
+        }
+        out
+    }
+
+    /// Forget text that arrived before `at`.
+    ///
+    /// Whole marks at a time, so up to [`ARRIVAL_QUANTUM_S`] of text either side
+    /// of the cut goes with the stretch it was recorded in. Nothing reading this
+    /// is aiming at a character — a timeout is measured in minutes and a clear
+    /// is aimed at everything on a row — so the extra precision would cost more
+    /// bookkeeping than it could ever be worth.
+    pub fn forget_before(&mut self, at: f64) {
+        let k = self.arrivals.partition_point(|&(_, t)| t < at);
+        // Nothing on record is new enough, so all of it goes — including any
+        // text past the last mark, which arrived inside that mark's stretch and
+        // is therefore no newer than a quantum after it.
+        let cut = self.arrivals.get(k).map_or(self.next_index(), |&(i, _)| i);
+        if cut > self.text_dropped {
+            self.drop_front(cut - self.text_dropped);
+        }
     }
 }
 
@@ -294,6 +383,11 @@ impl ChannelSet {
                 if d.mode.period_s().is_some() {
                     ch.frames.push((ch.next_index(), d.time_s));
                 }
+                // Written before the text goes on, like the marks above it, so
+                // the index is where this decode's text starts.
+                if ch.arrivals.last().is_none_or(|&(_, t)| d.time_s - t >= ARRIVAL_QUANTUM_S) {
+                    ch.arrivals.push((ch.next_index(), d.time_s));
+                }
                 ch.over_ended = d.ends_over;
                 ch.push_text(&d.text);
                 ch.last_heard_s = d.time_s;
@@ -331,6 +425,7 @@ impl ChannelSet {
                     chunks: 1,
                     breaks: Vec::new(),
                     frames: if d.mode.period_s().is_some() { vec![(0, d.time_s)] } else { Vec::new() },
+                    arrivals: vec![(0, d.time_s)],
                     over_ended: d.ends_over,
                     over_sender: sender_in(&d.text).map(str::to_string),
                 });
@@ -351,6 +446,25 @@ impl ChannelSet {
     /// scratch on every frame.
     pub fn by_id(&self, id: u64) -> Option<&Channel> {
         self.channels.iter().find(|c| c.id == id)
+    }
+
+    /// Forget text that arrived before the instant `cut` names for the channel
+    /// it is asked about, and with it any channel left with nothing to show.
+    ///
+    /// A channel is dropped rather than kept empty because an empty row is not
+    /// a station: there is no text to read and its leader would point at a
+    /// signal the waterfall has long since carried away. `-∞` is "keep
+    /// everything", and is the only way a channel that has never said anything
+    /// survives this.
+    pub fn forget(&mut self, cut: impl Fn(&Channel) -> f64) {
+        self.channels.retain_mut(|ch| {
+            let at = cut(ch);
+            if !at.is_finite() {
+                return true;
+            }
+            ch.forget_before(at);
+            !ch.text.is_empty()
+        });
     }
 
     /// Build a channel set from a batch of decodes (sorted by time first).
@@ -692,6 +806,138 @@ mod tests {
         assert_eq!(sender_in("HELLO OM HW CPY"), None, "free text named a sender");
         assert_eq!(sender_in("TNX: FB"), None, "a word and a colon is not a call");
         assert_eq!(sender_in(""), None);
+    }
+
+    /// Text from before a cut is forgotten, and what is left keeps its place in
+    /// the conversation: everything indexed into a channel counts from the
+    /// start of it, so a reader that has already logged some of this must not
+    /// find the rest shifted under it.
+    #[test]
+    fn text_from_before_a_cut_is_forgotten() {
+        let mut set = ChannelSet::new(15.0);
+        for i in 0..4 {
+            set.add(d(1000.0, i as f64 * 15.0, "DE K2N "));
+        }
+        set.forget(|_| 20.0);
+        let ch = &set.channels()[0];
+        assert_eq!(ch.text, "DE K2N DE K2N ", "the wrong end was forgotten");
+        assert_eq!(ch.text_dropped, 14, "what is left is at the wrong index");
+        for (what, marks) in [("frame", &ch.frames), ("arrival", &ch.arrivals)] {
+            assert!(
+                marks.iter().all(|&(i, _)| i >= ch.text_dropped),
+                "an {what} mark points into text that is gone: {marks:?}"
+            );
+        }
+        assert_eq!(ch.arrivals.first().map(|&(_, t)| t), Some(30.0), "{:?}", ch.arrivals);
+    }
+
+    /// A channel with nothing left to show is not a channel any more: an empty
+    /// row is a leader pointing at a signal that has scrolled away.
+    #[test]
+    fn a_channel_forgotten_entirely_leaves_the_set() {
+        let mut set = ChannelSet::from_decodes([d(1000.0, 0.0, "A"), d(1500.0, 30.0, "B")], 15.0);
+        set.forget(|_| 15.0);
+        assert_eq!(set.channels().len(), 1, "the quiet station is still here");
+        assert_eq!(set.channels()[0].text, "B");
+    }
+
+    /// No cut is no change — not even to a channel that has never managed to
+    /// say anything.
+    #[test]
+    fn nothing_is_forgotten_without_a_cut() {
+        let mut set = ChannelSet::from_decodes([d(1000.0, 0.0, ""), d(1500.0, 0.0, "B")], 15.0);
+        set.forget(|_| f64::NEG_INFINITY);
+        assert_eq!(set.channels().len(), 2);
+        assert_eq!(set.channels()[1].text, "B", "text went missing with no cut set");
+    }
+
+    /// Text that arrived after a silence is never aged with the text before it.
+    ///
+    /// This is the property the arrival marks exist for. On a per-character
+    /// mode their times are coalesced, and if the coalescing could span a pause
+    /// then a station that came back after ten minutes would have what it just
+    /// said forgotten along with what it said before.
+    #[test]
+    fn a_silence_always_gets_its_own_mark() {
+        let psk = |t: f64, c: char| Decode {
+            snr_db: None,
+            hz: 620.0,
+            time_s: t,
+            text: c.to_string(),
+            ends_over: false,
+            mode: ModeId::Psk(ragchew::psk::PSK31),
+            quality: 4.0,
+        };
+        let step = ModeId::Psk(ragchew::psk::PSK31).chunk_secs();
+        let mut set = ChannelSet::new(15.0);
+        let mut t = 0.0;
+        for c in "hi om ".chars() {
+            set.add(psk(t, c));
+            t += step;
+        }
+        let resumed = t + 600.0;
+        t = resumed;
+        for c in "back".chars() {
+            set.add(psk(t, c));
+            t += step;
+        }
+        // Forget anything older than a minute before the station came back.
+        set.forget(|_| resumed - 60.0);
+        assert_eq!(set.channels()[0].text, "back", "the new over was aged with the old one");
+    }
+
+    /// The marks stay bounded on a mode that decodes one character at a time:
+    /// no closer together than the quantum, whatever the character rate is.
+    #[test]
+    fn arrival_marks_are_no_finer_than_the_quantum() {
+        let step = ModeId::Psk(ragchew::psk::PSK31).chunk_secs();
+        let mut set = ChannelSet::new(15.0);
+        for i in 0..600 {
+            set.add(Decode {
+                snr_db: None,
+                hz: 620.0,
+                time_s: i as f64 * step,
+                text: "x".to_string(),
+                ends_over: false,
+                mode: ModeId::Psk(ragchew::psk::PSK31),
+                quality: 4.0,
+            });
+        }
+        let ch = &set.channels()[0];
+        assert!(
+            ch.arrivals.windows(2).all(|w| w[1].1 - w[0].1 >= ARRIVAL_QUANTUM_S),
+            "two marks landed inside one quantum: {:?}",
+            ch.arrivals
+        );
+        // PSK31 carries about five characters a second, so one mark a second is
+        // a fifth of what a mark per decode would have cost.
+        assert!(
+            ch.arrivals.len() * 3 < ch.text.chars().count(),
+            "{} marks for {} characters",
+            ch.arrivals.len(),
+            ch.text.chars().count()
+        );
+    }
+
+    /// The tail divides exactly: every character a row would show is accounted
+    /// for once, and the newest stretch is the last one.
+    #[test]
+    fn the_tail_divides_by_age_without_gaps() {
+        let mut set = ChannelSet::new(15.0);
+        for i in 0..4 {
+            set.add(d(1000.0, i as f64 * 15.0, "DE K2N "));
+        }
+        let ch = &set.channels()[0];
+        let held = ch.text.chars().count();
+
+        let runs = ch.tail_ages(10);
+        assert_eq!(runs.iter().map(|&(n, _)| n).sum::<usize>(), 10, "{runs:?}");
+        assert_eq!(runs.last().and_then(|&(_, t)| t), Some(45.0), "the last stretch is the newest");
+
+        let all = ch.tail_ages(10_000);
+        assert_eq!(all.iter().map(|&(n, _)| n).sum::<usize>(), held, "asking for more lost some");
+        assert_eq!(all.len(), 4, "four frames should be four stretches: {all:?}");
+        assert_eq!(all[0], (7, Some(0.0)));
     }
 
     /// Breaks are indexed from the start of the conversation, like the text

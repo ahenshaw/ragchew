@@ -16,6 +16,7 @@
 //! block every couple of seconds — and the waterfall scrolls. Stand-in for the
 //! live decode loop.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
@@ -40,6 +41,57 @@ use crate::tx::{self, Tx};
 use crate::waterfall::{self, Viewport};
 
 const HIGHLIGHT_SECS: f64 = 2.5;
+
+/// Longest a station's text can be asked to stay on its row, in minutes.
+///
+/// Two hours is a long evening on one frequency, and past it the bound on how
+/// much text a channel keeps at all has taken over anyway: see
+/// `channels::MAX_TEXT_CHARS`.
+const MAX_FORGET_MIN: f32 = 120.0;
+
+/// Longest text can be asked to take going.
+const MAX_FADE_S: f32 = 60.0;
+
+/// One stroke of the clear button's mark, in the asset's own units.
+struct MarkStroke {
+    from: Pos2,
+    to: Pos2,
+    width: f32,
+}
+
+/// The mark on the clear button, from `gui/assets/Red_X.svg`: the two strokes
+/// that are the whole of that file, in its own 100×100 viewport.
+///
+/// Transcribed rather than rendered. Both strokes are straight lines —
+/// `the_clear_mark_is_the_one_in_the_asset` reads the file and fails the moment
+/// that stops being true — and rasterising them would mean carrying an SVG
+/// stack in the binary to draw, at the eleven pixels this is seen at, what two
+/// line segments draw better at every scale factor.
+///
+/// The digits are the file's, shortened to what an `f32` can hold: the same
+/// number, written the way Rust writes it. That test is what ties the two
+/// together, so it is the thing to fix if the asset ever moves.
+const CLEAR_MARK: [MarkStroke; 2] = [
+    MarkStroke {
+        from: Pos2::new(6.3895625, 6.419563),
+        to: Pos2::new(93.58044, 93.610437),
+        width: 18.05196,
+    },
+    MarkStroke {
+        from: Pos2::new(6.3894, 93.6106),
+        to: Pos2::new(93.830213, 6.4194),
+        width: 17.802021,
+    },
+];
+
+/// The side of the viewport [`CLEAR_MARK`] is drawn in.
+const CLEAR_MARK_BOX: f32 = 100.0;
+
+/// The colour the asset draws it in, `stroke:#ff0000`.
+///
+/// It goes through [`legible`] like every other accent here: pure red on the
+/// light palette is a stain rather than a mark.
+const CLEAR_MARK_RED: Color32 = Color32::from_rgb(255, 0, 0);
 
 /// Width of the band bar overlaid on the waterfall's right edge.
 const BAND_BAR_W: f32 = 14.0;
@@ -574,6 +626,13 @@ struct Settings {
     theme: String,
     /// Mode a QSO opened by hand starts in, by [`ModeId::name`].
     default_mode: String,
+    /// How long a station's text stays on its row before it starts fading off,
+    /// in minutes. Zero — which is also what a settings file written before
+    /// this existed deserialises to — keeps everything, as a monitor always
+    /// did.
+    forget_min: f32,
+    /// How long text takes to go once it has passed `forget_min`, in seconds.
+    fade_secs: f32,
 }
 
 impl Default for Settings {
@@ -592,6 +651,12 @@ impl Default for Settings {
             view_hz: None,
             theme: Theme::default().name().to_string(),
             default_mode: DEFAULT_QSO_MODE.name(),
+            // Off. A monitor that quietly dropped text nobody had read yet
+            // would be noticed at three in the morning and not before, so this
+            // is a thing the operator turns on, having decided how long a
+            // conversation stays interesting.
+            forget_min: 0.0,
+            fade_secs: 8.0,
         }
     }
 }
@@ -721,6 +786,55 @@ fn transport_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
     resp
 }
 
+/// The clear button: the mark from the asset, painted, and the word beside it.
+///
+/// Painted for the reason [`transport_button`] paints its icon, and for one
+/// more. The crosses a keyboard offers for this — ✖, ✕, ❌ — are in none of the
+/// three fonts egui bundles and draw as an empty box; `×` is in the text face,
+/// but that is the trouble with it, since a multiplication sign at button size
+/// is a thin dash of a thing where a mark is wanted. Two strokes are the same
+/// two strokes at any scale factor.
+fn clear_button(ui: &mut egui::Ui) -> egui::Response {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let pad = ui.spacing().button_padding;
+    let icon = ui.text_style_height(&egui::TextStyle::Button) * 0.55;
+    let gap = 6.0;
+    let galley = ui.painter().layout_no_wrap("clear".to_owned(), font, Color32::PLACEHOLDER);
+
+    let size = egui::vec2(
+        pad.x * 2.0 + icon + gap + galley.size().x,
+        ui.spacing().interact_size.y.max(galley.size().y + pad.y * 2.0),
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let v = *ui.style().interact(&resp);
+        let red = legible(ui.visuals().dark_mode, CLEAR_MARK_RED);
+        let p = ui.painter();
+        p.rect(rect, v.corner_radius, v.weak_bg_fill, v.bg_stroke, egui::StrokeKind::Inside);
+
+        // The asset's viewport, mapped onto a square the height of the text
+        // beside it. Stroke width is scaled with it, or the mark would thicken
+        // as the text was sized down.
+        let box_ = Rect::from_center_size(
+            egui::pos2(rect.left() + pad.x + icon / 2.0, rect.center().y),
+            egui::Vec2::splat(icon),
+        );
+        let scale = icon / CLEAR_MARK_BOX;
+        for s in &CLEAR_MARK {
+            p.line_segment(
+                [box_.min + s.from.to_vec2() * scale, box_.min + s.to.to_vec2() * scale],
+                Stroke::new(s.width * scale, red),
+            );
+        }
+        p.galley(
+            egui::pos2(rect.left() + pad.x + icon + gap, rect.center().y - galley.size().y / 2.0),
+            galley,
+            v.fg_stroke.color,
+        );
+    }
+    resp
+}
+
 /// A time on a `track_w`-point slider, snapped to whole physical pixels.
 ///
 /// A circle drawn at a fractional position is anti-aliased differently at every
@@ -761,6 +875,9 @@ fn texture_geometry(span_cols: usize, px_w: usize) -> (usize, usize) {
 /// eleven pixels of text or a forty-five second window, typing it is the
 /// shorter path. The box drags too, so the pair covers both habits, and the
 /// range is enforced on the typed value as much as the dragged one.
+///
+/// Returns the row, so a setting whose name will not carry its whole meaning in
+/// one word can hang the rest of it off a hover.
 fn setting(
     ui: &mut egui::Ui,
     label: &str,
@@ -769,7 +886,7 @@ fn setting(
     suffix: &str,
     speed: f32,
     decimals: usize,
-) {
+) -> egui::Response {
     // One row: name, track, value. The slider stacks its own label above its
     // track, so the name is drawn here instead, and its readout is replaced by
     // a box that can be typed into as well as dragged.
@@ -785,7 +902,8 @@ fn setting(
                 .speed(speed)
                 .max_decimals(decimals),
         );
-    });
+    })
+    .response
 }
 
 /// A menu that stays open while its contents are used.
@@ -805,6 +923,33 @@ fn settings_menu<R>(
         .config(MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
         .ui(ui, contents)
         .0
+}
+
+/// How solidly text that arrived at `at` is drawn, `now`: whole until it has
+/// been on the row `keep` seconds, then fading to nothing over the next `fade`.
+///
+/// The ages are on the audio clock, not the wall clock, and deliberately: what
+/// makes text stale is how long ago the station sent it, which is a fact about
+/// the band rather than about how fast a recording of it is being played back.
+/// A file running at 8× therefore ages its text 8× faster on screen, because
+/// that is what it is doing to the band it is replaying.
+fn solidity(now: f64, at: Option<f64>, keep: Option<f64>, fade: f64) -> f32 {
+    let Some(keep) = keep else {
+        return 1.0;
+    };
+    // Older than anything the channel still has a time for, so it is the oldest
+    // text there is — see [`Channel::tail_ages`].
+    let Some(at) = at else {
+        return 0.0;
+    };
+    let over = (now - at) - keep;
+    if over <= 0.0 {
+        return 1.0;
+    }
+    if fade <= 0.0 {
+        return 0.0;
+    }
+    (1.0 - over / fade).clamp(0.0, 1.0) as f32
 }
 
 /// The log's offset column: how long into the QSO a line landed.
@@ -1152,6 +1297,25 @@ struct App {
     /// diagnostics menu.
     record: bool,
 
+    /// How long a station's text stays on its row, in minutes, and how long it
+    /// takes to fade off once it has been there that long. Zero minutes keeps
+    /// everything, which is what a monitor did before this existed.
+    forget_min: f32,
+    fade_secs: f32,
+    /// Text the operator has dismissed: the instant before which a channel's
+    /// text is no longer shown, by channel id, and one for the whole band from
+    /// the clear button.
+    ///
+    /// An instant rather than a flag, because a cleared station goes on
+    /// transmitting and what it says next is not what was cleared. Held here
+    /// rather than applied to the channels themselves because the file view
+    /// rebuilds its channels from scratch on every frame — a clear that lived
+    /// in the set would last one frame — and because a log is a record: the
+    /// conversations take their text from the set before this trims the copy
+    /// the window is drawn from.
+    cleared: HashMap<u64, f64>,
+    cleared_all_at: f64,
+
     /// What PipeWire could route into the capture, as of [`App::pw_at`].
     ///
     /// Held rather than asked for, because a menu redraws every frame and the
@@ -1298,6 +1462,10 @@ impl App {
             split_grab_dx: 0.0,
             live: None,
             record: false,
+            forget_min: 0.0,
+            fade_secs: 8.0,
+            cleared: HashMap::new(),
+            cleared_all_at: f64::NEG_INFINITY,
             pw: crate::pipewire::Routing::default(),
             pw_at: None,
         }
@@ -1319,6 +1487,8 @@ impl App {
             view_hz: Some((self.vp.f_lo, self.vp.f_hi)),
             theme: self.theme.name().to_string(),
             default_mode: self.default_mode.name(),
+            forget_min: self.forget_min,
+            fade_secs: self.fade_secs,
         }
     }
 
@@ -1333,6 +1503,8 @@ impl App {
         self.preferred_output = s.output_device;
         self.show_all_inputs = s.show_all_inputs;
         self.qso_w = s.qso_w.clamp(MIN_QSO_W, 900.0);
+        self.forget_min = s.forget_min.clamp(0.0, MAX_FORGET_MIN);
+        self.fade_secs = s.fade_secs.clamp(0.0, MAX_FADE_S);
         // An unknown name leaves the theme at Auto rather than at whatever the
         // last build happened to write.
         self.theme = Theme::parse(&s.theme).unwrap_or_default();
@@ -1350,6 +1522,73 @@ impl App {
                 *on = wanted.contains(m);
             }
         }
+    }
+
+    /// How long text stays on a row before it starts to go, in seconds, or
+    /// `None` when nothing is forgotten — which is what a zero means.
+    fn forget_secs(&self) -> Option<f64> {
+        (self.forget_min > 0.0).then_some(self.forget_min as f64 * 60.0)
+    }
+
+    /// The instant before which this channel's text is no longer shown: the
+    /// last time it was cleared by hand, or the trailing edge of the timeout,
+    /// whichever is later. `-∞` when neither applies, which is "keep
+    /// everything".
+    fn cut_for(&self, ch: &Channel, now: f64) -> f64 {
+        let by_hand = self
+            .cleared
+            .get(&ch.id)
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY)
+            .max(self.cleared_all_at);
+        match self.forget_secs() {
+            // The fade is part of the life of the text: it is not dropped when
+            // it starts fading, it is dropped when it has finished.
+            Some(keep) => by_hand.max(now - keep - self.fade_secs as f64),
+            None => by_hand,
+        }
+    }
+
+    /// Take everything on the rows off them, as of `now`.
+    ///
+    /// The per-channel clears go with it: none of them can be later than this,
+    /// so none of them can still have anything to say. What arrives after this
+    /// instant is new text and appears as usual, including on a station that
+    /// was cleared mid-over and is still transmitting.
+    fn clear_all(&mut self, now: f64) {
+        self.cleared.clear();
+        self.cleared_all_at = now;
+    }
+
+    /// Drop the clears the clock has fallen back behind.
+    ///
+    /// A clear is a moment in the recording, and the clock can be put back
+    /// before one: ⟲ restart, a drag of the playback slider, a new file. What
+    /// was cleared has then not been said yet, so there is nothing left for the
+    /// clear to hold against.
+    ///
+    /// Holding it anyway is what a moment means read literally, and it is
+    /// wrong: restarting a demo after clearing it left the panel blank for the
+    /// whole replay up to the instant clear was pressed, which reads exactly
+    /// like the decoding having stopped.
+    fn drop_stale_clears(&mut self, now: f64) {
+        if self.cleared_all_at > now {
+            self.cleared_all_at = f64::NEG_INFINITY;
+        }
+        self.cleared.retain(|_, at| *at <= now);
+    }
+
+    /// Drop every clear, whatever the clock says.
+    ///
+    /// For when the channels themselves are rebuilt rather than replayed. A
+    /// clear on one station is a channel id, and an id means something only
+    /// within the set that issued it: rescan the same recording for a different
+    /// set of modes and id 3 is a different station, or nobody at all. The
+    /// band-wide clear goes too, since the times it was aimed at belong to a
+    /// scan that no longer exists.
+    fn drop_clears(&mut self) {
+        self.cleared.clear();
+        self.cleared_all_at = f64::NEG_INFINITY;
     }
 
     /// The modes currently being listened for.
@@ -1432,6 +1671,11 @@ impl App {
     /// while playback runs off the (much faster) spectrogram. Any batch that
     /// arrives after the clock has already passed it simply appears in place.
     fn rescan(&mut self) {
+        // The channels are about to be built again from nothing, and the ids
+        // any clear names go with the old ones. The clock does not move here —
+        // a mode toggled mid-playback rescans in place — so this is the one
+        // rebuild `drop_stale_clears` cannot see.
+        self.drop_clears();
         let (frames_tx, frames_rx) = channel();
         self.frames_rx = frames_rx;
         self.frames = Vec::new();
@@ -2360,9 +2604,12 @@ impl App {
         if live {
             self.norm = live_norm;
         }
-        let channels = live_channels.unwrap_or_else(|| self.channels_now());
+        let mut channels = live_channels.unwrap_or_else(|| self.channels_now());
         let spec = if live { live_spec } else { self.spec.clone() };
         let t_now = if live { live_t } else { self.t_now };
+        // Wherever the clock has got to, it is the clock the clears are held
+        // against — and it can have gone backwards since the last frame.
+        self.drop_stale_clears(t_now);
 
         let mut chosen_device: Option<String> = None;
         // Routing another application's audio in. `want_pw` is set by the menu
@@ -2397,6 +2644,17 @@ impl App {
                     setting(ui, "text size", &mut self.text_px, 8.0..=22.0, " px", 0.25, 1);
                     setting(ui, "window", &mut self.span_s, 10.0..=120.0, " s", 0.5, 0);
                     setting(ui, "scroll", &mut self.scroll_secs, 0.0..=2.0, " s", 0.02, 2);
+                    // How long the window keeps what it has been told. Beside
+                    // the other things about the text panel, because that is
+                    // what it acts on — the band is still being decoded and the
+                    // conversations still keep their logs.
+                    setting(ui, "forget", &mut self.forget_min, 0.0..=MAX_FORGET_MIN, " min", 0.5, 1)
+                        .on_hover_text(
+                            "how long a station's text stays on its row before it fades off. \
+                             Zero keeps everything.",
+                        );
+                    setting(ui, "fade", &mut self.fade_secs, 0.0..=MAX_FADE_S, " s", 0.25, 1)
+                        .on_hover_text("how long text takes to go, once it is that old");
                     if !live {
                         setting(ui, "speed", &mut self.speed, 1.0..=20.0, "×", 0.1, 1);
                     }
@@ -2737,6 +2995,20 @@ impl App {
                 ui.separator();
                 modes_changed = self.modes_menu(ui);
 
+                // Clearing the window is a command about the window rather than
+                // a setting, and it is reached mid-session and often — you tidy
+                // the rows when the band has moved on — so it sits out here
+                // beside the modes instead of two clicks inside the hamburger.
+                if clear_button(ui)
+                    .on_hover_text(
+                        "take every station's text off the rows. Right-click one row to \
+                         clear just that channel; open conversations keep their logs.",
+                    )
+                    .clicked()
+                {
+                    self.clear_all(t_now);
+                }
+
                 // Last on the bar, deliberately. Its readout gains and loses
                 // digits as playback runs, and anything to its right would be
                 // shoved back and forth for the whole recording.
@@ -2857,16 +3129,29 @@ impl App {
             }
         }
 
-        // The status line spans the window, so it is claimed before the QSO
-        // panel takes the left of it — shown after the toolbar's handlers above
-        // so that something said this frame is read this frame.
-        self.status_bar(ui, live, channels.channels().len());
-
         // Conversations sit to the left of the panorama, before the central
         // panel claims what is left. New text reaches them here, so a QSO logs
         // what its station said whether or not its tab is the one on top.
+        //
+        // Before anything is forgotten, and from the set rather than from the
+        // window's copy of it: clearing a row is about the window, and a log
+        // that lost text because the operator tidied the display would be a
+        // record that could not be trusted.
         self.qsos.absorb(&channels);
         self.qsos.retire_sent(unix_now());
+
+        // Now take out what has been cleared and what has gone stale. Live,
+        // what this trims is the copy the window is drawn from; the set behind
+        // it is the session's own record and keeps everything it heard.
+        channels.forget(|ch| self.cut_for(ch, t_now));
+
+        // The status line spans the window, so it is claimed before the QSO
+        // panel takes the left of it — shown after the toolbar's handlers above
+        // so that something said this frame is read this frame. It counts what
+        // the window is showing, which after a clear is not the same as what
+        // the band has been carrying.
+        self.status_bar(ui, live, channels.channels().len());
+
         // The conversations sit on the theme's card surface while the band
         // keeps the panel background. The two are a designed pair — a shade
         // apart in both palettes, lighter in the dark theme and lighter again
@@ -2885,10 +3170,15 @@ impl App {
         // shave a few pixels off the panel every time the app was restarted.
         self.qso_w = panel.response.rect.width().max(MIN_QSO_W);
 
-        // Clicking a station's text opens its conversation. The click is
-        // handled after the panel rather than inside it, where `self` is
-        // already borrowed for the drawing.
+        // Clicking a station's text opens its conversation, and right-clicking
+        // it offers to clear it. Both are handled after the panel rather than
+        // inside it, where `self` is already borrowed for the drawing.
         let mut open_qso: Option<Channel> = None;
+        let mut clear_one: Option<u64> = None;
+        let mut clear_every = false;
+        // What is left of the timeout, for the rows to fade against. Read out
+        // here for the same reason: the drawing borrows `self`.
+        let (keep, fade) = (self.forget_secs(), self.fade_secs as f64);
         egui::CentralPanel::default().show(ui, |ui| {
             let spec = match &spec {
                 Some(s) => s.clone(),
@@ -3110,6 +3400,33 @@ impl App {
                 let shown: String = ch.text.chars().rev().take(tail).collect::<Vec<_>>()
                     .into_iter().rev().collect();
 
+                // The row in stretches of one age, oldest first, so the front
+                // of it can fade off while the station carries on talking at
+                // the other end. What is going keeps its columns as it goes —
+                // the row is right-aligned on the newest character, so the text
+                // still being read never shifts under the eye.
+                let mut job = egui::text::LayoutJob::default();
+                let mut left = shown.chars();
+                // The newest stretch's solidity, which is the row's: when the
+                // last thing a station said has faded, so has the leader out to
+                // where it said it. It only ever reaches zero in the same frame
+                // the channel is forgotten — both edges are `keep + fade` — so
+                // a row never sits here invisible.
+                let mut solid = 1.0f32;
+                for (n, at) in ch.tail_ages(tail) {
+                    let s: String = left.by_ref().take(n).collect();
+                    solid = solidity(t_now, at, keep, fade);
+                    job.append(
+                        &s,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: font.clone(),
+                            color: color.gamma_multiply(solid),
+                            ..Default::default()
+                        },
+                    );
+                }
+
                 if (0.0..HIGHLIGHT_SECS).contains(&age) {
                     let a = (1.0 - age / HIGHLIGHT_SECS) as f32;
                     let w = (shown.chars().count() as f32 * char_w).min(g.strip_x0() - 8.0);
@@ -3117,26 +3434,33 @@ impl App {
                         to_screen(g.strip_x0() - 6.0 - w + offset_x, y_row - line_h / 2.0),
                         to_screen(g.strip_x0() - 2.0 + offset_x, y_row + line_h / 2.0),
                     );
-                    text_painter.rect_filled(r, 3.0, color.gamma_multiply(0.22 * a));
+                    text_painter.rect_filled(r, 3.0, color.gamma_multiply(0.22 * a * solid));
                 }
 
-                text_painter.text(
-                    to_screen(g.strip_x0() - 6.0 + offset_x, y_row),
-                    egui::Align2::RIGHT_CENTER,
-                    shown,
-                    font.clone(),
+                let galley = text_painter.layout_job(job);
+                text_painter.galley(
+                    egui::Align2::RIGHT_CENTER
+                        .anchor_size(to_screen(g.strip_x0() - 6.0 + offset_x, y_row), galley.size())
+                        .min,
+                    galley,
                     color,
                 );
 
+                // The leader goes with the text it leads to, not with the hover
+                // card, which stays legible right up until the row is gone.
                 let p = scene::leader(&g, y_row, y_freq);
-                let stroke = Stroke::new(1.2, color);
+                let stroke = Stroke::new(1.2, color.gamma_multiply(solid));
                 for seg in p.windows(2) {
                     painter.line_segment(
                         [to_screen(seg[0].0, seg[0].1), to_screen(seg[1].0, seg[1].1)],
                         stroke,
                     );
                 }
-                painter.circle_filled(to_screen(g.waterfall_x0(), y_freq), 2.5, color);
+                painter.circle_filled(
+                    to_screen(g.waterfall_x0(), y_freq),
+                    2.5,
+                    color.gamma_multiply(solid),
+                );
 
                 // Hovering a row reports what the waterfall cannot: how well
                 // the station is being heard, and how far its carrier has
@@ -3185,8 +3509,22 @@ impl App {
                             if ch.chunks == 1 { "" } else { "s" },
                             (ch.last_heard_s - ch.first_heard_s) + ch.mode.chunk_secs()
                         ));
-                        ui.weak("click to open a QSO");
+                        ui.weak("click to open a QSO · right-click to clear it");
                     });
+                // Clearing one station is offered where that station is, which
+                // is the only place it can be aimed: the rows are the band's
+                // own order and nothing else on screen names a channel.
+                let _ = resp.context_menu(|ui| {
+                    ui.weak(format!("{} at {:.0} Hz", ch.mode.name(), ch.hz));
+                    if ui.button("Clear this channel").clicked() {
+                        clear_one = Some(ch.id);
+                        ui.close();
+                    }
+                    if ui.button("Clear every channel").clicked() {
+                        clear_every = true;
+                        ui.close();
+                    }
+                });
                 if resp.clicked() {
                     open_qso = Some((*ch).clone());
                 }
@@ -3248,6 +3586,12 @@ impl App {
         if let Some(ch) = open_qso {
             self.qsos.open_for_channel(&ch, t_now);
         }
+        if let Some(id) = clear_one {
+            self.cleared.insert(id, t_now);
+        }
+        if clear_every {
+            self.clear_all(t_now);
+        }
     }
 }
 
@@ -3299,6 +3643,8 @@ mod tests {
         app.qso_w = 380.0;
         app.theme = Theme::Light;
         app.default_mode = ModeId::Olivia(ragchew::olivia::OL_16_500);
+        app.forget_min = 20.0;
+        app.fade_secs = 3.5;
         app.set_view(1200.0, 1400.0);
         for (m, on) in app.modes.iter_mut() {
             *on = m.protocol() == Protocol::Olivia;
@@ -3317,6 +3663,8 @@ mod tests {
         assert_eq!(restored.qso_w, 380.0);
         assert_eq!(restored.theme, Theme::Light);
         assert_eq!(restored.default_mode, ModeId::Olivia(ragchew::olivia::OL_16_500));
+        assert_eq!(restored.forget_min, 20.0);
+        assert_eq!(restored.fade_secs, 3.5);
         assert_eq!((restored.vp.f_lo, restored.vp.f_hi), (1200.0, 1400.0));
         assert_eq!(restored.enabled_modes(), app.enabled_modes());
         assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
@@ -3456,10 +3804,21 @@ mod tests {
         assert_eq!(app.enabled_modes().len(), all);
 
         // absurd values are clamped rather than trusted
-        app.apply(Settings { text_px: 1e6, span_s: -3.0, speed: 0.0, ..Settings::default() });
+        app.apply(Settings {
+            text_px: 1e6,
+            span_s: -3.0,
+            speed: 0.0,
+            forget_min: -60.0,
+            fade_secs: 1e6,
+            ..Settings::default()
+        });
         assert!((8.0..=22.0).contains(&app.text_px), "text_px {}", app.text_px);
         assert!((10.0..=120.0).contains(&app.span_s), "span_s {}", app.span_s);
         assert!((1.0..=20.0).contains(&app.speed), "speed {}", app.speed);
+        // A negative timeout is not "forget everything at once": it comes back
+        // as the zero that means keep it all.
+        assert_eq!(app.forget_secs(), None, "forget_min {}", app.forget_min);
+        assert!((0.0..=MAX_FADE_S).contains(&app.fade_secs), "fade_secs {}", app.fade_secs);
     }
 
     /// Lay the whole interface out, QSO panel and all, with no window and no
@@ -3983,6 +4342,295 @@ mod tests {
         app.t_now = t;
         app.samples = Arc::new(vec![0.0; 12_000]);
         app
+    }
+
+    /// The mark is painted, in the asset's colour, inside its own button.
+    ///
+    /// Two strokes and nothing typed, so nothing else here would notice if it
+    /// were drawn off the edge of the button, or not at all: the button would
+    /// measure the same and the word beside it would still be there.
+    #[test]
+    fn the_clear_button_paints_its_mark_inside_itself() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let (mut button, mut red) = (Rect::NOTHING, Color32::PLACEHOLDER);
+        let out = ctx.run_ui(input, |ui| {
+            elegance::Theme::slate().install(ui.ctx());
+            red = legible(ui.visuals().dark_mode, CLEAR_MARK_RED);
+            button = clear_button(ui).rect;
+        });
+
+        let strokes: Vec<[Pos2; 2]> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match cs.shape {
+                egui::Shape::LineSegment { points, stroke } if stroke.color == red => Some(points),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(strokes.len(), 2, "the mark is not two strokes on screen: {strokes:?}");
+        for seg in &strokes {
+            for p in seg {
+                assert!(button.contains(*p), "the mark is drawn at {p:?}, outside {button:?}");
+            }
+        }
+        // One stroke down to the right and one up to it: an X, not a V.
+        let slope = |s: &[Pos2; 2]| (s[1].y - s[0].y).signum() * (s[1].x - s[0].x).signum();
+        assert_eq!(slope(&strokes[0]), -slope(&strokes[1]), "the strokes do not cross");
+    }
+
+    /// The mark on the clear button is the one in the file it came from.
+    ///
+    /// [`CLEAR_MARK`] is transcribed from `gui/assets/Red_X.svg` rather than
+    /// rendered out of it, which is only honest while the two agree — so this
+    /// reads the asset and checks. It is also what says the shortcut is still
+    /// allowed: each stroke has to be a straight line, which in that file is a
+    /// cubic whose control points sit on its own endpoint. Give one a real
+    /// curve and this fails rather than the app quietly drawing something else.
+    #[test]
+    fn the_clear_mark_is_the_one_in_the_asset() {
+        let svg = include_str!("../assets/Red_X.svg");
+        let field = |s: &str, key: &str, end: char| {
+            let rest = s.split(key).nth(1).unwrap_or_else(|| panic!("no {key} in the asset"));
+            rest.split(end).next().expect("unterminated").to_owned()
+        };
+
+        let paths: Vec<&str> = svg.split("<path").skip(1).collect();
+        assert_eq!(paths.len(), CLEAR_MARK.len(), "the asset is no longer two strokes");
+        for (path, s) in paths.iter().zip(CLEAR_MARK.iter()) {
+            let d = field(path, " d=\"", '"');
+            let n: Vec<f32> = d.split([' ', ',']).filter_map(|t| t.parse().ok()).collect();
+            assert_eq!(Pos2::new(n[0], n[1]), s.from, "the stroke starts elsewhere in the asset");
+            for p in n[2..].chunks(2) {
+                assert_eq!(Pos2::new(p[0], p[1]), s.to, "the stroke is a curve, not a line: {d}");
+            }
+
+            let w: f32 = field(path, "stroke-width:", ';').parse().expect("a number");
+            let drawn = s.width;
+            assert!((w - drawn).abs() < 1e-4, "the asset draws that stroke {w} wide, not {drawn}");
+
+            let rgb = field(path, "stroke:#", ';');
+            let hex = |i: usize| u8::from_str_radix(&rgb[i..i + 2], 16).expect("hex");
+            assert_eq!(
+                Color32::from_rgb(hex(0), hex(2), hex(4)),
+                CLEAR_MARK_RED,
+                "the asset is drawn in #{rgb}"
+            );
+        }
+    }
+
+    /// The same band with a waterfall behind it, so the panorama is drawn
+    /// rather than the "computing spectrogram…" that stands in for it.
+    fn app_with_a_waterfall(t: f64) -> App {
+        let mut app = app_with_traffic(t);
+        app.samples = Arc::new(vec![0.0; SAMPLE_RATE as usize * 40]);
+        app.spec = Some(Arc::new(Spectrogram::compute(&app.samples, 0.0, 4000.0, WINDOW / 4)));
+        app
+    }
+
+    /// What was drawn to the right of the conversations, which is where the
+    /// rows are.
+    ///
+    /// Picked out by position because a station's text is not unique to its
+    /// row: an open QSO's log repeats it word for word, and by the time either
+    /// is a shape they are the same string.
+    ///
+    /// A row is one galley however many stretches it was written in, so this
+    /// reads what is on the row and not how much of it is fading — text on its
+    /// way out is still in the galley, holding its columns.
+    fn rows(app: &App, out: &egui::FullOutput) -> Vec<String> {
+        out.shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.pos.x > app.qso_w => {
+                    Some(t.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Clearing takes the text off the rows and leaves the conversations alone:
+    /// a log is a record of what was said, and tidying the window is not
+    /// editing it.
+    #[test]
+    fn clearing_empties_the_rows_and_not_the_log() {
+        let mut app = app_with_a_waterfall(30.0);
+        lay_out(&mut app);
+        let channels = app.channels_now();
+        app.qsos.open_for_channel(&channels.channels()[0], app.t_now);
+        let out = lay_out(&mut app);
+        assert!(
+            rows(&app, &out).iter().any(|s| s.contains("CQ CQ DE K2N")),
+            "the station was not on a row to begin with: {:?}",
+            rows(&app, &out)
+        );
+
+        app.clear_all(app.t_now);
+        let out = lay_out(&mut app);
+        for station in ["K2N", "VE3XYZ"] {
+            assert!(
+                !rows(&app, &out).iter().any(|s| s.contains(station)),
+                "{station} is still on a row: {:?}",
+                rows(&app, &out)
+            );
+        }
+        assert!(
+            drawn(&out).iter().any(|(s, _)| s == "0 channels"),
+            "the count still has them: {:?}",
+            drawn(&out)
+        );
+        assert!(
+            app.qsos.qsos()[0].log[0].text.contains("CQ CQ DE K2N"),
+            "the conversation lost its log: {:?}",
+            app.qsos.qsos()[0].log
+        );
+    }
+
+    /// Putting the clock back behind a clear replays what was cleared.
+    ///
+    /// A clear is a moment in the recording, and taken literally that outlives
+    /// a restart: everything decoded before the instant it was pressed arrives
+    /// already cleared, so the panel stays empty for the whole replay up to
+    /// that point. Which is what it looked like — clear a demo band, hit ⟲
+    /// restart, and the app appears to have stopped decoding.
+    #[test]
+    fn restarting_replays_what_was_cleared() {
+        let mut app = app_with_a_waterfall(30.0);
+        lay_out(&mut app);
+        app.clear_all(app.t_now);
+        let out = lay_out(&mut app);
+        assert!(
+            !rows(&app, &out).iter().any(|s| s.contains("K2N")),
+            "nothing was cleared, so this proves nothing"
+        );
+
+        // ⟲ restart, then far enough in for both stations to be back.
+        app.t_now = 0.0;
+        lay_out(&mut app);
+        assert!(app.cleared_all_at.is_infinite(), "the clear outlived the clock");
+        app.t_now = 30.0;
+        let out = lay_out(&mut app);
+        for station in ["CQ CQ DE K2N", "DE VE3XYZ"] {
+            assert!(
+                rows(&app, &out).iter().any(|s| s.contains(station)),
+                "{station} did not come back: {:?}",
+                rows(&app, &out)
+            );
+        }
+    }
+
+    /// A clear does not outlive the channels it names.
+    ///
+    /// It holds a channel id, and an id means something only within the set
+    /// that issued it. Rescanning — a mode toggled, a new recording — builds
+    /// the channels again from nothing, and the station that comes back as id 3
+    /// is not the one that was cleared. The clock does not move for a rescan,
+    /// so nothing else would have noticed.
+    #[test]
+    fn a_clear_does_not_carry_over_to_a_new_scan() {
+        let mut app = app_with_traffic(30.0);
+        lay_out(&mut app);
+        app.cleared.insert(app.channels_now().channels()[0].id, app.t_now);
+        app.clear_all(app.t_now);
+
+        app.rescan();
+        assert!(app.cleared.is_empty(), "a station's clear survived the rebuild");
+        assert!(app.cleared_all_at.is_infinite(), "the band-wide clear survived the rebuild");
+    }
+
+    /// Clearing one channel clears that one. The other stations on the band are
+    /// somebody else's conversation and stay where they were.
+    #[test]
+    fn clearing_one_channel_leaves_the_rest_of_the_band_alone() {
+        let mut app = app_with_a_waterfall(30.0);
+        lay_out(&mut app);
+        let id = app.channels_now().channels()[0].id;
+        app.cleared.insert(id, app.t_now);
+
+        let out = lay_out(&mut app);
+        assert!(
+            !rows(&app, &out).iter().any(|s| s.contains("K2N")),
+            "the cleared channel is still there: {:?}",
+            rows(&app, &out)
+        );
+        assert!(
+            rows(&app, &out).iter().any(|s| s.contains("DE VE3XYZ")),
+            "the other station went with it: {:?}",
+            rows(&app, &out)
+        );
+    }
+
+    /// The timeout forgets a station's text a piece at a time: what it said too
+    /// long ago goes, what it said since stays on the row, and a station that
+    /// has said nothing at all for that long leaves the window.
+    #[test]
+    fn text_from_too_far_back_is_forgotten() {
+        // Fourteen seconds, and nothing kept beyond it — K2N's second frame
+        // landed at 16 s and its first at 1 s, so the cut falls between them.
+        let mut app = app_with_a_waterfall(30.0);
+        app.forget_min = 14.0 / 60.0;
+        app.fade_secs = 0.0;
+
+        let out = lay_out(&mut app);
+        let row = rows(&app, &out)
+            .into_iter()
+            .find(|s| s.contains("FN20"))
+            .expect("the station's newest frame should still be on its row");
+        assert_eq!(row, "FN20 5W ", "the older frame is still on the row");
+        assert!(
+            !rows(&app, &out).iter().any(|s| s.contains("VE3XYZ")),
+            "a station last heard 27 s ago is still shown: {:?}",
+            rows(&app, &out)
+        );
+        assert!(
+            drawn(&out).iter().any(|(s, _)| s == "1 channels"),
+            "the count still has both: {:?}",
+            drawn(&out)
+        );
+    }
+
+    /// Text on its way out is drawn on its way out: dimmer than the row it
+    /// belongs to, and still there to be read.
+    #[test]
+    fn text_being_forgotten_fades_rather_than_vanishing() {
+        let mut app = app_with_a_waterfall(30.0);
+        // K2N's newest frame is 14 s old, so 10 s of keeping and 8 s of fading
+        // puts it half way out.
+        app.forget_min = 10.0 / 60.0;
+        app.fade_secs = 8.0;
+        let out = lay_out(&mut app);
+
+        let alphas: Vec<u8> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("FN20") => Some(t),
+                _ => None,
+            })
+            .flat_map(|t| t.galley.job.sections.iter().map(|s| s.format.color.a()))
+            .collect();
+        assert!(!alphas.is_empty(), "the row was not drawn at all");
+        assert!(
+            alphas.iter().all(|&a| a < 255) && alphas.iter().any(|&a| a > 0),
+            "a row half way out was drawn at {alphas:?}"
+        );
+    }
+
+    /// The fade is the whole of the text's last stretch of life: solid until it
+    /// is old, gone once it has finished fading, and nothing is forgotten at
+    /// all while the timeout is off.
+    #[test]
+    fn text_is_solid_then_fades_then_goes() {
+        assert_eq!(solidity(100.0, Some(0.0), None, 8.0), 1.0, "the timeout was off");
+        assert_eq!(solidity(100.0, Some(95.0), Some(10.0), 8.0), 1.0, "faded before its time");
+        assert_eq!(solidity(100.0, Some(85.0), Some(10.0), 8.0), 0.375, "5 s into an 8 s fade");
+        assert_eq!(solidity(100.0, Some(80.0), Some(10.0), 8.0), 0.0, "outlived the fade");
+        assert_eq!(solidity(100.0, Some(0.0), Some(10.0), 0.0), 0.0, "no fade is a clean cut");
+        assert_eq!(solidity(100.0, None, Some(10.0), 8.0), 0.0, "older than anything on record");
     }
 
     /// The interface lays out with nothing loaded, with a band up, and with a
