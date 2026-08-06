@@ -627,9 +627,11 @@ struct Settings {
     /// Mode a QSO opened by hand starts in, by [`ModeId::name`].
     default_mode: String,
     /// How long a station's text stays on its row before it starts fading off,
-    /// in minutes. Zero — which is also what a settings file written before
-    /// this existed deserialises to — keeps everything, as a monitor always
-    /// did.
+    /// in minutes. Zero keeps everything.
+    ///
+    /// A settings file written before this existed has no opinion about it and
+    /// takes the default below, which is the whole reason the default is worth
+    /// choosing carefully: it is what every existing installation will get.
     forget_min: f32,
     /// How long text takes to go once it has passed `forget_min`, in seconds.
     fade_secs: f32,
@@ -651,11 +653,12 @@ impl Default for Settings {
             view_hz: None,
             theme: Theme::default().name().to_string(),
             default_mode: DEFAULT_QSO_MODE.name(),
-            // Off. A monitor that quietly dropped text nobody had read yet
-            // would be noticed at three in the morning and not before, so this
-            // is a thing the operator turns on, having decided how long a
-            // conversation stays interesting.
-            forget_min: 0.0,
+            // A quarter of an hour is longer than any over and longer than the
+            // pause in the middle of a ragchew, and shorter than the gap that
+            // means the QSO ended: a station not heard from in fifteen minutes
+            // has gone, and its row is holding space against the ones that
+            // have not.
+            forget_min: 15.0,
             fade_secs: 8.0,
         }
     }
@@ -1298,8 +1301,9 @@ struct App {
     record: bool,
 
     /// How long a station's text stays on its row, in minutes, and how long it
-    /// takes to fade off once it has been there that long. Zero minutes keeps
-    /// everything, which is what a monitor did before this existed.
+    /// takes to fade off once it has been there that long. Zero minutes turns
+    /// the timeout off and keeps everything, which is what a monitor did before
+    /// this existed.
     forget_min: f32,
     fade_secs: f32,
     /// Text the operator has dismissed: the instant before which a channel's
@@ -1462,7 +1466,7 @@ impl App {
             split_grab_dx: 0.0,
             live: None,
             record: false,
-            forget_min: 0.0,
+            forget_min: 15.0,
             fade_secs: 8.0,
             cleared: HashMap::new(),
             cleared_all_at: f64::NEG_INFINITY,
@@ -3668,6 +3672,34 @@ mod tests {
         assert_eq!((restored.vp.f_lo, restored.vp.f_hi), (1200.0, 1400.0));
         assert_eq!(restored.enabled_modes(), app.enabled_modes());
         assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
+    }
+
+    /// The timeout is on out of the box, and a settings file from before it
+    /// existed takes that rather than the zero that means "off".
+    ///
+    /// Which is the whole weight of the default: `#[serde(default)]` fills a
+    /// missing field from `Settings::default`, so this is not just what a fresh
+    /// install gets but what every installation already out there gets on its
+    /// next launch. Only a file that names the field — one saved since — keeps
+    /// its own answer.
+    #[test]
+    fn a_fresh_install_forgets_after_a_quarter_of_an_hour() {
+        let quarter_hour = Some(15.0 * 60.0);
+        assert_eq!(App::base((0.0, 4000.0)).forget_secs(), quarter_hour);
+
+        // A file from a build that had never heard of the setting: everything
+        // else present, this one absent.
+        let mut app = App::base((0.0, 4000.0));
+        let old = r#"{"text_px":17.0,"qso_w":380.0,"modes":["JS8 Normal"]}"#;
+        app.apply(serde_json::from_str(old).unwrap());
+        assert_eq!(app.forget_secs(), quarter_hour, "an old settings file turned it off");
+        assert_eq!(app.fade_secs, 8.0);
+
+        // And a file that does name it is the operator's own answer, including
+        // when the answer is "never".
+        let mut app = App::base((0.0, 4000.0));
+        app.apply(serde_json::from_str(r#"{"forget_min":0.0}"#).unwrap());
+        assert_eq!(app.forget_secs(), None, "a saved zero was overruled by the default");
     }
 
     /// A theme name this build does not know — from a settings file written by

@@ -93,10 +93,11 @@ the window can be told to forget: **☰ ▸ forget** is how long a station's tex
 stays on its row, and **fade** is how long it takes to go once it is that old.
 The oldest text goes first, a piece at a time, so a station still talking keeps
 what it has just said and loses only what it said too long ago; a station that
-has been quiet for the whole timeout leaves the window altogether. It is off
-until you set it — zero minutes keeps everything, which is what the app did
-before. None of this touches the decoding or the logs: an open conversation
-keeps every word it took, cleared or not.
+has been quiet for the whole timeout leaves the window altogether. It starts at
+fifteen minutes, which is longer than any over and shorter than the gap that
+means the QSO ended; zero turns it off and keeps everything. None of this
+touches the decoding or the logs: an open conversation keeps every word it
+took, cleared or not.
 
 ## Working a station
 
