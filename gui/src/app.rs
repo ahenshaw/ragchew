@@ -64,6 +64,18 @@ struct Slide {
     px: f32,
 }
 
+/// Most text one arrival may slide in, in characters.
+///
+/// The slide is for text as it is *said*: a PSK character, an Olivia block of
+/// five, a JS8 frame of thirteen. Larger than that and it is not an arrival at
+/// all but a catch-up — a station's receiver being opened part-way through an
+/// over hands over everything from where it started transmitting, which can be
+/// a whole window and a hundred characters. Charging the row for all of it
+/// pushed the text clean off its own panel, where it sat blank for a moment and
+/// then swept back in oldest-first, looking for all the world like a row being
+/// cleared and redrawn. Filled-in history should simply be there.
+const SLIDE_MAX_CHARS: f32 = 16.0;
+
 /// Longest a station's text can be asked to stay on its row, in minutes.
 ///
 /// Two hours is a long evening on one frequency, and past it the bound on how
@@ -1346,6 +1358,8 @@ struct App {
     /// [`App::slide_rows`].
     slide: HashMap<u64, Slide>,
 
+
+
     /// What PipeWire could route into the capture, as of [`App::pw_at`].
     ///
     /// Held rather than asked for, because a menu redraws every frame and the
@@ -1634,6 +1648,7 @@ impl App {
     /// owes only its newest decode — a row that appeared mid-conversation would
     /// otherwise fly in from the far right — and a channel with *less* text than
     /// it had has been cleared or forgotten, which is not something to animate.
+    /// A third is capped rather than refused: see [`SLIDE_MAX_CHARS`].
     ///
     /// The map is rebuilt from the channels on show, so it holds one small
     /// entry per row for exactly as long as the row is there.
@@ -1655,10 +1670,9 @@ impl App {
                 Some(&was) => Slide { chars, ..was },
                 None => Slide { px: ch.last_chunk_chars as f32 * char_w, chars },
             };
-            // Never further right than the panel is wide: past that the row is
-            // off the edge of its own strip, and a file played fast enough
-            // could otherwise push one there and leave it.
-            s.px = (s.px * decay).min(panel_w);
+            // A chunk's worth at most, and never further right than the panel
+            // is wide.
+            s.px = (s.px * decay).min(SLIDE_MAX_CHARS * char_w).min(panel_w);
             if s.px < 0.5 {
                 s.px = 0.0;
             }
@@ -4500,6 +4514,58 @@ mod tests {
             "the ease sprang by only {sprang_under_the_ease:.2} px, so this test is no longer \
              about the fault it was written for"
         );
+    }
+
+    /// Text filled in behind a station is there, not swept in.
+    ///
+    /// A PSK receiver opened part-way through an over is caught up from where
+    /// the station started transmitting, so a hundred characters can reach a
+    /// row that already had text in one frame. Charged in full, that is more
+    /// debt than the panel is wide: the row is drawn off the right-hand edge of
+    /// its own strip, blank, and then glides back in oldest-first over a
+    /// second — which reads as the row clearing and redrawing itself.
+    #[test]
+    fn a_catch_up_does_not_sweep_the_row_off_its_panel() {
+        let mut app = App::base((0.0, 4000.0));
+        app.scroll_secs = 1.0;
+        let (char_w, panel_w) = (8.0, 400.0);
+        let psk = ModeId::Psk(ragchew::psk::PSK31);
+        let mut set = ChannelSet::new(15.0);
+        let say = |set: &mut ChannelSet, at: f64, text: &str| {
+            set.add(protocol::Decode {
+                snr_db: None,
+                mode: psk,
+                hz: 1500.0,
+                time_s: at,
+                quality: 30.0,
+                text: text.to_string(),
+                ends_over: false,
+            });
+        };
+
+        // A station already on the row, then its receiver opening and handing
+        // over a window's worth of what it had been saying all along.
+        say(&mut set, 1.0, "cq de w1aw k ");
+        app.slide_rows(&set, char_w, 1.0 / 60.0, panel_w);
+        for (i, c) in "the quick brown fox jumps over the lazy dog and keeps on typing for a \
+                       good long while yet"
+            .chars()
+            .enumerate()
+        {
+            say(&mut set, 2.0 + i as f64 * 0.2, &c.to_string());
+        }
+        app.slide_rows(&set, char_w, 1.0 / 60.0, panel_w);
+
+        let id = set.channels()[0].id;
+        let px = app.slide[&id].px;
+        assert!(
+            px <= SLIDE_MAX_CHARS * char_w,
+            "a catch-up of {} characters shifted the row {px:.0} px, {:.0} of them past the \
+             largest thing anyone says at once",
+            set.channels()[0].next_index(),
+            px - SLIDE_MAX_CHARS * char_w
+        );
+        assert!(px < panel_w * 0.5, "the row was pushed {px:.0} px across a {panel_w:.0} px panel");
     }
 
     fn app_with_traffic(t: f64) -> App {
