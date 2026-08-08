@@ -86,7 +86,9 @@ zoom, shift+scroll to size the text. The frequency axis — scale and band
 position — is overlaid on the waterfall's right edge; drag the bar there to move
 around the whole band whatever the zoom. Drag the gutter between the text and
 the waterfall to give either side more room. Right-click a row to clear that one
-station.
+station. Point at the waterfall or the band bar and the status bar reads out the
+frequency under the cursor — an offset from the dial, like every frequency here
+— which is how you find what to tune to before there is any text to click.
 
 A band left running fills up with conversations that finished an hour ago, so
 the window can be told to forget: **☰ ▸ forget** is how long a station's text

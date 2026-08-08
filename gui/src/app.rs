@@ -1405,6 +1405,14 @@ struct App {
     /// when one loses its text. See [`App::watch_rows`].
     seen_rows: HashMap<u64, RowSeen>,
 
+    /// The frequency under the pointer, while it is somewhere that has one.
+    ///
+    /// Measured as the panorama is drawn and reported by the status bar, which
+    /// is a panel and so is laid out before it — the reading is therefore one
+    /// frame old. A frame is nothing against a hand moving a mouse, and the
+    /// alternative is working the geometry out twice.
+    cursor_hz: Option<f64>,
+
     /// The file view's channels, and how much of the revealed list has been fed
     /// into them. See [`App::channels_now`].
     file_set: ChannelSet,
@@ -1475,7 +1483,7 @@ impl App {
                 let font = egui::TextStyle::Body.resolve(ui.style());
                 let width = ui
                     .painter()
-                    .layout_no_wrap("⏳ 8888 channels".to_owned(), font, Color32::PLACEHOLDER)
+                    .layout_no_wrap("⏳ 8888 channels".to_owned(), font.clone(), Color32::PLACEHOLDER)
                     .size()
                     .x;
                 let text = if !live && self.samples.is_empty() {
@@ -1493,6 +1501,24 @@ impl App {
                     egui::vec2(width, ui.spacing().interact_size.y),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| ui.label(text),
+                );
+                ui.separator();
+                // Where the pointer is on the band, sized for the widest
+                // reading it can hold so that a hand moving up the waterfall
+                // does not drag the message along with it. It is an offset from
+                // the receiver's dial, like every frequency this app shows.
+                let width = ui
+                    .painter()
+                    .layout_no_wrap("8888.8 Hz".to_owned(), font, Color32::PLACEHOLDER)
+                    .size()
+                    .x;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| match self.cursor_hz {
+                        Some(hz) => ui.weak(format!("{hz:.1} Hz")),
+                        None => ui.label(""),
+                    },
                 );
                 ui.separator();
                 match &self.status {
@@ -1564,6 +1590,7 @@ impl App {
             cleared: HashMap::new(),
             slide: HashMap::new(),
             seen_rows: HashMap::new(),
+            cursor_hz: None,
             file_set: ChannelSet::new(15.0),
             fed_frames: 0,
             frames_dirty: false,
@@ -3549,6 +3576,24 @@ impl App {
             let on_bar = |p: Pos2| p.x - rect.min.x >= bar_x0;
             let pointer = ui.input(|i| i.pointer.interact_pos());
 
+            // What the pointer is pointing at, in Hz, for the status bar.
+            //
+            // Only over the waterfall and the band bar, because they are where
+            // a vertical position *is* a frequency. Left of them the rows have
+            // been nudged apart to fit, which is the whole reason the leader
+            // lines exist, and a readout that answered there would be answering
+            // a question about layout as though it were about the band. The bar
+            // has its own mapping — the full band over the full height, however
+            // far the view is zoomed in — so it reports what it shows.
+            self.cursor_hz = pointer.filter(|p| rect.contains(*p)).and_then(|p| {
+                let x = p.x - rect.min.x;
+                match x {
+                    _ if x >= bar_x0 => Some(y_to_band_hz(p.y)),
+                    _ if x >= g.waterfall_x0() => Some(y_to_hz(p.y)),
+                    _ => None,
+                }
+            });
+
             if resp.drag_started() {
                 self.bar_drag = pointer.is_some_and(on_bar);
                 if let (true, Some(p)) = (self.bar_drag, pointer) {
@@ -4198,14 +4243,25 @@ mod tests {
     /// it catches is a panic, a bad rect, or a widget id clash in a panel that
     /// otherwise only gets exercised by someone sitting in front of it.
     fn lay_out(app: &mut App) -> egui::FullOutput {
+        lay_out_pointed_at(app, None).1
+    }
+
+    /// Lay the window out with the pointer somewhere, and hand back where the
+    /// window ended up as well as what it drew.
+    ///
+    /// The size is the one `lay_out` uses, so a caller placing a pointer can
+    /// work out what it is pointing at.
+    fn lay_out_pointed_at(app: &mut App, at: Option<Pos2>) -> (Rect, egui::FullOutput) {
+        let window = Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let ctx = egui::Context::default();
         let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0))),
+            screen_rect: Some(window),
+            events: at.map(egui::Event::PointerMoved).into_iter().collect(),
             ..Default::default()
         };
         // `run_ui` hands the callback a `Ui` covering the whole window, which
         // is exactly what eframe gives `App::ui`.
-        ctx.run_ui(input, |ui| app.draw(ui))
+        (window, ctx.run_ui(input, |ui| app.draw(ui)))
     }
 
     /// The play/pause button must not change size or shift its icon when it is
@@ -4913,6 +4969,86 @@ mod tests {
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("come back as channel 8"), "{}", said[0]);
         assert!(said[0].contains("was channel 7"), "{}", said[0]);
+    }
+
+    /// What the status bar drew, found by the one thing always on it: the
+    /// channel count. Anything on that line is on the bar — which the bottom of
+    /// the window is not, since the frequency scale's last label ("0 Hz") sits
+    /// just above it and would otherwise be read as a cursor readout.
+    fn in_the_status_bar(out: &egui::FullOutput) -> Vec<String> {
+        let all = drawn(out);
+        let Some((_, bar_y)) = all.iter().find(|(s, _)| s.ends_with(" channels")) else {
+            panic!("no channel count, so no status bar to read");
+        };
+        let bar_y = *bar_y;
+        all.iter().filter(|(_, y)| (y - bar_y).abs() < 1.0).map(|(s, _)| s.clone()).collect()
+    }
+
+    /// The status bar says what frequency the pointer is on, and says nothing
+    /// where a vertical position is not one.
+    ///
+    /// Over the waterfall it is the view's own mapping, so it agrees with the
+    /// scale printed up the side. Left of the strip it is a row position — the
+    /// rows have been nudged apart to fit and the leader lines exist to bridge
+    /// exactly that gap — so there is no frequency to report and none is
+    /// reported.
+    #[test]
+    fn the_status_bar_reads_the_frequency_under_the_pointer() {
+        let mut app = app_with_a_waterfall(30.0);
+        app.vp = Viewport { f_lo: 0.0, f_hi: 4000.0 };
+        let (window, _) = lay_out_pointed_at(&mut app, None);
+
+        // Over the waterfall, at three heights. The status bar is a panel, so
+        // it is laid out before the panorama it reads: the reading appears on
+        // the frame after the move, which is why each is asked for twice.
+        let x = window.max.x - app.waterfall_w / 2.0;
+        let read = |app: &mut App, y: f32| -> f64 {
+            lay_out_pointed_at(app, Some(Pos2::new(x, y)));
+            let (_, out) = lay_out_pointed_at(app, Some(Pos2::new(x, y)));
+            // Picked out by where it is, not by what it says: the readout is
+            // bare now, and the frequency scale up the waterfall's edge is full
+            // of numbers that would otherwise match.
+            let said = in_the_status_bar(&out)
+                .into_iter()
+                .find(|s| s.ends_with(" Hz"))
+                .expect("the status bar said nothing about the pointer");
+            let hz: f64 = said
+                .trim_end_matches(" Hz")
+                .parse()
+                .unwrap_or_else(|e| panic!("could not read {said:?}: {e}"));
+            // What the bar prints is what the app measured, to the tenth of a
+            // hertz it prints to.
+            let want = app.cursor_hz.expect("the app did not measure the pointer");
+            assert!((hz - want).abs() < 0.05, "the bar said {hz:.1}, the app measured {want:.1}");
+            hz
+        };
+
+        // The panorama is shorter than the window — a toolbar above it and this
+        // very bar below — so the arithmetic worth pinning is not which
+        // frequency lands on which pixel but that the axis runs the right way
+        // and stays inside the view: high at the top, low at the bottom.
+        let high = read(&mut app, window.min.y + 60.0);
+        let mid = read(&mut app, window.center().y);
+        let low = read(&mut app, window.max.y - 60.0);
+        assert!(high > mid && mid > low, "read {high:.0}, {mid:.0}, {low:.0} down the waterfall");
+        for hz in [high, mid, low] {
+            assert!(
+                (app.vp.f_lo..=app.vp.f_hi).contains(&hz),
+                "{hz:.0} Hz is outside the {:.0}–{:.0} Hz on show",
+                app.vp.f_lo,
+                app.vp.f_hi
+            );
+        }
+
+        // Over the text panel there is no frequency to give.
+        let on_a_row = Pos2::new(window.min.x + 10.0, window.center().y);
+        lay_out_pointed_at(&mut app, Some(on_a_row));
+        let (_, out) = lay_out_pointed_at(&mut app, Some(on_a_row));
+        assert_eq!(app.cursor_hz, None, "read a frequency off a row position");
+        assert!(
+            !in_the_status_bar(&out).iter().any(|s| s.ends_with(" Hz")),
+            "the bar answered where there was nothing to answer"
+        );
     }
 
     /// A row that is nudged aside keeps its text.
