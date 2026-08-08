@@ -77,7 +77,7 @@ the window between clean copy and nothing at all is about a decibel wide.
 The toolbar is one line: **☰** holds the display settings, the audio input and
 output, *Reset view* and *Quit*; **Source** opens a recording or switches what
 is being listened to; the mode
-menus on the right control what is scanned for, and each protocol's channels are
+menus on the right control what is scanned for, and each protocol's threads are
 coloured by mode. **clear**, under a red ✕, takes every station's text off the
 rows.
 
@@ -108,7 +108,7 @@ tab per conversation, labelled with the other operator's call as soon as the
 text says what it is. A tab carries the usual information — call, name, QTH,
 grid, signal reports — over a log of the exchange, each line stamped with how
 far into the QSO it landed and marked `RX` or `TX`. The log fills itself: a QSO
-follows the channel it was opened on, so whatever that station decodes next
+follows the thread it was opened on, so whatever that station decodes next
 appears whether or not its tab is the one on top. **＋** opens a blank tab for a
 station not heard yet.
 

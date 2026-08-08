@@ -1472,7 +1472,7 @@ impl App {
     /// appears when a message does would resize the panorama above it, and a
     /// waterfall that jumps every time the app mentions something is worse than
     /// no message at all.
-    fn status_bar(&mut self, ui: &mut egui::Ui, live: bool, n_channels: usize) {
+    fn status_bar(&mut self, ui: &mut egui::Ui, live: bool, threads: usize) {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.set_min_height(ui.spacing().interact_size.y);
@@ -1483,7 +1483,7 @@ impl App {
                 let font = egui::TextStyle::Body.resolve(ui.style());
                 let width = ui
                     .painter()
-                    .layout_no_wrap("⏳ 8888 channels".to_owned(), font.clone(), Color32::PLACEHOLDER)
+                    .layout_no_wrap("⏳ 8888 threads".to_owned(), font.clone(), Color32::PLACEHOLDER)
                     .size()
                     .x;
                 let text = if !live && self.samples.is_empty() {
@@ -1493,9 +1493,9 @@ impl App {
                 } else if !live && self.pending_scans > 0 {
                     // Counting while the scan is still running: the count is
                     // real, it is just not final yet.
-                    format!("⏳ {n_channels} channels")
+                    format!("⏳ {threads} thread{}", if threads == 1 { "" } else { "s" })
                 } else {
-                    format!("{n_channels} channels")
+                    format!("{threads} thread{}", if threads == 1 { "" } else { "s" })
                 };
                 ui.allocate_ui_with_layout(
                     egui::vec2(width, ui.spacing().interact_size.y),
@@ -3896,11 +3896,11 @@ impl App {
                 // own order and nothing else on screen names a channel.
                 let _ = resp.context_menu(|ui| {
                     ui.weak(format!("{} at {:.0} Hz", ch.mode.name(), ch.hz));
-                    if ui.button("Clear this channel").clicked() {
+                    if ui.button("Clear this thread").clicked() {
                         clear_one = Some(ch.id);
                         ui.close();
                     }
-                    if ui.button("Clear every channel").clicked() {
+                    if ui.button("Clear every thread").clicked() {
                         clear_every = true;
                         ui.close();
                     }
@@ -4448,13 +4448,13 @@ mod tests {
                 .1
         };
         let msg = find("listening to Firefox");
-        let count = find("channels");
+        let count = find("threads");
 
         // 800 tall, per `lay_out`. Both on the same row at the bottom.
         assert!(msg > 700.0, "the message sits at y={msg} of 800, not at the foot");
         assert!(
             (msg - count).abs() < 1.0,
-            "the message ({msg}) and the channel count ({count}) are not on one line"
+            "the message ({msg}) and the thread count ({count}) are not on one line"
         );
     }
 
@@ -4502,7 +4502,7 @@ mod tests {
                 match t.galley.text() {
                     "Send" => send_y = Some(t.pos.y),
                     "reply…" => reply_y = Some(t.pos.y),
-                    s if s.ends_with("channels") => status_y = Some(t.pos.y),
+                    s if s.ends_with("threads") => status_y = Some(t.pos.y),
                     s if s.contains("K2N") => lowest_log_y = lowest_log_y.max(t.pos.y),
                     _ => {}
                 }
@@ -4977,8 +4977,8 @@ mod tests {
     /// just above it and would otherwise be read as a cursor readout.
     fn in_the_status_bar(out: &egui::FullOutput) -> Vec<String> {
         let all = drawn(out);
-        let Some((_, bar_y)) = all.iter().find(|(s, _)| s.ends_with(" channels")) else {
-            panic!("no channel count, so no status bar to read");
+        let Some((_, bar_y)) = all.iter().find(|(s, _)| s.ends_with(" threads")) else {
+            panic!("no thread count, so no status bar to read");
         };
         let bar_y = *bar_y;
         all.iter().filter(|(_, y)| (y - bar_y).abs() < 1.0).map(|(s, _)| s.clone()).collect()
@@ -5338,7 +5338,7 @@ mod tests {
             );
         }
         assert!(
-            drawn(&out).iter().any(|(s, _)| s == "0 channels"),
+            drawn(&out).iter().any(|(s, _)| s == "0 threads"),
             "the count still has them: {:?}",
             drawn(&out)
         );
@@ -5447,7 +5447,7 @@ mod tests {
             rows(&app, &out)
         );
         assert!(
-            drawn(&out).iter().any(|(s, _)| s == "1 channels"),
+            drawn(&out).iter().any(|(s, _)| s == "1 thread"),
             "the count still has both: {:?}",
             drawn(&out)
         );
