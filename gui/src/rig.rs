@@ -18,10 +18,20 @@
 //! The operator runs `rigctld -m <model> -r <device>` and points this at it,
 //! exactly as they already do for WSJT-X or fldigi.
 //!
-//! Nothing here un-keys anything by itself. A [`Transmitter`] does as it is
-//! told and reports what happened; the timing, and the promise that a key-down
-//! is always followed by a key-up, belong above it where they can be made once
-//! for every transport.
+//! A [`Transmitter`] does as it is told and reports what happened, and that is
+//! all it does. Above it sits [`Ptt`], which is where the promise lives: a
+//! key-down is always followed by a key-up. It owns the transmitter on a thread
+//! of its own, so that
+//!
+//! * the interface never waits on a socket to key,
+//! * a transmission scheduled for a cycle boundary half a minute away is keyed
+//!   by something whose only job is to be awake then,
+//! * and there is exactly one place that knows whether the rig is down, which
+//!   is the only way to promise anything about it.
+//!
+//! Three things un-key without being asked, because each of them has left a rig
+//! transmitting into an empty band on somebody's bench: a key-down that outlasts
+//! its limit, an owner that goes away, and a panic anywhere in the thread.
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
@@ -307,6 +317,384 @@ pub fn open(keying: &Keying) -> Box<dyn Transmitter> {
     }
 }
 
+// ---- the supervisor ----
+
+/// How long a rig may be keyed, and how often it is asked what it is doing.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Longest a single key-down may last before it is broken by force.
+    ///
+    /// Two minutes is longer than any transmission this app makes — the longest
+    /// is a JS8 Slow frame at twenty-five seconds — and short enough that a rig
+    /// left down by a fault is not left down for the afternoon. It is a
+    /// backstop, not a schedule: nothing normal should ever reach it.
+    pub max_key_s: f64,
+    /// How often the rig is asked what its PTT is doing.
+    ///
+    /// Every poll is a CAT transaction, and on an older rig that is a CI-V
+    /// exchange at 4800 baud, so this is not free. Half a second is quick
+    /// enough that an indicator does not feel stale and slow enough to leave
+    /// the link alone.
+    pub poll_s: f64,
+    /// How long to leave a link that will not come up before trying it again,
+    /// so a daemon that is not running costs one connection attempt every few
+    /// seconds rather than one per poll.
+    pub retry_s: f64,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { max_key_s: 120.0, poll_s: 0.5, retry_s: 5.0 }
+    }
+}
+
+/// What the transmitter is doing, as far as anything can tell.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct State {
+    /// Whether the last thing asked of the rig worked.
+    pub linked: bool,
+    /// What it was last told to do. *Intent*, not fact.
+    pub asked: bool,
+    /// What the rig says it is doing, when it can be asked. Fact — and not
+    /// always the same as `asked`: a front panel PTT, a foot switch and a stuck
+    /// line all show up here and nowhere else.
+    pub rig_says: Option<bool>,
+    /// How long it has been keyed, in seconds; zero when it is not.
+    pub keyed_for: f64,
+    /// The last thing that went wrong, still worth showing after it has.
+    pub fault: Option<String>,
+}
+
+/// One stretch of time the rig should be transmitting for.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    on: f64,
+    off: f64,
+}
+
+enum Cmd {
+    /// Key or unkey now, and cancel anything scheduled — a hand on a button
+    /// outranks a queue.
+    Now(bool),
+    /// Be transmitting between these two instants (UNIX seconds), which is what
+    /// a scheduled frame wants: the caller knows when its audio starts, and the
+    /// lead and tail are already in these numbers.
+    Span(Span),
+    /// Drop everything scheduled and un-key if a span is what is holding it
+    /// down.
+    Cancel,
+}
+
+/// A transmitter under supervision.
+///
+/// Dropping it un-keys the rig and waits for that to have happened. That is why
+/// it is worth holding one rather than a bare [`Transmitter`]: a rig that is
+/// transmitting when the program ends is a rig that is transmitting until
+/// somebody notices.
+pub struct Ptt {
+    /// Dropped before the worker is waited for: closing the channel is how the
+    /// worker is told to finish, so it has to go first and cannot go in a
+    /// field that outlives the wait.
+    cmds: Option<std::sync::mpsc::Sender<Cmd>>,
+    state: std::sync::Arc<std::sync::Mutex<State>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Ptt {
+    /// Supervise the transmitter a setting asks for.
+    pub fn start(keying: &Keying, limits: Limits) -> Ptt {
+        Ptt::with_transmitter(open(keying), limits)
+    }
+
+    /// Supervise a transmitter that has already been built.
+    pub fn with_transmitter(tx: Box<dyn Transmitter>, limits: Limits) -> Ptt {
+        let (cmds, rx) = std::sync::mpsc::channel();
+        let state = std::sync::Arc::new(std::sync::Mutex::new(State::default()));
+        let mine = state.clone();
+        let worker = std::thread::Builder::new()
+            .name("ragchew-ptt".into())
+            .spawn(move || Session::new(tx, limits, mine).run(rx))
+            .ok();
+        Ptt { cmds: Some(cmds), state, worker }
+    }
+
+    /// Key or unkey now. Cancels anything scheduled: a hand on a button means
+    /// what it says.
+    pub fn key(&self, on: bool) {
+        self.tell(Cmd::Now(on));
+    }
+
+    /// Transmit from `on` until `off`, both UNIX seconds, both already carrying
+    /// whatever lead and tail the caller wants. Spans queue up, so a message
+    /// that goes out as several frames is several spans.
+    pub fn schedule(&self, on: f64, off: f64) {
+        self.tell(Cmd::Span(Span { on, off }));
+    }
+
+    /// Forget everything scheduled, and stop transmitting if that is what is
+    /// keeping the rig down.
+    pub fn cancel(&self) {
+        self.tell(Cmd::Cancel);
+    }
+
+    /// Say something to the worker, or say nothing at all: a worker that has
+    /// gone has already un-keyed, which is the only thing a caller here needs
+    /// to be true.
+    fn tell(&self, cmd: Cmd) {
+        if let Some(cmds) = &self.cmds {
+            let _ = cmds.send(cmd);
+        }
+    }
+
+    /// What the rig is doing, for the interface to draw.
+    pub fn state(&self) -> State {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl Drop for Ptt {
+    fn drop(&mut self) {
+        // Dropping the sender is the signal: the worker's `recv` fails, it
+        // un-keys, and it returns. Then wait for it, because the point of the
+        // exercise is that the rig is not still transmitting afterwards, and a
+        // process that exits without waiting has not established that.
+        self.cmds = None;
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+/// The supervised transmitter, on its own thread.
+///
+/// Everything about the rig's state lives here, in one place, on one thread.
+struct Session {
+    tx: Box<dyn Transmitter>,
+    limits: Limits,
+    state: std::sync::Arc<std::sync::Mutex<State>>,
+    /// Whether the rig is believed to be keyed, and since when. Monotonic, so
+    /// that a clock stepped by NTP under a keyed rig cannot extend the
+    /// key-down — the one place in this app where the wall clock is the wrong
+    /// clock for a duration.
+    down_since: Option<std::time::Instant>,
+    /// Spans still to come, and the one holding the key down if any.
+    queued: Vec<Span>,
+    holding: Option<Span>,
+    next_poll: std::time::Instant,
+    /// Cleared once the rig has said it cannot report its PTT, so a station
+    /// that keys without read-back is asked once rather than twice a second
+    /// for the rest of the session.
+    can_ask: bool,
+    /// When the link may next be tried, after one has failed.
+    retry_at: Option<std::time::Instant>,
+}
+
+impl Drop for Session {
+    /// The promise, in the only form that survives a panic: whatever else
+    /// happened in this thread, the rig is not left transmitting. Unwinding a
+    /// panic runs this; so does returning normally.
+    fn drop(&mut self) {
+        if self.down_since.is_some() {
+            let _ = self.tx.key(false);
+        }
+    }
+}
+
+impl Session {
+    fn new(
+        tx: Box<dyn Transmitter>,
+        limits: Limits,
+        state: std::sync::Arc<std::sync::Mutex<State>>,
+    ) -> Session {
+        Session {
+            tx,
+            limits,
+            state,
+            down_since: None,
+            queued: Vec::new(),
+            holding: None,
+            next_poll: std::time::Instant::now(),
+            can_ask: true,
+            retry_at: None,
+        }
+    }
+
+    fn run(mut self, cmds: std::sync::mpsc::Receiver<Cmd>) {
+        loop {
+            let wait = self.until_something_happens();
+            match cmds.recv_timeout(wait) {
+                Ok(Cmd::Now(on)) => {
+                    self.queued.clear();
+                    self.holding = None;
+                    self.set(on);
+                }
+                Ok(Cmd::Span(s)) => self.queued.push(s),
+                Ok(Cmd::Cancel) => {
+                    self.queued.clear();
+                    if self.holding.take().is_some() {
+                        self.set(false);
+                    }
+                }
+                // The owner has gone. `Session::drop` un-keys on the way out.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            self.work_the_schedule();
+            self.mind_the_limit();
+            self.ask_the_rig();
+            self.publish();
+        }
+    }
+
+    /// How long the thread may sleep before it must do something whether or not
+    /// anyone has asked it to.
+    fn until_something_happens(&self) -> Duration {
+        let now = unix_now();
+        let mut soonest = self.limits.poll_s.max(0.05);
+        for s in self.queued.iter().chain(self.holding.iter()) {
+            for at in [s.on, s.off] {
+                if at > now {
+                    soonest = soonest.min(at - now);
+                }
+            }
+        }
+        if let Some(since) = self.down_since {
+            let left = self.limits.max_key_s - since.elapsed().as_secs_f64();
+            soonest = soonest.min(left.max(0.0));
+        }
+        Duration::from_secs_f64(soonest.clamp(0.005, 1.0))
+    }
+
+    /// Key and unkey for the spans that have come due.
+    fn work_the_schedule(&mut self) {
+        let now = unix_now();
+        // Anything whose whole span went by while nothing was running is gone,
+        // not fired late: keying for a transmission whose audio has already
+        // played is a carrier with nothing on it.
+        self.queued.retain(|s| s.off > now);
+        if let Some(h) = self.holding {
+            if now >= h.off {
+                self.holding = None;
+                self.set(false);
+            }
+        }
+        if self.holding.is_none() {
+            if let Some(i) = self.queued.iter().position(|s| now >= s.on && now < s.off) {
+                let s = self.queued.remove(i);
+                self.holding = Some(s);
+                self.set(true);
+            }
+        }
+    }
+
+    /// Break a key-down that has gone on too long.
+    fn mind_the_limit(&mut self) {
+        let Some(since) = self.down_since else { return };
+        if since.elapsed().as_secs_f64() < self.limits.max_key_s {
+            return;
+        }
+        self.queued.clear();
+        self.holding = None;
+        self.set(false);
+        self.fault(format!(
+            "the rig was keyed for longer than the {:.0}s limit and has been unkeyed",
+            self.limits.max_key_s
+        ));
+    }
+
+    /// Ask the rig what it is doing, now and then.
+    fn ask_the_rig(&mut self) {
+        let now = std::time::Instant::now();
+        if !self.can_ask || now < self.next_poll {
+            return;
+        }
+        if self.retry_at.is_some_and(|t| now < t) {
+            return;
+        }
+        self.next_poll = now + Duration::from_secs_f64(self.limits.poll_s.max(0.05));
+        match self.tx.keyed() {
+            Ok(says) => {
+                self.retry_at = None;
+                self.can_ask = says.is_some();
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.linked = true;
+                st.rig_says = says;
+            }
+            Err(e) => {
+                self.retry_at = Some(now + Duration::from_secs_f64(self.limits.retry_s));
+                self.no_link(e);
+            }
+        }
+    }
+
+    /// Key or unkey, and remember which.
+    ///
+    /// The record is kept even when the command failed, because a command that
+    /// failed may still have keyed the rig — the answer can be lost on the way
+    /// back — and a supervisor that forgets a key-down it might have caused is
+    /// no supervisor at all.
+    fn set(&mut self, on: bool) {
+        let was = self.down_since;
+        self.down_since = match on {
+            true => was.or_else(|| Some(std::time::Instant::now())),
+            false => None,
+        };
+        let outcome = self.tx.key(on);
+        match outcome {
+            Ok(()) => {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.asked = on;
+                st.linked = true;
+                st.fault = None;
+            }
+            // A refusal is the rig answering, and the answer was no: it is not
+            // transmitting, so nothing here should say it is or watch a clock
+            // over it.
+            Err(e @ Fault::Rejected { .. }) => {
+                self.down_since = None;
+                self.state.lock().unwrap_or_else(|e| e.into_inner()).asked = false;
+                self.no_link(e);
+            }
+            // Anything else and we do not know. It was asked to transmit and
+            // the answer was lost, which has to be read as "possibly keyed" —
+            // the whole point of the limit is the case where nobody knows.
+            Err(e) => {
+                if on {
+                    self.down_since = Some(std::time::Instant::now());
+                }
+                self.state.lock().unwrap_or_else(|e| e.into_inner()).asked = on;
+                self.no_link(e);
+            }
+        }
+    }
+
+    fn no_link(&mut self, e: Fault) {
+        let linked = !matches!(e, Fault::Link(_) | Fault::Timeout);
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.linked = linked;
+        st.fault = Some(e.to_string());
+    }
+
+    fn fault(&mut self, what: String) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.fault = Some(what);
+    }
+
+    fn publish(&mut self) {
+        let down = self.down_since.map_or(0.0, |t| t.elapsed().as_secs_f64());
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.keyed_for = down;
+    }
+}
+
+/// Seconds since the epoch, which is the clock a scheduled transmission is
+/// scheduled against — see `tx::next_start_after`.
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +919,278 @@ mod tests {
     fn nothing_is_keyed_until_something_is_configured() {
         assert_eq!(Keying::default(), Keying::None);
         assert!(open(&Keying::default()).keyed().unwrap().is_none());
+    }
+
+    // ---- the supervisor ----
+
+    /// A transmitter that writes down everything asked of it, and can be told
+    /// to come apart at a chosen moment.
+    #[derive(Clone)]
+    struct Bench {
+        did: Arc<Mutex<Vec<(bool, std::time::Instant)>>>,
+        keyed: Arc<AtomicBool>,
+        /// Panic on the n-th `keyed()` — a fault in the middle of the loop,
+        /// which is the one case no amount of error handling covers.
+        explode_on_poll: Arc<AtomicUsize>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Bench {
+        fn new() -> Bench {
+            Bench {
+                did: Arc::new(Mutex::new(Vec::new())),
+                keyed: Arc::new(AtomicBool::new(false)),
+                explode_on_poll: Arc::new(AtomicUsize::new(usize::MAX)),
+                polls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+        fn keyings(&self) -> Vec<bool> {
+            self.did.lock().unwrap().iter().map(|(on, _)| *on).collect()
+        }
+        fn at(&self, i: usize) -> std::time::Instant {
+            self.did.lock().unwrap()[i].1
+        }
+        fn transmitting(&self) -> bool {
+            self.keyed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Transmitter for Bench {
+        fn key(&mut self, on: bool) -> Result<(), Fault> {
+            self.keyed.store(on, Ordering::SeqCst);
+            self.did.lock().unwrap().push((on, std::time::Instant::now()));
+            Ok(())
+        }
+        fn keyed(&mut self) -> Result<Option<bool>, Fault> {
+            let n = self.polls.fetch_add(1, Ordering::SeqCst) + 1;
+            assert!(n < self.explode_on_poll.load(Ordering::SeqCst), "bench came apart on purpose");
+            Ok(Some(self.keyed.load(Ordering::SeqCst)))
+        }
+        fn describe(&self) -> String {
+            "a bench".to_string()
+        }
+    }
+
+    fn quick() -> Limits {
+        Limits { max_key_s: 0.3, poll_s: 0.02, retry_s: 0.05 }
+    }
+
+    fn wait_until(what: impl Fn() -> bool) -> bool {
+        let began = std::time::Instant::now();
+        while began.elapsed() < Duration::from_secs(2) {
+            if what() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// The promise: an owner that goes away takes the transmission with it.
+    ///
+    /// This is the one that matters at the end of a session. A program that
+    /// exits with the rig keyed leaves it keyed until somebody walks over to
+    /// it, and dropping is what a program does on its way out.
+    #[test]
+    fn dropping_the_supervisor_takes_the_rig_off_the_air() {
+        let bench = Bench::new();
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        ptt.key(true);
+        assert!(wait_until(|| bench.transmitting()), "never keyed");
+
+        drop(ptt);
+        // Not "eventually": `drop` waits for it, so it is off by the time the
+        // line above has returned.
+        assert!(!bench.transmitting(), "the rig was left transmitting");
+        assert_eq!(bench.keyings(), [true, false]);
+    }
+
+    /// A key-down that outlasts its limit is broken by force, and said so.
+    #[test]
+    fn a_rig_left_keyed_is_unkeyed_by_the_watchdog() {
+        let bench = Bench::new();
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        ptt.key(true);
+        assert!(wait_until(|| bench.transmitting()), "never keyed");
+        assert!(wait_until(|| !bench.transmitting()), "the watchdog never fired");
+
+        // At the limit, not whenever it got round to it.
+        let held = bench.at(1).duration_since(bench.at(0)).as_secs_f64();
+        assert!((0.28..0.45).contains(&held), "held the key for {held:.3}s, limit was 0.30");
+        let fault = ptt.state().fault.unwrap_or_default();
+        assert!(fault.contains("longer than the") && fault.contains("unkeyed"), "{fault:?}");
+        assert_eq!(bench.keyings(), [true, false], "keyed or unkeyed more than once");
+    }
+
+    /// A panic in the thread still takes the rig off the air.
+    ///
+    /// Error handling cannot cover this one — the point of a panic is that the
+    /// code stopped running — so it is covered by unwinding through a `Drop`
+    /// instead. Worth a test precisely because it is invisible in the source.
+    #[test]
+    fn a_thread_that_comes_apart_still_unkeys() {
+        let bench = Bench::new();
+        bench.explode_on_poll.store(2, Ordering::SeqCst);
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        ptt.key(true);
+
+        assert!(wait_until(|| bench.keyings().len() >= 2), "never unkeyed after the panic");
+        assert!(!bench.transmitting(), "left transmitting by a panicking thread");
+        assert_eq!(bench.keyings(), [true, false]);
+    }
+
+    /// A scheduled span keys at its start and unkeys at its end, without
+    /// anything having to be awake to ask.
+    ///
+    /// This is what a transmission on a cycle boundary needs: the caller says
+    /// when, in UNIX seconds, lead and tail already in the numbers, and then
+    /// forgets about it.
+    #[test]
+    fn a_scheduled_span_keys_itself_and_lets_go() {
+        let bench = Bench::new();
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        let began = std::time::Instant::now();
+        let at = unix_now();
+        ptt.schedule(at + 0.15, at + 0.30);
+
+        assert!(wait_until(|| bench.keyings().len() >= 2), "the span never ran");
+        assert_eq!(bench.keyings(), [true, false]);
+        let down = bench.at(0).duration_since(began).as_secs_f64();
+        let up = bench.at(1).duration_since(began).as_secs_f64();
+        assert!((0.13..0.25).contains(&down), "keyed at {down:.3}s, wanted 0.15");
+        assert!((0.28..0.40).contains(&up), "unkeyed at {up:.3}s, wanted 0.30");
+    }
+
+    /// Frames are spans, one each, and each gets its own key-down: a message
+    /// that goes out over several cycles must not hold the key through the
+    /// silence between them.
+    #[test]
+    fn one_key_down_per_span_not_one_per_message() {
+        let bench = Bench::new();
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        let at = unix_now();
+        ptt.schedule(at + 0.05, at + 0.15);
+        ptt.schedule(at + 0.25, at + 0.35);
+
+        assert!(wait_until(|| bench.keyings().len() >= 4), "both spans did not run");
+        assert_eq!(bench.keyings(), [true, false, true, false]);
+    }
+
+    /// A hand on the button outranks the queue.
+    #[test]
+    fn keying_by_hand_drops_what_was_scheduled() {
+        let bench = Bench::new();
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        let at = unix_now();
+        ptt.schedule(at + 0.10, at + 0.20);
+        ptt.key(false);
+
+        thread::sleep(Duration::from_millis(300));
+        assert!(!bench.keyings().contains(&true), "the cancelled span transmitted anyway");
+    }
+
+    /// A span whose time has passed is dropped, not fired late. Keying for a
+    /// transmission whose audio has already played is a bare carrier.
+    #[test]
+    fn a_span_that_was_missed_is_not_transmitted_late() {
+        let bench = Bench::new();
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        let at = unix_now();
+        ptt.schedule(at - 5.0, at - 4.0);
+
+        thread::sleep(Duration::from_millis(200));
+        assert!(bench.keyings().is_empty(), "transmitted a span from five seconds ago");
+    }
+
+    /// What the rig says is reported, and it is not the same question as what
+    /// the rig was told: a front panel PTT shows up here and nowhere else.
+    #[test]
+    fn the_rig_is_asked_rather_than_assumed() {
+        let bench = Bench::new();
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        assert!(wait_until(|| ptt.state().linked), "never reached the rig");
+        assert_eq!(ptt.state().rig_says, Some(false));
+        assert!(!ptt.state().asked);
+
+        // Somebody presses the PTT on the front of the radio.
+        bench.keyed.store(true, Ordering::SeqCst);
+        assert!(wait_until(|| ptt.state().rig_says == Some(true)), "never noticed the rig keying");
+        assert!(!ptt.state().asked, "reported it as ours");
+    }
+
+    /// A real rig, through the real client, from the button down to the socket.
+    #[test]
+    fn the_whole_path_keys_a_rigctld() {
+        let rig = FakeRig::start();
+        let ptt = Ptt::with_transmitter(Box::new(rig.client()), quick());
+
+        ptt.key(true);
+        assert!(wait_until(|| rig.transmitting()), "the rig never keyed");
+        assert!(wait_until(|| ptt.state().rig_says == Some(true)), "never read it back");
+
+        drop(ptt);
+        assert!(!rig.transmitting(), "left a real link transmitting");
+    }
+
+    /// A rig that will not say what its PTT is doing is an ordinary rig, not a
+    /// broken one.
+    ///
+    /// Keying over RTS with no CAT read-back is a whole class of station, and
+    /// hamlib answers for those exactly as it does for its own dummy before it
+    /// has been given a PTT method: `RPRT -11`. Reading that as a fault put a
+    /// red error on a link that works.
+    #[test]
+    fn a_rig_that_cannot_report_its_ptt_is_not_a_fault() {
+        let rig = FakeRig::start();
+        rig.deny_reads.store(true, Ordering::SeqCst);
+        // In its own scope: the fake serves one link at a time, as the real
+        // daemon does not, so this one has to be let go before the supervisor
+        // below can be served.
+        {
+            let mut tx = rig.client();
+            assert_eq!(tx.keyed(), Ok(None), "read a refusal as a state");
+        }
+
+        // And it is asked once, not twice a second for the rest of the day.
+        let ptt = Ptt::with_transmitter(Box::new(rig.client()), quick());
+        assert!(wait_until(|| ptt.state().linked), "never reached the rig");
+        thread::sleep(Duration::from_millis(200));
+        let asked = rig.heard().iter().filter(|c| *c == "t").count();
+        assert!(asked <= 3, "asked a rig that cannot answer {asked} times");
+        assert_eq!(ptt.state().fault, None, "a rig that cannot answer is not a fault");
+        assert_eq!(ptt.state().rig_says, None);
+    }
+
+    /// A rig that refuses to key is not reported as transmitting.
+    ///
+    /// A refusal is the rig answering, and the answer was no. Showing TX over
+    /// it would be the interface inventing a transmission — and starting a
+    /// watchdog over one that is not happening.
+    #[test]
+    fn a_rig_that_refuses_to_key_is_not_shown_as_transmitting() {
+        let rig = FakeRig::start();
+        let ptt = Ptt::with_transmitter(Box::new(rig.client()), quick());
+        *rig.reject.lock().unwrap() = Some(-1);
+        ptt.key(true);
+
+        assert!(wait_until(|| ptt.state().fault.is_some()), "said nothing about the refusal");
+        assert!(!ptt.state().asked, "claimed to be transmitting after a refusal");
+        assert_eq!(ptt.state().keyed_for, 0.0, "started a clock over a refused key-down");
+        let said = ptt.state().fault.unwrap();
+        assert!(said.contains("ptt_type"), "did not say what to check: {said}");
+    }
+
+    /// A daemon that is not there does not become a busy loop against it, and
+    /// the fault is on show rather than in a log nobody is reading.
+    #[test]
+    fn a_rig_that_cannot_be_reached_is_reported_and_left_alone() {
+        let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let client = RigCtld::new("127.0.0.1", port).with_timeout(Duration::from_millis(50));
+        let ptt = Ptt::with_transmitter(Box::new(client), quick());
+
+        assert!(wait_until(|| ptt.state().fault.is_some()), "said nothing about a missing rig");
+        assert!(!ptt.state().linked);
+        let said = ptt.state().fault.unwrap();
+        assert!(said.contains("no link to the rig"), "{said}");
     }
 }
