@@ -46,7 +46,9 @@ fn unix_now() -> f64 {
 
 /// Modulate `text` at `hz` in `mode`, at the crate's 12 kHz internal rate.
 ///
-/// A JS8 frame holds only a few characters, one frame goes per cycle, and a
+/// A JS8 frame holds only a few characters — more of them if the words are ones
+/// JS8Call's list knows, since each frame goes out compressed where that
+/// carries more than the character coding does — one frame goes per cycle, and a
 /// message longer than one frame is therefore a *sequence* of frames a cycle
 /// apart — silence and all, so that what comes back is one buffer that can be
 /// handed to the card and forgotten about. Olivia and PSK31 have no such
@@ -69,7 +71,7 @@ pub fn modulate(text: &str, hz: f64, mode: ModeId) -> Vec<f32> {
             let mut parts: Vec<&str> = Vec::new();
             let mut rest = text;
             while !rest.trim().is_empty() {
-                let (_, used) = message::freetext(rest, IType::None);
+                let (_, used) = message::best_frame(rest, IType::None);
                 // `freetext` reporting nothing consumed would spin forever on
                 // text it cannot pack at all, so that ends the transmission.
                 if used == 0 {
@@ -93,7 +95,7 @@ pub fn modulate(text: &str, hz: f64, mode: ModeId) -> Vec<f32> {
                     (true, _) => IType::Last,
                     _ => IType::None,
                 };
-                let (a87, _) = message::freetext(part, itype);
+                let (a87, _) = message::best_frame(part, itype);
                 let burst = modem::encode_audio_sm(&a87, hz, &sm);
                 let start = cycle * period + offset;
                 if out.len() < start + burst.len() {
@@ -328,6 +330,50 @@ mod tests {
 
     /// A message too long for one JS8 frame goes out as several, one per cycle,
     /// and every one of them decodes.
+    /// Compression buys cycles, which is the only currency that matters here:
+    /// a JS8 frame goes once per cycle, so a message that packs into fewer
+    /// frames is a message that is finished sooner and holds the frequency for
+    /// less time.
+    #[test]
+    fn compressing_the_words_saves_whole_cycles() {
+        let text = "JS8CALL KN4CRD 599 599 73 TNX FER QSO GL SK JS8CALL KN4CRD 599";
+        let mode = ModeId::Js8(ragchew::js8::Mode::Normal);
+
+        let frames = |pack: fn(&str, IType) -> ([u8; 87], usize)| {
+            let mut n = 0;
+            let mut rest = text;
+            while !rest.trim().is_empty() {
+                let (_, used) = pack(rest, IType::None);
+                if used == 0 {
+                    break;
+                }
+                let cut = rest.char_indices().nth(used).map_or(rest.len(), |(i, _)| i);
+                rest = &rest[cut..];
+                n += 1;
+            }
+            n
+        };
+
+        let as_chars = frames(message::freetext);
+        let as_words = frames(message::best_frame);
+        assert!(
+            as_words < as_chars,
+            "{as_words} frames compressed against {as_chars} uncompressed — no cycles saved"
+        );
+
+        // And what comes off the air is still what went on it.
+        let audio = modulate(text, 1500.0, mode);
+        let got: String = ragchew::protocol::decode_all(&audio, 1000.0, 2000.0, &[mode])
+            .iter()
+            .map(|d| d.text.clone())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            got.replace("<>", "").trim() == text,
+            "went out as {text:?}, came back as {got:?}"
+        );
+    }
+
     #[test]
     fn a_long_js8_message_becomes_one_frame_per_cycle() {
         let sm = submode::NORMAL;
