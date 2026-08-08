@@ -239,7 +239,11 @@ impl Channel {
     }
 
     /// Absolute index of the next character this channel will take.
-    fn next_index(&self) -> usize {
+    ///
+    /// Also the count of everything it has ever said, which is what makes it a
+    /// usable pulse: it only ever grows, and forgetting the front of the text
+    /// does not move it.
+    pub fn next_index(&self) -> usize {
         self.text_dropped + self.text.chars().count()
     }
 

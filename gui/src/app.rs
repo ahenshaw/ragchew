@@ -42,6 +42,28 @@ use crate::waterfall::{self, Viewport};
 
 const HIGHLIGHT_SECS: f64 = 2.5;
 
+/// How far one row still has to travel before the newest character it holds
+/// sits where the newest character belongs.
+///
+/// A row is right-aligned on its newest character, so every character that
+/// arrives pushes everything before it one character to the left. Drawing the
+/// row shifted right by what it still owes is what turns that push into a
+/// glide: nothing moves at the instant new text lands, and the whole row then
+/// slides left as the debt is paid off.
+///
+/// A debt, rather than an ease from the last arrival, because text does not
+/// arrive on a schedule. PSK31 types five characters a second while the slide
+/// runs for one, so an ease restarted on every character never reached halfway
+/// before springing back to the right — five times a second, which is what a
+/// streaming row shimmering on screen actually was.
+#[derive(Clone, Copy, Default)]
+struct Slide {
+    /// Characters the channel had said when it was last drawn.
+    chars: usize,
+    /// Pixels the row is still shifted right by.
+    px: f32,
+}
+
 /// Longest a station's text can be asked to stay on its row, in minutes.
 ///
 /// Two hours is a long evening on one frequency, and past it the bound on how
@@ -1320,6 +1342,10 @@ struct App {
     cleared: HashMap<u64, f64>,
     cleared_all_at: f64,
 
+    /// How far each row still has to slide, by channel id. See [`Slide`] and
+    /// [`App::slide_rows`].
+    slide: HashMap<u64, Slide>,
+
     /// What PipeWire could route into the capture, as of [`App::pw_at`].
     ///
     /// Held rather than asked for, because a menu redraws every frame and the
@@ -1469,6 +1495,7 @@ impl App {
             forget_min: 15.0,
             fade_secs: 8.0,
             cleared: HashMap::new(),
+            slide: HashMap::new(),
             cleared_all_at: f64::NEG_INFINITY,
             pw: crate::pipewire::Routing::default(),
             pw_at: None,
@@ -1593,6 +1620,51 @@ impl App {
     fn drop_clears(&mut self) {
         self.cleared.clear();
         self.cleared_all_at = f64::NEG_INFINITY;
+    }
+
+    /// Move every row on towards where its newest character belongs.
+    ///
+    /// Each channel owes a character's width for every character it has taken
+    /// on since the last frame, and pays it off exponentially: `scroll_secs` is
+    /// read as the time to settle, which an exponential reaches at about three
+    /// time constants. Under half a pixel it is simply at rest, so a quiet band
+    /// costs nothing and nothing creeps.
+    ///
+    /// Two cases are not debts and take none. A channel seen for the first time
+    /// owes only its newest decode — a row that appeared mid-conversation would
+    /// otherwise fly in from the far right — and a channel with *less* text than
+    /// it had has been cleared or forgotten, which is not something to animate.
+    ///
+    /// The map is rebuilt from the channels on show, so it holds one small
+    /// entry per row for exactly as long as the row is there.
+    fn slide_rows(&mut self, channels: &ChannelSet, char_w: f32, dt: f32, panel_w: f32) {
+        let decay = if self.scroll_secs > 1e-3 {
+            (-dt / (self.scroll_secs / 3.0)).exp()
+        } else {
+            0.0
+        };
+        let mut next: HashMap<u64, Slide> = HashMap::with_capacity(channels.channels().len());
+        for ch in channels.channels() {
+            let chars = ch.next_index();
+            let mut s = match self.slide.get(&ch.id) {
+                Some(&was) if chars > was.chars => Slide {
+                    px: was.px + (chars - was.chars) as f32 * char_w,
+                    chars,
+                },
+                Some(&was) if chars < was.chars => Slide { px: 0.0, chars },
+                Some(&was) => Slide { chars, ..was },
+                None => Slide { px: ch.last_chunk_chars as f32 * char_w, chars },
+            };
+            // Never further right than the panel is wide: past that the row is
+            // off the edge of its own strip, and a file played fast enough
+            // could otherwise push one there and leave it.
+            s.px = (s.px * decay).min(panel_w);
+            if s.px < 0.5 {
+                s.px = 0.0;
+            }
+            next.insert(ch.id, s);
+        }
+        self.slide = next;
     }
 
     /// The modes currently being listened for.
@@ -3369,6 +3441,13 @@ impl App {
             let dark = ui.visuals().dark_mode;
             let char_w = self.text_px * 0.6;
             let max_chars = ((g.strip_x0() - 8.0) / char_w).max(1.0) as usize;
+            // Rows move on the wall clock, like every other animation here, so
+            // a file played at 8× slides no faster than a live band would —
+            // except that its text arrives 8× faster, so the debt is paid at
+            // that speed too or a busy row would never settle.
+            let dt = ui.input(|i| i.stable_dt).min(0.25)
+                * if live { 1.0 } else { self.speed.max(1e-3) };
+            self.slide_rows(&channels, char_w, dt, g.strip_x0());
             // clip text to the text panel so a chunk sliding in from behind the
             // strip (and old text sliding off the left) is masked cleanly.
             let text_painter = painter.with_clip_rect(Rect::from_min_max(
@@ -3388,16 +3467,9 @@ impl App {
                 let playback_age = t_now - (ch.last_heard_s + ch.mode.chunk_secs());
                 let age = playback_age / eff_speed as f64;
 
-                // scroll-in animation: when a new chunk just arrived, the row
-                // starts shifted right by the chunk width and eases back to rest.
-                let chunk_px = ch.last_chunk_chars as f32 * char_w;
-                let offset_x = if self.scroll_secs > 1e-3 && (0.0..self.scroll_secs as f64).contains(&age) {
-                    let p = (age / self.scroll_secs as f64) as f32;
-                    let eased = 1.0 - (1.0 - p).powi(3); // ease-out
-                    (1.0 - eased) * chunk_px
-                } else {
-                    0.0
-                };
+                // scroll-in animation: the row is drawn shifted right by what
+                // it still owes, and [`App::slide_rows`] pays that off.
+                let offset_x = self.slide.get(&ch.id).map_or(0.0, |s| s.px);
 
                 // render a bit more than fits, and let the clip rects trim it
                 let tail = max_chars + ch.last_chunk_chars + 2;
@@ -4351,6 +4423,85 @@ mod tests {
     }
 
     /// A band with two stations in it, revealed at `t`.
+    /// A row being typed into may only ever move left.
+    ///
+    /// Text is right-aligned on its newest character, so the slide is what
+    /// keeps the characters already on screen still while the row grows past
+    /// them. What it must never do is put one back where it was a frame ago —
+    /// that is text springing right, and doing it five times a second is what
+    /// a flickering row is.
+    ///
+    /// The ease this replaced sprang for a reason worth keeping in view. Its
+    /// offset was a function of the *age* of the newest text, and a decode's
+    /// age when it reaches the screen is its own pipeline delay: measured over
+    /// a real capture, a median of 0.14 s with a tail past 0.3 s. So each
+    /// character landed at a different point along the ease from the last, and
+    /// the row jumped back and forth by the difference. A debt cannot do that,
+    /// because it never reads the clock — it only ever counts characters.
+    #[test]
+    fn a_streaming_row_only_ever_moves_left() {
+        let mut app = App::base((0.0, 4000.0));
+        app.scroll_secs = 1.0;
+        let char_w = 8.0;
+        let psk = ModeId::Psk(ragchew::psk::PSK31);
+        let chunk = psk.chunk_secs();
+
+        // Sixty frames a second, a character every fifth of a second, each
+        // reaching the screen after a delay of its own: a live PSK31 station.
+        let delay = |k: usize| if k.is_multiple_of(3) { 0.32 } else { 0.12 };
+        let mut set = ChannelSet::new(15.0);
+        let mut typed = 0usize;
+        let mut worst = f32::INFINITY;
+        let mut sprang_under_the_ease = 0.0f32;
+        let mut was_under_the_ease = f32::INFINITY;
+        for frame in 1..600 {
+            let t = frame as f64 / 60.0;
+            let sent = typed as f64 / 5.0;
+            if t >= sent + delay(typed) {
+                set.add(protocol::Decode {
+                    snr_db: None,
+                    mode: psk,
+                    hz: 1500.0,
+                    time_s: sent,
+                    quality: 30.0,
+                    text: "e".to_string(),
+                    ends_over: false,
+                });
+                typed += 1;
+            }
+            app.slide_rows(&set, char_w, 1.0 / 60.0, 400.0);
+            let Some(ch) = set.channels().first() else { continue };
+
+            // Where the oldest character on the row sits, relative to the
+            // row's right edge: everything typed since has pushed it left by a
+            // width apiece, and the slide holds it back by what is still owed.
+            let held = ch.next_index() as f32 * char_w;
+            let x = app.slide[&ch.id].px - held;
+            assert!(x <= worst + 1e-3, "frame {frame}: the row sprang {:.2} px right", x - worst);
+            worst = worst.min(x);
+
+            // And the same character under the ease, which is where the
+            // springing came from. Kept as arithmetic rather than as a second
+            // implementation: it is here to say how much this changed.
+            let age = t - (ch.last_heard_s + chunk);
+            let eased = if (0.0..app.scroll_secs as f64).contains(&age) {
+                (1.0 - age as f32 / app.scroll_secs).powi(3) * ch.last_chunk_chars as f32 * char_w
+            } else {
+                0.0
+            };
+            let x_eased = eased - held;
+            sprang_under_the_ease = sprang_under_the_ease.max(x_eased - was_under_the_ease);
+            was_under_the_ease = was_under_the_ease.min(x_eased);
+        }
+
+        assert!(typed > 40, "only {typed} characters were typed; the test proved little");
+        assert!(
+            sprang_under_the_ease > 1.0,
+            "the ease sprang by only {sprang_under_the_ease:.2} px, so this test is no longer \
+             about the fault it was written for"
+        );
+    }
+
     fn app_with_traffic(t: f64) -> App {
         let mut app = App::base((0.0, 4000.0));
         let d = |hz: f64, at: f64, text: &str| protocol::Decode {
