@@ -280,20 +280,40 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
     for m in modes {
         if let ModeId::Js8(mode) = m {
             let sm = js8::submode::of(*mode);
-            out.extend(js8::modem::decode_all_sm(samples, hz_lo, hz_hi, 30, &sm).into_iter().map(
-                |r| {
-                    let mode = ModeId::Js8(r.mode);
-                    Decode {
-                        mode,
-                        hz: r.hz,
-                        time_s: r.offset as f64 / crate::SAMPLE_RATE as f64,
-                        quality: (r.sync / js8::modem::NOISE_SYNC) as f32,
-                        snr_db: measure_snr(samples, r.offset, r.hz, mode),
-                        text: js8::message::unpack(&r.a87).text(),
-                        ends_over: js8::message::ends_over(&r.a87),
-                    }
-                },
-            ));
+            out.extend(
+                js8::modem::decode_all_sm(samples, hz_lo, hz_hi, 30, &sm)
+                    .into_iter()
+                    .filter_map(|r| {
+                        let mode = ModeId::Js8(r.mode);
+                        let message = js8::message::unpack(&r.a87);
+                        // Only what a station said. JS8 has frame types this
+                        // decoder recognises but cannot parse — compound
+                        // callsigns, and the directed frames built on them —
+                        // and what it knows about those is that somebody is on
+                        // that frequency, not what they say. A note to that
+                        // effect used to go out as the decode's text, where
+                        // everything downstream presents it as a transmission:
+                        // it took a row of the text panel, opened as a
+                        // conversation if clicked, and went into the CSV beside
+                        // real traffic. The waterfall shows the carrier either
+                        // way, which is the whole of what was actually
+                        // established.
+                        //
+                        // Reading them properly is the better answer, and is a
+                        // port of JS8Call's compound unpacker away — the
+                        // reference here does not implement it either, so it
+                        // wants vectors before it wants code.
+                        message.is_from_the_air().then(|| Decode {
+                            mode,
+                            hz: r.hz,
+                            time_s: r.offset as f64 / crate::SAMPLE_RATE as f64,
+                            quality: (r.sync / js8::modem::NOISE_SYNC) as f32,
+                            snr_db: measure_snr(samples, r.offset, r.hz, mode),
+                            text: message.text(),
+                            ends_over: js8::message::ends_over(&r.a87),
+                        })
+                    }),
+            );
         }
     }
 
@@ -456,6 +476,52 @@ fn arbitrate_psk(found: Vec<Decode>, others: &[Decode]) -> Vec<Decode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame the decoder cannot parse does not reach the interface as text.
+    ///
+    /// JS8 has compound-callsign frames and directed frames built on them, and
+    /// this decoder recognises both without being able to read either. What it
+    /// learns from one is that somebody is transmitting there — which the
+    /// waterfall already shows — and not a word of what they said. Passing a
+    /// note about it along as the decode's *text* put it on a row of the text
+    /// panel, into the CSV beside real traffic, and into a QSO if the row was
+    /// clicked, all of which present it as a transmission.
+    #[test]
+    fn a_frame_that_cannot_be_read_is_not_reported_as_traffic() {
+        use crate::js8::message::{self, IType};
+        use crate::js8::{modem, submode};
+
+        // A compound frame: the type bits are 0,0,1 and the rest is anything.
+        let mut a87 = [0u8; 87];
+        a87[2] = 1;
+        for (i, b) in a87.iter_mut().enumerate().take(72).skip(3) {
+            *b = u8::from(i % 3 == 0);
+        }
+        let a87 = message::finalize(&a87[..72].try_into().unwrap(), IType::None);
+        assert!(
+            matches!(message::unpack(&a87), message::Message::Compound),
+            "the test no longer builds a compound frame"
+        );
+
+        // Where a frame actually sits: half a second into its cycle, in a
+        // buffer as long as the cycle, which is what the decoder searches.
+        let sm = submode::of(crate::js8::Mode::Normal);
+        let burst = modem::encode_audio_sm(&a87, 1500.0, &sm);
+        let rate = crate::SAMPLE_RATE as usize;
+        let mut audio = vec![0.0f32; sm.period_s as usize * rate];
+        let at = rate / 2;
+        audio[at..at + burst.len()].copy_from_slice(&burst);
+        let modem_saw = modem::decode_all_sm(&audio, 1000.0, 2000.0, 30, &sm);
+        assert!(!modem_saw.is_empty(), "the modem could not read its own frame");
+
+        let reported = decode_all(&audio, 1000.0, 2000.0, &[ModeId::Js8(crate::js8::Mode::Normal)]);
+        assert!(
+            reported.is_empty(),
+            "an unreadable frame was reported as traffic: {:?}",
+            reported.iter().map(|d| d.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
 
     /// The duplicate window must be narrower than the closest two real PSK
     /// characters can be, or a live scan throws away a character every time its
