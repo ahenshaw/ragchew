@@ -64,6 +64,49 @@ struct Slide {
     px: f32,
 }
 
+/// One row as it was drawn this frame, for [`App::watch_rows`] to compare
+/// against the last time it saw it.
+struct RowNow {
+    id: u64,
+    hz: f64,
+    mode: ModeId,
+    /// Characters put on the row.
+    drawn: usize,
+    /// Characters the channel holds, which is more than fits.
+    held: usize,
+    y: f32,
+    /// What the row is shifted right by, if it is still sliding.
+    offset: f32,
+    /// The instant text is being forgotten before, and the oldest text the
+    /// channel still has a time for. Together they say whether the timeout is
+    /// what took the row's text.
+    cut: f64,
+    oldest: Option<f64>,
+}
+
+/// What a row looked like when it was last on screen.
+#[derive(Clone, Copy)]
+struct RowSeen {
+    hz: f64,
+    mode: ModeId,
+    drawn: usize,
+    held: usize,
+    /// Wall clock when it was last drawn.
+    at: f64,
+    /// Wall clock when it was last written about, so a row that flaps every
+    /// frame writes one line a second rather than sixty.
+    said_at: f64,
+}
+
+/// How long a row is remembered after it stops being drawn, so that one which
+/// goes and comes back is known to be the same row rather than a new one.
+const ROW_MEMORY_S: f64 = 120.0;
+
+/// Longest a row may be missing before its return is worth remarking on. A
+/// frame or two is the interface catching up; half a second is a gap the eye
+/// sees.
+const ROW_BLINK_S: f64 = 0.5;
+
 /// Most text one arrival may slide in, in characters.
 ///
 /// The slide is for text as it is *said*: a PSK character, an Olivia block of
@@ -1358,6 +1401,9 @@ struct App {
     /// [`App::slide_rows`].
     slide: HashMap<u64, Slide>,
 
+    /// What each row looked like last time it was drawn, so the log can say
+    /// when one loses its text. See [`App::watch_rows`].
+    seen_rows: HashMap<u64, RowSeen>,
 
 
     /// What PipeWire could route into the capture, as of [`App::pw_at`].
@@ -1510,6 +1556,7 @@ impl App {
             fade_secs: 8.0,
             cleared: HashMap::new(),
             slide: HashMap::new(),
+            seen_rows: HashMap::new(),
             cleared_all_at: f64::NEG_INFINITY,
             pw: crate::pipewire::Routing::default(),
             pw_at: None,
@@ -1679,6 +1726,108 @@ impl App {
             next.insert(ch.id, s);
         }
         self.slide = next;
+    }
+
+    /// Say, in the log, when a row loses the text it had.
+    ///
+    /// A row that clears and fills in again is a fault nobody can catch by eye:
+    /// it happens in the frames either side of a station arriving, and by the
+    /// time it is noticed the evidence has been drawn over. So the window keeps
+    /// a note of each row as it last drew it, and writes a line when one of
+    /// three things happens — text going off a row that stayed, a row returning
+    /// after a gap the eye would see, or a station coming back under a new
+    /// channel id, which means its text starts again from nothing.
+    ///
+    /// Each line carries what is needed to tell those apart without asking for
+    /// another run: what the row drew against what the channel holds (the
+    /// difference between text that is gone and text that is merely not drawn),
+    /// where the row sat, what it was still sliding by, and the instant text is
+    /// being forgotten before against the oldest the channel still has.
+    ///
+    /// Returns the lines rather than writing them, so that what it decides is
+    /// worth saying can be tested.
+    fn watch_rows(&mut self, rows: &[RowNow], wall: f64) -> Vec<String> {
+        let mut said = Vec::new();
+        for r in rows {
+            let (hz, mode) = (r.hz, r.mode.name());
+            let was = self.seen_rows.get(&r.id).copied();
+            // A station whose channel was rebuilt comes back as a different id
+            // at the same place on the band, holding none of its text.
+            // Of the same protocol, and gone from the screen: the demo band
+            // alone has a JS8 station inside an Olivia signal on the same
+            // carrier, and two rows sharing a frequency is not one row coming
+            // back as the other.
+            let reborn = was
+                .is_none()
+                .then(|| {
+                    self.seen_rows
+                        .iter()
+                        .find(|(id, s)| {
+                            s.mode.protocol() == r.mode.protocol()
+                                && (s.hz - hz).abs() <= r.mode.assoc_tol_hz()
+                                && !rows.iter().any(|o| o.id == **id)
+                        })
+                        .map(|(id, s)| (*id, wall - s.at, s.drawn))
+                })
+                .flatten();
+            let oldest = r.oldest.map_or("none".to_string(), |t| format!("{t:.1}s"));
+            // The cut is minus infinity when nothing is being forgotten, which
+            // in a log line has to read as words rather than as a float.
+            let cut = if r.cut.is_finite() {
+                format!("{:.1}s", r.cut)
+            } else {
+                "never".to_string()
+            };
+
+            let line = match (was, reborn) {
+                // Text off a row that stayed put.
+                (Some(w), _) if w.drawn >= 8 && r.drawn * 2 <= w.drawn => Some(format!(
+                    "{mode} {hz:.0} Hz lost text on screen: {} characters drawn where there were \
+                     {}, out of {} the channel holds (it held {}); row y={:.0}, sliding {:.0} px, \
+                     forgetting before {cut} with its oldest text at {oldest}",
+                    r.drawn, w.drawn, r.held, w.held, r.y, r.offset
+                )),
+                // A row that went away and came back.
+                (Some(w), _) if wall - w.at > ROW_BLINK_S => Some(format!(
+                    "{mode} {hz:.0} Hz is back after {:.1}s off screen, drawing {} characters \
+                     where it drew {}; the channel holds {} (it held {}), forgetting before \
+                     {cut} with its oldest text at {oldest}",
+                    wall - w.at,
+                    r.drawn,
+                    w.drawn,
+                    r.held,
+                    w.held
+                )),
+                // The same station, a different channel.
+                (None, Some((old_id, ago, drew))) => Some(format!(
+                    "{mode} {hz:.0} Hz has come back as channel {} where it was channel {old_id} \
+                     {ago:.1}s ago, so its text starts again: {} characters drawn where that drew \
+                     {drew}",
+                    r.id, r.drawn
+                )),
+                _ => None,
+            };
+
+            // One line a second per row. A row that flaps every frame has said
+            // what it has to say in the first of them, and sixty a second would
+            // bury the rest of the log.
+            let quiet_since = was.map_or(f64::NEG_INFINITY, |w| w.said_at);
+            let said_at = match line {
+                Some(l) if wall - quiet_since >= 1.0 => {
+                    said.push(l);
+                    wall
+                }
+                _ => quiet_since,
+            };
+            self.seen_rows.insert(
+                r.id,
+                RowSeen { hz, mode: r.mode, drawn: r.drawn, held: r.held, at: wall, said_at },
+            );
+        }
+        // A row is remembered for a while after it goes, so that one which
+        // comes back is known to be the same row; past that it goes with it.
+        self.seen_rows.retain(|_, s| wall - s.at <= ROW_MEMORY_S);
+        said
     }
 
     /// The modes currently being listened for.
@@ -3469,6 +3618,10 @@ impl App {
                 to_screen(g.strip_x0(), g.height),
             ));
 
+            // What each row ended up with, gathered as they are drawn and read
+            // by [`App::watch_rows`] once they all have been.
+            let mut row_now: Vec<RowNow> = Vec::with_capacity(visible.len());
+
             for (i, ch) in visible.iter().enumerate() {
                 let color = mode_text_color(dark, ch.mode);
                 let y_row = rows[i];
@@ -3489,6 +3642,18 @@ impl App {
                 let tail = max_chars + ch.last_chunk_chars + 2;
                 let shown: String = ch.text.chars().rev().take(tail).collect::<Vec<_>>()
                     .into_iter().rev().collect();
+
+                row_now.push(RowNow {
+                    id: ch.id,
+                    hz: ch.hz,
+                    mode: ch.mode,
+                    drawn: shown.chars().count(),
+                    held: ch.text.chars().count(),
+                    y: y_row,
+                    offset: offset_x,
+                    cut: self.cut_for(ch, t_now),
+                    oldest: ch.arrivals.first().map(|&(_, t)| t),
+                });
 
                 // The row in stretches of one age, oldest first, so the front
                 // of it can fade off while the station carries on talking at
@@ -3618,6 +3783,12 @@ impl App {
                 if resp.clicked() {
                     open_qso = Some((*ch).clone());
                 }
+            }
+
+            // A row losing its text is a fault the eye cannot catch, so the log
+            // catches it instead.
+            for line in self.watch_rows(&row_now, unix_now()) {
+                diag_warn!("rows", "{line}");
             }
 
             // The whole frequency axis lives on the right-hand edge of the
@@ -4514,6 +4685,79 @@ mod tests {
             "the ease sprang by only {sprang_under_the_ease:.2} px, so this test is no longer \
              about the fault it was written for"
         );
+    }
+
+    fn a_row(id: u64, hz: f64, drawn: usize, held: usize) -> RowNow {
+        RowNow {
+            id,
+            hz,
+            mode: ModeId::Psk(ragchew::psk::PSK31),
+            drawn,
+            held,
+            y: 100.0,
+            offset: 0.0,
+            cut: f64::NEG_INFINITY,
+            oldest: Some(1.0),
+        }
+    }
+
+    /// The log says when a row loses its text, and says nothing at all while
+    /// one is merely being typed into.
+    ///
+    /// A row that clears and fills in again cannot be caught by eye — it is
+    /// over within a frame or two of a station arriving — so the fault has to
+    /// be written down as it happens or it cannot be chased at all.
+    #[test]
+    fn the_log_notices_a_row_losing_its_text() {
+        let mut app = App::base((0.0, 4000.0));
+        let mut wall = 1000.0;
+
+        for n in 1..40 {
+            wall += 1.0 / 60.0;
+            let said = app.watch_rows(&[a_row(1, 1500.0, n, n)], wall);
+            assert!(said.is_empty(), "complained about a row being typed into: {said:?}");
+        }
+
+        wall += 1.0 / 60.0;
+        let said = app.watch_rows(&[a_row(1, 1500.0, 2, 2)], wall);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("lost text on screen"), "{}", said[0]);
+        assert!(said[0].contains("2 characters drawn where there were 39"), "{}", said[0]);
+
+        // Once a second, not once a frame: a row that flaps has said what it
+        // has to say, and sixty lines a second would bury the rest of the log.
+        wall += 1.0 / 60.0;
+        let said = app.watch_rows(&[a_row(1, 1500.0, 1, 1)], wall);
+        assert!(said.is_empty(), "wrote a line every frame: {said:?}");
+    }
+
+    /// A row that goes and comes back says so, with how long it was away.
+    #[test]
+    fn the_log_notices_a_row_coming_back() {
+        let mut app = App::base((0.0, 4000.0));
+        let mut wall = 1000.0;
+        app.watch_rows(&[a_row(1, 1500.0, 40, 40)], wall);
+
+        wall += 3.0; // three seconds of frames in which it was not drawn
+        let said = app.watch_rows(&[a_row(1, 1500.0, 40, 40)], wall);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("back after 3.0s off screen"), "{}", said[0]);
+    }
+
+    /// A station back under a different channel id is named as that, because it
+    /// means something quite different: the channel was rebuilt, so the text
+    /// genuinely starts again rather than the row having been redrawn.
+    #[test]
+    fn the_log_names_a_station_that_came_back_as_a_new_channel() {
+        let mut app = App::base((0.0, 4000.0));
+        let mut wall = 1000.0;
+        app.watch_rows(&[a_row(7, 1500.0, 40, 40)], wall);
+
+        wall += 2.0;
+        let said = app.watch_rows(&[a_row(8, 1501.0, 1, 1)], wall);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("come back as channel 8"), "{}", said[0]);
+        assert!(said[0].contains("was channel 7"), "{}", said[0]);
     }
 
     /// Text filled in behind a station is there, not swept in.
