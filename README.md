@@ -117,8 +117,30 @@ transmission in one tab and come back to it. **Send** modulates what is in it at
 the QSO's carrier and mode and plays it out of the chosen audio output. Olivia
 goes immediately, being continuous; JS8 waits for the next boundary of its
 submode's UTC cycle, and a message too long for one frame goes out as several,
-one per cycle. There is no PTT and no CAT control here — the audio goes to the
-device you point it at, which is what a rig on a USB codec (or VOX) wants.
+one per cycle. The audio goes to the device you point it at, which is all a rig
+on a USB codec (or VOX) needs.
+
+For a rig that wants keying, **☰ ▸ Rig** points the app at hamlib's `rigctld`
+— run `rigctld -m <model> -r <device>` and give it the address. Hamlib will not
+key a rig it has no PTT method for, and says so with "not available on this
+rig"; `--set-conf=ptt_type=RIG` (or `RTS`, or `DTR`) is what it is asking for.
+That applies to hamlib's own dummy too, which is the cheapest way to watch the
+whole path work without a radio on the bench:
+`rigctld -m 1 -r /dev/null --set-conf=ptt_type=RIG`. The **TX**
+button on the toolbar then keys and unkeys by hand, for tuning up or checking
+into a dummy load, and goes red for as long as the rig is transmitting, with a
+count of how long it has been down. It goes amber instead when the rig is
+transmitting for a reason the app did not ask for — a hand on the front panel, a
+foot switch, a line stuck down — because that is worth telling apart from your
+own key-down. The rig is asked what it is doing twice a second rather than
+assumed — and a rig that cannot answer, which is any station keying over RTS
+with no CAT read-back, is asked once and then left alone rather than treated as
+broken. Nothing keys unless you configure it: the default is no keying at all.
+
+A key-down is always followed by a key-up. One is forced if a transmission
+outlasts its limit, if the app exits, or if the thread doing the keying comes
+apart — the last of those by unwinding through the code that unkeys, since that
+is the only mechanism a panic cannot skip.
 
 Headless, without the windowing/audio stack — renders straight to PNG:
 

@@ -32,6 +32,7 @@ use crate::channels::{Channel, ChannelSet};
 use crate::diag::{self, Health};
 use crate::layout;
 use crate::record::Recorder;
+use crate::rig;
 use crate::traffic;
 use crate::{diag_info, diag_warn};
 use crate::qso::{Dir, QsoSet};
@@ -106,6 +107,15 @@ const ROW_MEMORY_S: f64 = 120.0;
 /// frame or two is the interface catching up; half a second is a gap the eye
 /// sees.
 const ROW_BLINK_S: f64 = 0.5;
+
+/// Transmitting because this app asked for it, and transmitting for a reason it
+/// does not know. Two colours because they call for two different reactions.
+const TX_RED: Color32 = Color32::from_rgb(255, 60, 60);
+const TX_ELSEWHERE: Color32 = Color32::from_rgb(255, 170, 40);
+
+/// Where `rigctld` listens unless told otherwise — hamlib's own default.
+const DEFAULT_RIG_HOST: &str = "127.0.0.1";
+const DEFAULT_RIG_PORT: u16 = 4532;
 
 /// Most text one arrival may slide in, in characters.
 ///
@@ -712,6 +722,16 @@ struct Settings {
     forget_min: f32,
     /// How long text takes to go once it has passed `forget_min`, in seconds.
     fade_secs: f32,
+    /// How the transmitter is keyed: `"none"` or `"rigctld"`, with the daemon's
+    /// address beside it.
+    ///
+    /// Three plain fields rather than the enum itself, for the reason the modes
+    /// are names: a settings file outlives the shape of the type that wrote it,
+    /// and a word this build does not recognise should cost the rig setting
+    /// rather than the whole file.
+    rig_keying: String,
+    rig_host: String,
+    rig_port: u16,
 }
 
 impl Default for Settings {
@@ -737,6 +757,9 @@ impl Default for Settings {
             // have not.
             forget_min: 15.0,
             fade_secs: 8.0,
+            rig_keying: "none".to_string(),
+            rig_host: DEFAULT_RIG_HOST.to_string(),
+            rig_port: DEFAULT_RIG_PORT,
         }
     }
 }
@@ -1405,6 +1428,18 @@ struct App {
     /// when one loses its text. See [`App::watch_rows`].
     seen_rows: HashMap<u64, RowSeen>,
 
+    /// How the transmitter is keyed, and the supervisor doing it.
+    ///
+    /// The supervisor is rebuilt whenever the setting changes; dropping the old
+    /// one takes the rig off the air before the new one exists, so the two can
+    /// never both think they hold the key.
+    rig: rig::Keying,
+    ptt: Option<rig::Ptt>,
+    /// The daemon's address, kept even while nothing is keying, so that turning
+    /// rig control back on does not ask for it again.
+    rig_host: String,
+    rig_port: u16,
+
     /// The frequency under the pointer, while it is somewhere that has one.
     ///
     /// Measured as the panorama is drawn and reported by the status bar, which
@@ -1590,6 +1625,10 @@ impl App {
             cleared: HashMap::new(),
             slide: HashMap::new(),
             seen_rows: HashMap::new(),
+            rig: rig::Keying::None,
+            ptt: None,
+            rig_host: DEFAULT_RIG_HOST.to_string(),
+            rig_port: DEFAULT_RIG_PORT,
             cursor_hz: None,
             file_set: ChannelSet::new(15.0),
             fed_frames: 0,
@@ -1618,6 +1657,12 @@ impl App {
             default_mode: self.default_mode.name(),
             forget_min: self.forget_min,
             fade_secs: self.fade_secs,
+            rig_keying: match self.rig {
+                rig::Keying::None => "none".to_string(),
+                rig::Keying::RigCtld { .. } => "rigctld".to_string(),
+            },
+            rig_host: self.rig_host.clone(),
+            rig_port: self.rig_port,
         }
     }
 
@@ -1634,6 +1679,22 @@ impl App {
         self.qso_w = s.qso_w.clamp(MIN_QSO_W, 900.0);
         self.forget_min = s.forget_min.clamp(0.0, MAX_FORGET_MIN);
         self.fade_secs = s.fade_secs.clamp(0.0, MAX_FADE_S);
+        if !s.rig_host.trim().is_empty() {
+            self.rig_host = s.rig_host;
+        }
+        if s.rig_port != 0 {
+            self.rig_port = s.rig_port;
+        }
+        // Anything but the word this build knows leaves the rig alone, which is
+        // the setting that touches hardware and so the one to be conservative
+        // about: an unreadable file must not leave something keying a radio.
+        self.set_keying(match s.rig_keying.as_str() {
+            "rigctld" => rig::Keying::RigCtld {
+                host: self.rig_host.clone(),
+                port: self.rig_port,
+            },
+            _ => rig::Keying::None,
+        });
         // An unknown name leaves the theme at Auto rather than at whatever the
         // last build happened to write.
         self.theme = Theme::parse(&s.theme).unwrap_or_default();
@@ -1865,6 +1926,98 @@ impl App {
         // comes back is known to be the same row; past that it goes with it.
         self.seen_rows.retain(|_, s| wall - s.at <= ROW_MEMORY_S);
         said
+    }
+
+    /// The manual key, and the only place the window says it is transmitting.
+    ///
+    /// It shows three states, and the third is the reason the rig is asked
+    /// rather than assumed: keyed because we keyed it, keyed by somebody else —
+    /// a hand on the front panel, a foot switch, a line stuck down — and not
+    /// keyed. The middle one is worth its own colour, because a rig
+    /// transmitting for a reason this app does not know about is the one a
+    /// reader most needs to be told about and the one it cannot fix by
+    /// releasing a button.
+    fn tx_button(&mut self, ui: &mut egui::Ui) {
+        let st = self.ptt_state();
+        let ours = st.asked;
+        let theirs = st.rig_says == Some(true) && !ours;
+        let live = ours || theirs;
+
+        let label = match (live, st.keyed_for) {
+            (false, _) => "TX".to_string(),
+            // The count is why a key-down left by accident does not last: it is
+            // the thing the eye lands on, long before the watchdog cares.
+            (true, t) if t >= 1.0 => format!("TX {t:.0}s"),
+            (true, _) => "TX".to_string(),
+        };
+        let colour = match (live, theirs) {
+            (false, _) => None,
+            (true, false) => Some(legible(ui.visuals().dark_mode, TX_RED)),
+            (true, true) => Some(legible(ui.visuals().dark_mode, TX_ELSEWHERE)),
+        };
+        let mut button = egui::Button::new(label);
+        if let Some(c) = colour {
+            button = button.fill(c.gamma_multiply(0.35)).stroke(Stroke::new(1.0, c));
+        }
+
+        let hover = match (&self.rig, st.fault.as_deref(), theirs) {
+            (rig::Keying::None, _, _) => {
+                "nothing is keying the rig — ☰ ▸ Rig, or leave it to VOX".to_string()
+            }
+            (_, Some(fault), _) => fault.to_string(),
+            (_, None, true) => {
+                "the rig is transmitting, and not because this asked it to — click to stop it"
+                    .to_string()
+            }
+            (_, None, false) if ours => "transmitting — click to stop".to_string(),
+            _ => "key the transmitter".to_string(),
+        };
+        let resp = ui.add_enabled(self.ptt.is_some(), button).on_hover_text(hover);
+        if resp.clicked() {
+            if let Some(ptt) = &self.ptt {
+                // Against whether the rig is transmitting *at all*, not against
+                // whether this app is what keyed it.
+                //
+                // The distinction cost a real transmission. Toggling against
+                // our own intent meant that a rig already on the air for any
+                // other reason — and the classic one is hamlib raising DTR as
+                // it opens the serial port, which keys an interface wired that
+                // way before this app has said a word — read as "not keyed by
+                // us", so every press sent `T 1` and keyed it harder. A control
+                // whose whole purpose is to stop a transmitter must stop it
+                // whoever started it. There is no state in which pressing this
+                // puts a rig on the air that is already on it.
+                ptt.key(!live);
+            }
+        }
+        // A transmitting rig has to keep being drawn, or the count stops and
+        // the colour is whatever the last event left behind.
+        if live {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// Change how the transmitter is keyed, and stand up a supervisor for it.
+    ///
+    /// The old supervisor is dropped first and its drop waits, so the rig is
+    /// off the air before anything else can key it. Switching to
+    /// [`rig::Keying::None`] leaves no thread at all: the app is back to what it
+    /// did before it could key anything.
+    fn set_keying(&mut self, keying: rig::Keying) {
+        if self.rig == keying && (self.ptt.is_some() == (keying != rig::Keying::None)) {
+            return;
+        }
+        self.ptt = None;
+        self.rig = keying;
+        if self.rig != rig::Keying::None {
+            self.ptt = Some(rig::Ptt::start(&self.rig, rig::Limits::default()));
+            diag_info!("rig", "keying through {}", rig::open(&self.rig).describe());
+        }
+    }
+
+    /// What the transmitter is doing, as far as anything can tell.
+    fn ptt_state(&self) -> rig::State {
+        self.ptt.as_ref().map(|p| p.state()).unwrap_or_default()
     }
 
     /// The modes currently being listened for.
@@ -3197,6 +3350,95 @@ impl App {
                             ui.weak(format!("transmitting on {name}"));
                         }
                     });
+                    // Rig control sits with the audio devices, because it is
+                    // the same kind of setting: which piece of hardware this
+                    // instance is wired to.
+                    ui.separator();
+                    ui.menu_button("Rig", |ui| {
+                        ui.set_min_width(300.0);
+                        let mut pick = usize::from(self.rig != rig::Keying::None);
+                        if ui
+                            .add(elegance::SegmentedControl::from_segments(
+                                &mut pick,
+                                [
+                                    elegance::Segment::text("none").hover_text(
+                                        "nothing is keyed: the rig decides, on VOX or a \
+                                         straight-through interface",
+                                    ),
+                                    elegance::Segment::text("rigctld").hover_text(
+                                        "hamlib's daemon: run `rigctld -m <model> -r <device>` \
+                                         and give its address below. Hamlib will not key a rig \
+                                         it has no PTT method for — add \
+                                         `--set-conf=ptt_type=RIG` (or RTS, or DTR) if it \
+                                         refuses.",
+                                    ),
+                                ],
+                            ))
+                            .changed()
+                        {
+                            let keying = match pick {
+                                0 => rig::Keying::None,
+                                _ => rig::Keying::RigCtld {
+                                    host: self.rig_host.clone(),
+                                    port: self.rig_port,
+                                },
+                            };
+                            self.set_keying(keying);
+                        }
+                        if self.rig != rig::Keying::None {
+                            let mut host = self.rig_host.clone();
+                            let mut port = self.rig_port;
+                            ui.horizontal(|ui| {
+                                ui.label("host");
+                                ui.add(egui::TextEdit::singleline(&mut host).desired_width(140.0));
+                                ui.label("port");
+                                ui.add(egui::DragValue::new(&mut port).range(1..=65535));
+                            });
+                            // Rebuilt on any edit, which takes the rig off the
+                            // air on the way past: an address being typed into
+                            // is an address that is wrong most of the time, and
+                            // a half-typed one must not be left keying anything.
+                            if host != self.rig_host || port != self.rig_port {
+                                self.rig_host = host;
+                                self.rig_port = port;
+                                self.set_keying(rig::Keying::RigCtld {
+                                    host: self.rig_host.clone(),
+                                    port: self.rig_port,
+                                });
+                            }
+
+                            let st = self.ptt_state();
+                            match (&st.fault, st.linked) {
+                                (Some(f), _) => {
+                                    let c = legible(ui.visuals().dark_mode, TX_RED);
+                                    ui.colored_label(c, format!("⚠ {f}"));
+                                }
+                                (None, true) => {
+                                    ui.weak(match st.rig_says {
+                                        Some(true) => "linked — the rig is transmitting",
+                                        Some(false) => "linked — the rig is receiving",
+                                        // Ordinary: keying over RTS with no CAT
+                                        // read-back is a whole class of station.
+                                        None => "linked — it cannot say whether it is \
+                                                 transmitting, only be told",
+                                    });
+                                }
+                                (None, false) => {
+                                    ui.weak("not tried yet");
+                                }
+                            }
+                            // Keying for a fifth of a second says more than any
+                            // amount of connection testing: it is the whole
+                            // path, including whether the rig will do it.
+                            if ui.button("Test — key for 0.2 s").clicked() {
+                                if let Some(ptt) = &self.ptt {
+                                    let at = unix_now();
+                                    ptt.schedule(at, at + 0.2);
+                                }
+                            }
+                        }
+                    });
+
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("Theme");
@@ -3354,6 +3596,14 @@ impl App {
                 {
                     self.clear_all(t_now);
                 }
+
+                // Keying by hand: for tuning up, for checking into a dummy
+                // load, for anything the Send path does not cover. It sits on
+                // the bar rather than in a menu for the same reason the fire
+                // alarm is not in a cupboard — while it is down it is the most
+                // important thing on the screen, and it has to be reachable and
+                // visible without opening anything.
+                self.tx_button(ui);
 
                 // Last on the bar, deliberately. Its readout gains and loses
                 // digits as playback runs, and anything to its right would be
@@ -4031,6 +4281,9 @@ mod tests {
         app.default_mode = ModeId::Olivia(ragchew::olivia::OL_16_500);
         app.forget_min = 20.0;
         app.fade_secs = 3.5;
+        app.rig_host = "radio.local".to_string();
+        app.rig_port = 4599;
+        app.set_keying(rig::Keying::RigCtld { host: "radio.local".into(), port: 4599 });
         app.set_view(1200.0, 1400.0);
         for (m, on) in app.modes.iter_mut() {
             *on = m.protocol() == Protocol::Olivia;
@@ -4052,6 +4305,12 @@ mod tests {
         assert_eq!(restored.forget_min, 20.0);
         assert_eq!(restored.fade_secs, 3.5);
         assert_eq!((restored.vp.f_lo, restored.vp.f_hi), (1200.0, 1400.0));
+        assert_eq!(
+            restored.rig,
+            rig::Keying::RigCtld { host: "radio.local".into(), port: 4599 },
+            "the rig came back as something else"
+        );
+        assert!(restored.ptt.is_some(), "restored a rig with nobody supervising it");
         assert_eq!(restored.enabled_modes(), app.enabled_modes());
         assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
     }
@@ -5049,6 +5308,125 @@ mod tests {
             !in_the_status_bar(&out).iter().any(|s| s.ends_with(" Hz")),
             "the bar answered where there was nothing to answer"
         );
+    }
+
+    /// Nothing keys a rig because a settings file said something odd.
+    ///
+    /// This is the one setting that reaches out and moves hardware, so an
+    /// unreadable answer has to mean "no" rather than "the last thing that
+    /// happened to be in the file".
+    #[test]
+    fn an_unreadable_rig_setting_leaves_the_transmitter_alone() {
+        let mut app = App::base((0.0, 4000.0));
+        app.apply(Settings { rig_keying: "flrig-over-carrier-pigeon".into(), ..Settings::default() });
+        assert_eq!(app.rig, rig::Keying::None);
+        assert!(app.ptt.is_none(), "started keying something on an unreadable setting");
+    }
+
+    /// Turning rig control off takes the rig off the air on the way past.
+    #[test]
+    fn turning_the_rig_off_stops_it_transmitting_first() {
+        let mut app = App::base((0.0, 4000.0));
+        let bench = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.rig = rig::Keying::RigCtld { host: "x".into(), port: 1 };
+        app.ptt = Some(rig::Ptt::with_transmitter(
+            Box::new(Flag(bench.clone())),
+            rig::Limits::default(),
+        ));
+        app.ptt.as_ref().unwrap().key(true);
+        let began = std::time::Instant::now();
+        while !bench.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(began.elapsed() < std::time::Duration::from_secs(2), "never keyed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        app.set_keying(rig::Keying::None);
+        assert!(!bench.load(std::sync::atomic::Ordering::SeqCst), "left it transmitting");
+        assert!(app.ptt.is_none());
+    }
+
+    /// A transmitter that only records whether it is keyed.
+    struct Flag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl rig::Transmitter for Flag {
+        fn key(&mut self, on: bool) -> Result<(), rig::Fault> {
+            self.0.store(on, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn keyed(&mut self) -> Result<Option<bool>, rig::Fault> {
+            Ok(Some(self.0.load(std::sync::atomic::Ordering::SeqCst)))
+        }
+        fn describe(&self) -> String {
+            "a flag".to_string()
+        }
+    }
+
+    /// The button stops a transmission it did not start.
+    ///
+    /// It used to toggle against its own intent, so a rig transmitting for any
+    /// other reason read as "not keyed by us" and every press sent another key
+    /// command. On a real rig, keyed by hamlib raising DTR as it opened the
+    /// port, that was a transmitter that could not be stopped from the one
+    /// control on the screen for stopping it.
+    #[test]
+    fn the_button_stops_a_transmission_it_did_not_start() {
+        let mut app = app_with_a_waterfall(30.0);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.rig = rig::Keying::RigCtld { host: "x".into(), port: 1 };
+        app.ptt =
+            Some(rig::Ptt::with_transmitter(Box::new(Flag(flag.clone())), rig::Limits::default()));
+
+        // Somebody else put it on the air; this app never asked for it.
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let began = std::time::Instant::now();
+        while app.ptt_state().rig_says != Some(true) {
+            assert!(began.elapsed() < std::time::Duration::from_secs(2), "never saw it keyed");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            lay_out(&mut app);
+        }
+        assert!(!app.ptt_state().asked, "the test set this up wrong: it thinks it keyed it");
+
+        // What the button does with a click in that state.
+        let live = app.ptt_state().asked || app.ptt_state().rig_says == Some(true);
+        app.ptt.as_ref().unwrap().key(!live);
+
+        let began = std::time::Instant::now();
+        while flag.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(2),
+                "the button would not take the rig off the air"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The bar says TX while the rig is keyed, and says nothing when it is not.
+    ///
+    /// Drawn rather than asserted on the state, because the state being right
+    /// while the button stays grey is exactly the failure that matters: this is
+    /// the only thing on screen that says the station is transmitting.
+    #[test]
+    fn the_toolbar_says_when_the_rig_is_keyed() {
+        let mut app = app_with_a_waterfall(30.0);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.rig = rig::Keying::RigCtld { host: "x".into(), port: 1 };
+        app.ptt =
+            Some(rig::Ptt::with_transmitter(Box::new(Flag(flag.clone())), rig::Limits::default()));
+
+        let out = lay_out(&mut app);
+        assert!(drawn(&out).iter().any(|(s, _)| s == "TX"), "no TX button at all");
+
+        app.ptt.as_ref().unwrap().key(true);
+        let began = std::time::Instant::now();
+        loop {
+            let out = lay_out(&mut app);
+            let says_tx = drawn(&out).iter().any(|(s, _)| s.starts_with("TX"));
+            if says_tx && app.ptt_state().asked {
+                break;
+            }
+            assert!(began.elapsed() < std::time::Duration::from_secs(2), "the bar never said TX");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst), "said TX without keying anything");
     }
 
     /// A row that is nudged aside keeps its text.
