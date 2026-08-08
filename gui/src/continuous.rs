@@ -18,6 +18,21 @@
 //!   [`psk::rx::Rx`] locked to it, which emits each character as its symbol
 //!   completes. Between acquisitions, that is where PSK text comes from.
 //!
+//! Acquisition is also where all of the cost is — a band scan across six Olivia
+//! modes is seconds of CPU, against a cadence of four — so it does not run in
+//! the same call as tracking. [`Continuous::due`] hands the window out as an
+//! [`Acquisition`], which the caller runs wherever it likes (a worker thread in
+//! the app, [`Continuous::feed_blocking`] in tests), and [`Continuous::apply`]
+//! folds the result back in. Only one is ever out at a time, so a scan that
+//! overruns its cadence delays the next one instead of queueing another behind
+//! it, and characters keep arriving throughout.
+//!
+//! That is not a refinement. With the scan inline, a machine that could not
+//! quite afford it consumed audio more slowly than the audio arrived, and fell
+//! behind by a little more on every pass — text from a live band landed half a
+//! minute late and getting later. Now the worst a scan too expensive for the
+//! machine can do is happen less often: PSK is untouched and Olivia thins out.
+//!
 //! Arbitration falls out of the split. Deciding whether a carrier is really
 //! PSK31 or an Olivia signal being read twice is a question about a *station*,
 //! not about a character, so [`protocol::decode_all`] settles it once at
@@ -118,6 +133,11 @@ pub struct Continuous {
     at: usize,
     /// Absolute offset at which the next acquisition is due.
     next_acq: usize,
+    /// Where the window of the acquisition currently out for scanning began,
+    /// if one is out. It says two things: that no other may be started, and
+    /// that the audio from there on must be kept, because a station the scan
+    /// finds has to be caught up from where it started transmitting.
+    pending: Option<usize>,
     /// Audio one acquisition looks at, in samples: what the most demanding
     /// enabled mode needs.
     window: usize,
@@ -156,6 +176,7 @@ impl Continuous {
             // The first scan is due as soon as one can find anything, not when
             // the window has filled.
             next_acq: least,
+            pending: None,
             window,
             least,
             step,
@@ -170,7 +191,11 @@ impl Continuous {
         self.stations.iter().map(|s| (s.mode, s.hz)).collect()
     }
 
-    /// Feed contiguous audio; get back whatever decoded inside it.
+    /// Feed contiguous audio; get back what the tracked receivers read in it.
+    ///
+    /// This is the cheap half and it runs on every callback: no scanning, just
+    /// the open receivers being handed the audio they have not had. New
+    /// stations arrive through [`due`](Self::due) and [`apply`](Self::apply).
     ///
     /// Times on the returned decodes are seconds from the first sample ever
     /// fed, so a caller that knows when that was knows when everything was.
@@ -179,53 +204,127 @@ impl Continuous {
         self.buf.extend_from_slice(samples);
         let mut out: Vec<Decode> = Vec::new();
 
-        // Acquisition first, so a station that appears in this stretch of audio
-        // gets its receiver before the tracking below feeds it.
-        //
-        // A scan looks at a whole window once there is one, and at everything
-        // there is before that. The modes too slow to be found in it are the
-        // ones that decline to decode at all, so an early scan is not a worse
-        // scan — it is the same scan with fewer modes able to answer, and it is
-        // what gets PSK text out at 8.2 s instead of 24.
-        while self.buf.len().min(self.window) >= self.least
-            && self.at + self.buf.len().min(self.window) >= self.next_acq
-        {
-            self.acquire(&mut out);
-            self.next_acq += self.step;
-            // Keep exactly the window; anything older cannot be looked at
-            // again. Until the buffer has filled there is nothing older, so it
-            // grows into place rather than sliding and each early scan sees a
-            // little more than the last.
-            if self.buf.len() >= self.window {
-                let drop = self.step.min(self.buf.len());
-                self.buf.drain(..drop);
-                self.at += drop;
-            }
-        }
-        // A feed far larger than a window leaves the loop still holding several,
-        // so the buffer is capped rather than trusted to drain a step at a time.
-        if self.buf.len() > self.window * 2 {
-            let drop = self.buf.len() - self.window;
-            self.buf.drain(..drop);
-            self.at += drop;
-        }
-
-        // Then tracking: every open receiver gets the audio it has not had.
+        // Every open receiver gets the audio it has not had.
         let end = self.at + self.buf.len();
-        for s in &mut self.stations {
-            if s.fed_to >= end || s.fed_to < self.at {
-                continue;
+        let (at, buf) = (self.at, &self.buf);
+        self.stations.retain_mut(|s| {
+            // A receiver whose audio has gone cannot be carried across the
+            // gap — a jump in phase and timing is not something its loops
+            // recover from — so it is dropped and re-acquired rather than fed
+            // the wrong samples or, worse, quietly skipped for ever while
+            // still counting as tracked. Trimming happens below, after this,
+            // so in practice nothing reaches it.
+            if s.fed_to < at {
+                return false;
             }
-            let from = s.fed_to - self.at;
-            let (mode, hz, q) = (s.mode, s.hz, s.quality);
-            out.extend(
-                s.rx.feed(&self.buf[from..]).into_iter().map(|c| streamed(mode, hz, q, c, rate)),
-            );
-            s.fed_to = end;
-        }
+            if s.fed_to < end {
+                let (mode, hz, q) = (s.mode, s.hz, s.quality);
+                out.extend(
+                    s.rx
+                        .feed(&buf[s.fed_to - at..])
+                        .into_iter()
+                        .map(|c| streamed(mode, hz, q, c, rate)),
+                );
+                s.fed_to = end;
+            }
+            true
+        });
 
+        self.trim();
         out.sort_by(|a, b| a.time_s.partial_cmp(&b.time_s).unwrap());
         self.in_order(out)
+    }
+
+    /// Drop audio no scan can look at any more.
+    ///
+    /// Which is less than it sounds. A window is kept for the scan due next,
+    /// and that window ends where the scan comes *due* rather than at the live
+    /// edge, so it reaches further back than a window whenever audio has run
+    /// ahead of the cadence. A scan already out pins its own window's start on
+    /// top of that: what it finds there has to be caught up from where the
+    /// station began transmitting.
+    ///
+    /// The two-window cap over the top is for a worker that has wedged — the
+    /// buffer stops growing, and the scan comes back to a window that is simply
+    /// older than what can still be caught up, which [`apply`](Self::apply)
+    /// handles by clamping.
+    fn trim(&mut self) {
+        let live = self.at + self.buf.len();
+        let mut from = live.saturating_sub(self.window);
+        from = from.min(self.next_acq.saturating_sub(self.window));
+        if let Some(pinned) = self.pending {
+            from = from.min(pinned);
+        }
+        from = from.max(live.saturating_sub(2 * self.window));
+        if from > self.at {
+            self.buf.drain(..from - self.at);
+            self.at = from;
+        }
+    }
+
+    /// The window due to be scanned, if one is due and none is already out.
+    ///
+    /// A scan looks at a whole window once there is one, and at everything
+    /// there is before that. The modes too slow to be found in it are the ones
+    /// that decline to decode at all, so an early scan is not a worse scan — it
+    /// is the same scan with fewer modes able to answer, and it is what gets
+    /// PSK text out at 8.2 s instead of 24.
+    ///
+    /// The window ends where the scan came *due*, not at the live edge of the
+    /// buffer. The cadence is a grid, so that is the same stretch of audio
+    /// however the sound card happens to cut the stream up — and a decoder
+    /// whose text depended on the callback size would be a decoder nobody could
+    /// reason about. Nothing is skipped by it: the next window is a whole
+    /// window long and reaches back over everything in between.
+    pub fn due(&mut self) -> Option<Acquisition> {
+        let live = self.at + self.buf.len();
+        // A slot whose audio has already been trimmed away cannot be scanned;
+        // the grid catches up to what is still held rather than trying.
+        if self.next_acq < self.at + self.least {
+            let behind = self.at + self.least - self.next_acq;
+            self.next_acq += behind.div_ceil(self.step) * self.step;
+        }
+        if self.pending.is_some() || live < self.next_acq {
+            return None;
+        }
+        let end = self.next_acq;
+        let start = end.saturating_sub(self.window).max(self.at);
+        if end - start < self.least {
+            return None;
+        }
+        self.pending = Some(start);
+        // The slots that went by while a scan was out are gone, not owed:
+        // counting them up would be a backlog that can never be worked off,
+        // which is what made a machine that could not quite afford the scan
+        // fall a little further behind on every pass.
+        self.next_acq += self.step;
+        if self.next_acq <= live {
+            self.next_acq += ((live - self.next_acq) / self.step + 1) * self.step;
+        }
+        Some(Acquisition {
+            samples: self.buf[start - self.at..end - self.at].to_vec(),
+            at: start,
+            band: self.band,
+            modes: self.modes.clone(),
+        })
+    }
+
+    /// Give up on the scan that is out, so another can be started.
+    ///
+    /// For a caller whose worker has gone: without it the decoder waits for a
+    /// result that is never coming and never scans again.
+    pub fn abandon(&mut self) {
+        self.pending = None;
+    }
+
+    /// Feed audio and run any due scan here and now — the whole pipeline in one
+    /// call, for tests and for any caller that does not want a second thread.
+    pub fn feed_blocking(&mut self, samples: &[f32]) -> Vec<Decode> {
+        let mut out = self.feed(samples);
+        if let Some(job) = self.due() {
+            out.extend(self.apply(job.run()));
+        }
+        out
     }
 
     /// Drop anything older than what a channel has already been told.
@@ -293,27 +392,21 @@ impl Continuous {
         })
     }
 
-    /// One block scan over the window: emit what the block-decoded modes found,
+    /// Fold a finished scan back in: emit what the block-decoded modes found,
     /// and open or confirm a receiver for every PSK station it vouched for.
-    fn acquire(&mut self, out: &mut Vec<Decode>) {
+    ///
+    /// The audio has moved on since the scan was handed out — that is the whole
+    /// point of handing it out — so a receiver opened here is caught up to the
+    /// live edge of the buffer rather than to the end of the window that found
+    /// it. Nothing is lost in between.
+    pub fn apply(&mut self, done: Acquired) -> Vec<Decode> {
         let rate = SAMPLE_RATE as f64;
-        // Everything there is, up to a window. Short only while the buffer is
-        // still filling, which is the point.
-        let window = self.buf.len().min(self.window);
-        let win_start = self.at as f64 / rate;
-
-        // The whole gate, arbitration included, exactly as a file scan runs it.
-        let found: Vec<Decode> =
-            protocol::decode_all(&self.buf[..window], self.band.0, self.band.1, &self.modes)
-                .into_iter()
-                .map(|mut d| {
-                    d.time_s += win_start;
-                    d
-                })
-                .collect();
+        let mut out: Vec<Decode> = Vec::new();
+        self.pending = None;
+        let live = self.at + self.buf.len();
 
         let (psk_found, others): (Vec<Decode>, Vec<Decode>) =
-            found.into_iter().partition(|d| matches!(d.mode, ModeId::Psk(_)));
+            done.found.into_iter().partition(|d| matches!(d.mode, ModeId::Psk(_)));
 
         // Held until the PSK stations below have been settled, because which
         // PSK characters the block is still responsible for depends on where
@@ -360,20 +453,25 @@ impl Continuous {
             // start of the window: a receiver places its clock on whatever it
             // is first given, so one started on the silence before a station
             // locks to that silence and never reads a word of what follows.
-            let start = ((first_t * rate) as usize).max(self.at).min(self.at + window);
+            //
+            // Clamped to the buffer, which normally changes nothing: the
+            // station was found inside audio still held. It bites only when a
+            // scan came back so late that its window has been trimmed away, and
+            // then the receiver starts as early as it still can.
+            let start = ((first_t * rate) as usize).max(self.at).min(live);
             let mut rx = psk::rx::Rx::new(hz, mode, start);
             // Until a receiver has had this much signal it has not placed its
             // clock, so the block scan stays authoritative that far and the two
             // meet without a gap or a repeat.
             let covered_from = start + psk::rx::lock_samples(mode);
 
-            // Caught up on the rest of the window, so the receiver is locked
-            // and current before any new audio reaches it. What it reads here
-            // is *kept*, not discarded: the block stops covering the station at
-            // `covered_from` and live tracking only begins at the window's end,
-            // so throwing this away leaves several seconds of the station's
-            // first over decoded by nobody.
-            let caught = rx.feed(&self.buf[start - self.at..window]);
+            // Caught up on everything held since, so the receiver is locked and
+            // current before any new audio reaches it. What it reads here is
+            // *kept*, not discarded: the block stops covering the station at
+            // `covered_from` and live tracking only begins now, so throwing
+            // this away leaves several seconds of the station's first over
+            // decoded by nobody.
+            let caught = rx.feed(&self.buf[start - self.at..]);
             emit.extend(
                 caught
                     .into_iter()
@@ -387,7 +485,7 @@ impl Continuous {
                 hz,
                 quality,
                 covered_from,
-                fed_to: self.at + window,
+                fed_to: live,
                 missed: 0,
             });
         }
@@ -412,11 +510,49 @@ impl Continuous {
                 out.push(d);
             }
         }
-        let cutoff = win_start - window as f64 / rate;
+        let cutoff = (self.at as f64 - self.window as f64) / rate;
         self.seen.retain(|(_, _, t)| *t >= cutoff);
 
         self.stations.retain(|s| s.missed <= MISSES_BEFORE_CLOSE);
+        out.sort_by(|a, b| a.time_s.partial_cmp(&b.time_s).unwrap());
+        self.in_order(out)
     }
+}
+
+/// One window of audio, waiting to be scanned.
+///
+/// It carries a copy of the audio rather than a borrow because it is meant to
+/// cross a thread: [`run`](Self::run) is several seconds of arithmetic that
+/// wants no lock held and nothing waiting on it.
+pub struct Acquisition {
+    samples: Vec<f32>,
+    /// Absolute offset of `samples[0]`, so times come back on the decoder's
+    /// clock rather than the window's.
+    at: usize,
+    band: (f64, f64),
+    modes: Vec<ModeId>,
+}
+
+impl Acquisition {
+    /// The block scan — the whole gate, arbitration included, exactly as a file
+    /// scan runs it. No state and no borrows: run it anywhere.
+    pub fn run(self) -> Acquired {
+        let win_start = self.at as f64 / SAMPLE_RATE as f64;
+        Acquired {
+            found: protocol::decode_all(&self.samples, self.band.0, self.band.1, &self.modes)
+                .into_iter()
+                .map(|mut d| {
+                    d.time_s += win_start;
+                    d
+                })
+                .collect(),
+        }
+    }
+}
+
+/// What one scan found, on its way back to the decoder that asked for it.
+pub struct Acquired {
+    found: Vec<Decode>,
 }
 
 #[cfg(test)]
@@ -475,7 +611,7 @@ mod tests {
         let mut first = None;
         for block in audio.chunks(512) {
             fed += block.len();
-            let got = c.feed(block);
+            let got = c.feed_blocking(block);
             if !got.is_empty() && first.is_none() {
                 first = Some(fed as f64 / SAMPLE_RATE as f64);
             }
@@ -541,7 +677,7 @@ mod tests {
         let mut per_call: Vec<usize> = Vec::new();
         let mut read = String::new();
         for block in audio.chunks(512) {
-            let got = c.feed(block);
+            let got = c.feed_blocking(block);
             per_call.push(got.len());
             read.extend(got.iter().map(|d| d.text.clone()));
         }
@@ -591,7 +727,7 @@ mod tests {
         let mut newest: Vec<(ModeId, f64, f64)> = Vec::new();
         let mut checked = 0;
         for block in audio.chunks(512) {
-            for d in c.feed(block) {
+            for d in c.feed_blocking(block) {
                 let tol = d.mode.assoc_tol_hz();
                 match newest
                     .iter_mut()
@@ -628,7 +764,7 @@ mod tests {
             let mut c = Continuous::new(vec![ModeId::Psk(psk::PSK31)], (300.0, 2600.0));
             audio
                 .chunks(chunk)
-                .flat_map(|b| c.feed(b))
+                .flat_map(|b| c.feed_blocking(b))
                 .map(|d| d.text)
                 .collect()
         };
@@ -655,9 +791,106 @@ mod tests {
         let mut c = Continuous::new(vec![ModeId::Psk(psk::PSK31)], (300.0, 2600.0));
         let mut n = 0;
         for block in noise.chunks(4096) {
-            n += c.feed(block).len();
+            n += c.feed_blocking(block).len();
         }
         assert_eq!(n, 0, "printed {n} characters from a band with nothing on it");
         assert!(c.tracking().is_empty(), "tracking {:?} on noise", c.tracking());
+    }
+
+    /// A scan is expensive, so at most one is ever out — and the ones that came
+    /// due while it was out do not pile up behind it.
+    ///
+    /// Both halves matter. Queueing them was the fault behind a live capture
+    /// sliding into the past: each scan cost more than the cadence it was
+    /// started on, so every pass ended owing more scans than the last, and text
+    /// arrived later and later until the audio buffer overran.
+    #[test]
+    fn a_scan_that_overruns_neither_doubles_up_nor_queues() {
+        let audio = band_with_psk("cq cq de w1aw w1aw k  ", 1500.0, lead_s());
+        let mut c = Continuous::new(vec![ModeId::Psk(psk::PSK31)], (300.0, 2600.0));
+
+        let block = (psk::PSK31.block_secs() * SAMPLE_RATE as f64) as usize;
+        c.feed(&audio[..block + 4096]);
+        let job = c.due().expect("nothing came due with a whole block in hand");
+
+        // However much audio arrives while it is out, nothing else starts.
+        for chunk in audio[block..].chunks(4096) {
+            c.feed(chunk);
+            assert!(c.due().is_none(), "started a second scan with one already out");
+        }
+
+        // And when it comes back, what is due is the audio there is now: one
+        // scan, not one for every step that went by while it was out.
+        let _ = c.apply(job.run());
+        let mut issued = 0;
+        while c.due().is_some() {
+            let _ = c.apply(Acquired { found: Vec::new() });
+            issued += 1;
+        }
+        assert_eq!(issued, 1, "{issued} scans were owed for the time one scan took");
+    }
+
+    /// Text keeps arriving while a scan is out. This is the whole point of
+    /// taking the scan off this path: a station already being tracked is read
+    /// by its receiver, which knows nothing about scanning and waits for none.
+    #[test]
+    fn tracking_keeps_reading_while_a_scan_is_out() {
+        let text = "cq cq de w1aw w1aw k  the quick brown fox jumps over the lazy dog  \
+                    de w1aw ur rst 599 599 name andy qth london hw cpy? k  ";
+        let audio = band_with_psk(text, 1500.0, lead_s());
+        let mut c = Continuous::new(vec![ModeId::Psk(psk::PSK31)], (300.0, 2600.0));
+
+        // Far enough in that the station is being tracked and a scan is out.
+        let mut chunks = audio.chunks(4096);
+        let mut held = None;
+        for chunk in chunks.by_ref() {
+            if c.tracking().is_empty() {
+                c.feed_blocking(chunk);
+                continue;
+            }
+            c.feed(chunk);
+            held = c.due();
+            if held.is_some() {
+                break;
+            }
+        }
+        assert!(held.is_some(), "never got a station tracked with a scan out");
+
+        // The scan is never applied — as if the machine were far too slow for
+        // it — and the rest of the capture is fed with only the receivers to
+        // read it.
+        let mut read = String::new();
+        for chunk in chunks {
+            read.extend(c.feed(chunk).iter().map(|d| d.text.clone()));
+        }
+        assert!(
+            read.contains("lazy dog"),
+            "the receiver stopped when the scanner did: {read:?}"
+        );
+    }
+
+    /// A receiver whose audio has been trimmed away is closed, not skipped.
+    ///
+    /// Its loops cannot be carried across a gap, so it could only print
+    /// nonsense — but silently skipping it is worse than closing it, because it
+    /// still counts as tracked and so the scan that would re-acquire the
+    /// station finds it already there and confirms it for ever. The station
+    /// goes quiet on screen while everything reports it as being read.
+    #[test]
+    fn a_receiver_whose_audio_has_gone_is_closed_rather_than_skipped() {
+        let mut c = Continuous::new(vec![ModeId::Psk(psk::PSK31)], (300.0, 2600.0));
+        c.at = 10_000;
+        c.stations.push(Station {
+            rx: psk::rx::Rx::new(1500.0, psk::PSK31, 0),
+            mode: psk::PSK31,
+            hz: 1500.0,
+            quality: 50.0,
+            covered_from: 0,
+            fed_to: 0,
+            missed: 0,
+        });
+
+        c.feed(&vec![0.0; 1200]);
+        assert!(c.tracking().is_empty(), "kept a receiver it can never feed again");
     }
 }

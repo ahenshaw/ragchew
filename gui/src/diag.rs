@@ -350,6 +350,11 @@ pub struct Health {
     pub js8: ThreadHealth,
     /// The rolling-window (Olivia, PSK) decode thread.
     pub continuous: ThreadHealth,
+    /// The band scanner behind it, which is where that thread's cost went when
+    /// it was one thread. It is reported separately rather than folded back in:
+    /// a scan too expensive for the machine no longer delays anything, so the
+    /// only place it can now be seen is its own cost.
+    pub acquire: ThreadHealth,
     /// Spectrogram columns the UI has consumed — the waterfall's own pulse.
     /// The reported fault had this climbing while decodes stopped, so the log
     /// has to carry both or it cannot confirm the report.

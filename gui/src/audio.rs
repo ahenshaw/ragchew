@@ -14,7 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ragchew::protocol::{self, ModeId};
 use ragchew::spectrogram::WINDOW;
 
-use crate::continuous::Continuous;
+use crate::continuous::{Acquired, Acquisition, Continuous, ACQ_STEP_S};
 use crate::diag::{self, Health, RunningGuard, ThreadHealth};
 use crate::record::Tap;
 use crate::traffic;
@@ -589,6 +589,7 @@ pub fn spawn_decoder(
     // thread switched off is as deliberate as one switched on.
     health.js8.wanted.store(!js8.is_empty(), Ordering::Relaxed);
     health.continuous.wanted.store(!continuous.is_empty(), Ordering::Relaxed);
+    health.acquire.wanted.store(!continuous.is_empty(), Ordering::Relaxed);
     if !js8.is_empty() {
         spawn_js8(buf.clone(), js8, tx.clone(), health.clone());
     }
@@ -812,16 +813,33 @@ fn spawn_js8(
 /// arrived since. Olivia is unaffected in substance — same window, same
 /// cadence, same gate — but it now reaches the interface through `Continuous`
 /// rather than through a scan written out here.
+///
+/// The scan itself runs on [`spawn_acquisition`], not here: it is seconds of
+/// arithmetic and this thread must be able to consume a second of audio in
+/// well under a second, every quarter of a second, or the receivers it feeds
+/// report late. What crosses between them is a window out and a result back,
+/// with a generation number so that a restart cannot be handed the findings of
+/// the capture before it.
 fn spawn_continuous(
     buf: Arc<Mutex<AudioBuf>>,
     modes: Vec<ModeId>,
     tx: Sender<Vec<protocol::Decode>>,
     health: Arc<Health>,
 ) {
+    let (jobs, jobs_rx) = channel::<(u64, Acquisition)>();
+    let (done, done_rx) = channel::<(u64, Acquired)>();
+    spawn_acquisition(jobs_rx, done, health.clone());
+
     let spawned = thread::Builder::new().name("ragchew-cont".into()).spawn(move || {
         let guard = RunningGuard::new(health, |h| &h.continuous);
         let stats = guard.stats();
         let mut cont = Continuous::new(modes.clone(), BAND);
+        // Which capture a scan belongs to. A restart abandons whatever is out
+        // rather than waiting for it, and its result is dropped on arrival:
+        // the offsets in it count from a first sample that is no longer the
+        // first sample.
+        let mut generation: u64 = 0;
+        let mut lost_worker = false;
         // Global index of the next sample to read, and the wall-clock-relative
         // time of the sample the decoder counts from, so its times come back
         // capture-relative like every other decode's.
@@ -857,15 +875,42 @@ fn spawn_continuous(
                     );
                 }
                 cont = Continuous::new(modes.clone(), BAND);
+                generation += 1;
                 origin_s = g0 as f64 / RATE as f64;
             }
             if samples.is_empty() {
                 Health::bump(&stats.short, 1);
                 continue;
             }
+            let audio_s = samples.len() as f64 / RATE as f64;
 
             stats.pass_begun();
-            let fresh = shift_times(cont.feed(&samples), origin_s);
+            let mut fresh = shift_times(cont.feed(&samples), origin_s);
+            // Whatever the scanner has finished since the last pass, folded in
+            // here so that everything reaches the interface on one clock, in
+            // one send, in time order.
+            while let Ok((gen, found)) = done_rx.try_recv() {
+                if gen == generation {
+                    fresh.extend(shift_times(cont.apply(found), origin_s));
+                }
+            }
+            if let Some(job) = cont.due() {
+                if jobs.send((generation, job)).is_err() {
+                    cont.abandon();
+                    if !lost_worker {
+                        lost_worker = true;
+                        diag_warn!(
+                            "cont",
+                            "the band scanner has stopped; PSK stations already being tracked \
+                             keep printing, but nothing new will be found and Olivia is done"
+                        );
+                    }
+                }
+            }
+            // One send, in time order: the two sources report on very different
+            // delays and the interface's channels are documented to need time
+            // order per station, which sorting by time keeps.
+            fresh.sort_by(|a, b| a.time_s.partial_cmp(&b.time_s).unwrap());
             stats.pass_done(pass.elapsed().as_secs_f64() * 1e3);
 
             if !fresh.is_empty() {
@@ -889,17 +934,18 @@ fn spawn_continuous(
                 }
             }
 
-            // Scanning six Olivia modes across the whole band costs 3.5 s in a
-            // release build and forty in a debug one. Left alone the thread
-            // runs flat out for ever, and the interface — sharing a CPU and a
-            // buffer lock with it — stops answering. So it yields for as long
-            // as the pass overran, holding decoding to half the wall clock.
+            // Yield the CPU, but never more of it than this pass left spare.
             //
-            // Falling behind now costs latency rather than coverage: the audio
-            // waits in the buffer and is read whole on the next pass, where the
-            // sliding window this replaced simply missed whatever it stepped
-            // over.
-            let owed = pass.elapsed().as_secs_f64() - FEED_STEP_S;
+            // The thread shares a machine with the interface, so a pass that
+            // cost real time should give some back. What it must not do is give
+            // back time it has not got: audio arrives in real time, so a thread
+            // that sleeps as long as it worked can only keep up while a pass
+            // costs less than half the audio it consumed. Past that it consumes
+            // audio more slowly than the audio arrives and the whole capture
+            // slides into the past, a little further every pass — which is
+            // exactly what happened when this yielded against [`FEED_STEP_S`]
+            // while an inline band scan was costing seconds.
+            let owed = yield_after(pass.elapsed().as_secs_f64(), audio_s);
             if owed > 0.0 {
                 thread::sleep(Duration::from_secs_f64(owed));
             }
@@ -910,13 +956,70 @@ fn spawn_continuous(
     }
 }
 
+/// How long a decode thread should yield after a pass that cost `cost_s` and
+/// consumed `audio_s` seconds of audio.
+///
+/// Half the pass, to leave the interface a share of the machine — but only out
+/// of the slack the pass actually left, and never a moment more. A thread that
+/// yields past that consumes audio slower than real time, and once it does, it
+/// is behind by a little more after every pass for the rest of the session.
+/// This returning zero is the thread saying it has no time to give.
+fn yield_after(cost_s: f64, audio_s: f64) -> f64 {
+    (audio_s - cost_s).clamp(0.0, cost_s.max(0.0))
+}
+
+/// The band scan, on a thread of its own.
+///
+/// One window in, one set of findings out, and nothing shared: a scan is pure
+/// arithmetic over a copy of the audio, so the only thing it can hold up is the
+/// next scan. That is the point — the audio it is a scan *of* keeps flowing
+/// past [`spawn_continuous`], and the PSK receivers there keep printing while
+/// this works.
+fn spawn_acquisition(
+    jobs: Receiver<(u64, Acquisition)>,
+    done: Sender<(u64, Acquired)>,
+    health: Arc<Health>,
+) {
+    let spawned = thread::Builder::new().name("ragchew-acq".into()).spawn(move || {
+        let guard = RunningGuard::new(health, |h| &h.acquire);
+        let stats = guard.stats();
+        // Ends when the continuous thread drops its end, i.e. when the capture
+        // does.
+        for (gen, job) in jobs {
+            let pass = std::time::Instant::now();
+            stats.pass_begun();
+            let found = job.run();
+            let cost = pass.elapsed().as_secs_f64();
+            stats.pass_done(cost * 1e3);
+            if done.send((gen, found)).is_err() {
+                diag_info!("acq", "receiver gone; scanner retiring");
+                break;
+            }
+            // A scan inside its cadence has already left the rest of it idle
+            // and needs no yield. One that overran is about to be handed the
+            // next window immediately, so it yields a share of the overrun
+            // instead — enough that a machine which cannot afford the scan
+            // still runs an interface, and bounded so that scans stay as
+            // frequent as the machine allows. Nothing waits on this: PSK is
+            // tracked elsewhere and Olivia simply gets scanned less often.
+            let owed = (cost - ACQ_STEP_S).clamp(0.0, ACQ_STEP_S);
+            if owed > 0.0 {
+                thread::sleep(Duration::from_secs_f64(owed));
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        diag_warn!("decode", "could not spawn the band scanner: {e}");
+    }
+}
+
 /// How often the continuous thread collects new audio.
 ///
 /// Short, because a streaming receiver can only report a character once the
 /// audio carrying it has been handed over, so this is the floor on how promptly
-/// that happens. It is not the cost of decoding: acquisition keeps its own
-/// four-second cadence inside [`Continuous`], and a pass that merely feeds
-/// receivers is a few milliseconds.
+/// that happens. It is not the cost of decoding: the band scan runs on its own
+/// thread at its own four-second cadence, and a pass here — feeding receivers
+/// and folding in whatever the scanner has finished — is a few milliseconds.
 const FEED_STEP_S: f64 = 0.25;
 
 // ---- the heartbeat ----
@@ -929,10 +1032,14 @@ const HEARTBEAT_S: f64 = 30.0;
 ///
 /// The cycle-aligned thread waits for whichever submode is due first, so on
 /// JS8 Slow alone it can legitimately be quiet for thirty seconds plus the
-/// pass; the continuous one steps every four seconds unless a pass overran.
-/// These are several times either, so a warning means *stuck*, not busy.
+/// pass; the continuous one steps four times a second. The scanner is the loose
+/// one: it is meant to start a scan every four seconds, but a machine it is too
+/// expensive for legitimately manages fewer, and that is a slower band scan
+/// rather than a fault. These are several times either, so a warning means
+/// *stuck*, not busy.
 const JS8_STALL_S: f64 = 90.0;
 const CONT_STALL_S: f64 = 60.0;
+const ACQ_STALL_S: f64 = 120.0;
 
 /// Lag past which the capture's timeline is far enough from the wall clock to
 /// be moving decode windows off the signal. Half a second is the whole margin
@@ -982,11 +1089,12 @@ pub fn spawn_heartbeat(buf: &Arc<Mutex<AudioBuf>>, health: Arc<Health>) -> Arc<A
             diag_info!(
                 "health",
                 "lag={lag:+.2}s slipped={slipped:.1}s held={held_s:.0}s cols=+{} frames=+{} | \
-                 js8 {} | cont {} | stream_err={} rec_drop={}",
+                 js8 {} | cont {} | acq {} | stream_err={} rec_drop={}",
                 d.ui_columns,
                 d.ui_frames,
                 thread_summary(&health.js8, d.js8),
                 thread_summary(&health.continuous, d.cont),
+                thread_summary(&health.acquire, d.acq),
                 diag::get(&health.stream_errors),
                 diag::get(&health.record_dropped)
             );
@@ -1011,6 +1119,7 @@ pub fn spawn_heartbeat(buf: &Arc<Mutex<AudioBuf>>, health: Arc<Health>) -> Arc<A
             }
             check_stall(&health.js8, "cycle-aligned (JS8)", JS8_STALL_S);
             check_stall(&health.continuous, "continuous (Olivia/PSK)", CONT_STALL_S);
+            check_stall(&health.acquire, "band scanner", ACQ_STALL_S);
         }
     });
     if let Err(e) = spawned {
@@ -1081,6 +1190,7 @@ struct Snapshot {
     ui_frames: u64,
     js8: ThreadDelta,
     cont: ThreadDelta,
+    acq: ThreadDelta,
 }
 
 impl ThreadDelta {
@@ -1111,6 +1221,7 @@ impl Snapshot {
             ui_frames: diag::get(&h.ui_frames),
             js8: ThreadDelta::of(&h.js8),
             cont: ThreadDelta::of(&h.continuous),
+            acq: ThreadDelta::of(&h.acquire),
         }
     }
     fn since(&self, then: &Snapshot) -> Snapshot {
@@ -1119,6 +1230,7 @@ impl Snapshot {
             ui_frames: self.ui_frames - then.ui_frames,
             js8: self.js8.since(&then.js8),
             cont: self.cont.since(&then.cont),
+            acq: self.acq.since(&then.acq),
         }
     }
 }
@@ -1299,6 +1411,37 @@ fn shift_times(decodes: Vec<protocol::Decode>, win_start: f64) -> Vec<protocol::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decode thread must never yield time it has not got.
+    ///
+    /// This is the arithmetic behind a fault that took a live capture apart. A
+    /// yield measured against [`FEED_STEP_S`] instead of the audio the pass
+    /// consumed meant a pass costing fourteen seconds slept for another
+    /// fourteen: the thread then read audio at half the rate it arrived, and
+    /// what it had not read piled up. Every pass had more to do than the last,
+    /// PSK text reached the screen fourteen seconds late, then nineteen, then
+    /// thirty-five, and the only thing that would ever have stopped it was the
+    /// capture buffer overrunning.
+    ///
+    /// So: give back the slack, at most half the wall clock, and nothing at all
+    /// when the pass cost as much as the audio it read.
+    #[test]
+    fn a_pass_never_yields_time_it_has_not_got() {
+        assert_eq!(yield_after(14.0, 14.0), 0.0, "yielded on a pass with no slack");
+        assert_eq!(yield_after(20.0, 5.0), 0.0, "yielded while already behind");
+        assert_eq!(yield_after(2.0, 10.0), 2.0, "should give back half the wall clock");
+        assert_eq!(yield_after(1.0, 1.5), 0.5, "should give back only the slack");
+        assert_eq!(yield_after(0.01, 0.25), 0.01, "a cheap pass yields its own cost");
+
+        // The property the fault broke: a pass and its yield together never
+        // take longer than the audio they consumed, so the thread keeps up.
+        for cost in [0.001, 0.1, 1.0, 2.5, 4.0, 30.0] {
+            for audio in [0.25, 1.0, 4.0, 24.0] {
+                let total = cost + yield_after(cost, audio);
+                assert!(total <= audio.max(cost), "cost {cost} on {audio}s of audio slept past it");
+            }
+        }
+    }
 
     fn dev(id: &str, label: &str) -> AudioDevice {
         AudioDevice { id: id.to_string(), label: label.to_string() }
