@@ -1405,6 +1405,13 @@ struct App {
     /// when one loses its text. See [`App::watch_rows`].
     seen_rows: HashMap<u64, RowSeen>,
 
+    /// The file view's channels, and how much of the revealed list has been fed
+    /// into them. See [`App::channels_now`].
+    file_set: ChannelSet,
+    fed_frames: usize,
+    /// Set when the frames themselves change, so the set is built again rather
+    /// than fed decodes it has already had.
+    frames_dirty: bool,
 
     /// What PipeWire could route into the capture, as of [`App::pw_at`].
     ///
@@ -1557,6 +1564,9 @@ impl App {
             cleared: HashMap::new(),
             slide: HashMap::new(),
             seen_rows: HashMap::new(),
+            file_set: ChannelSet::new(15.0),
+            fed_frames: 0,
+            frames_dirty: false,
             cleared_all_at: f64::NEG_INFINITY,
             pw: crate::pipewire::Routing::default(),
             pw_at: None,
@@ -1840,6 +1850,7 @@ impl App {
         self.samples = Arc::new(Vec::new());
         self.spec = None;
         self.frames = Vec::new();
+        self.frames_dirty = true;
         self.pending_scans = 0;
         self.status = None;
         self.source = "live input".to_string();
@@ -1902,6 +1913,48 @@ impl App {
         self.rescan();
     }
 
+    /// Take frames from a scan that has landed, and put the list back in the
+    /// order the window reveals them in.
+    ///
+    /// The order matters more than it looks. The file view rebuilds its
+    /// channels from every frame revealed so far, on every frame it draws, and
+    /// a channel set is a function of the order it was fed: stations are
+    /// matched to the nearest channel of their protocol as they arrive, and ids
+    /// are handed out in the order channels are created. Feed the same decodes
+    /// in a different order and text can land on a different station, and the
+    /// station it lands on can have a different id.
+    ///
+    /// Scans land one mode at a time, in whatever order they finish, so without
+    /// this the list is in no order at all — and "everything revealed so far"
+    /// then grows by *insertion*, not by appending: a decode revealed at
+    /// twenty seconds sits in the middle of the list, so the rebuild that
+    /// follows it is a different rebuild all the way down. On screen that is a
+    /// row losing the text it had and filling in again from nothing, which is
+    /// what the demo band did every time a scan landed.
+    ///
+    /// Reveal order is the one to be in. It is the order the live path delivers
+    /// decodes in, and the only one where what has been revealed grows by
+    /// appending, so a rebuild agrees with the rebuild before it about
+    /// everything both of them saw.
+    fn frames_landed(&mut self, more: Vec<Frame>) {
+        self.frames.extend(more);
+        self.sort_frames();
+    }
+
+    fn sort_frames(&mut self) {
+        self.frames_dirty = true;
+        // Total, and on the decodes themselves rather than on how they arrived:
+        // two runs of the same scan must not be able to disagree.
+        self.frames.sort_by(|a, b| {
+            a.reveal_s
+                .partial_cmp(&b.reveal_s)
+                .unwrap()
+                .then(a.decode.time_s.partial_cmp(&b.decode.time_s).unwrap())
+                .then(a.decode.hz.partial_cmp(&b.decode.hz).unwrap())
+                .then_with(|| a.decode.mode.name().cmp(&b.decode.mode.name()))
+        });
+    }
+
     /// (Re)decode the loaded file with the currently enabled modes.
     ///
     /// Scanning a minute of band costs seconds per mode, which is far longer
@@ -1918,6 +1971,7 @@ impl App {
         let (frames_tx, frames_rx) = channel();
         self.frames_rx = frames_rx;
         self.frames = Vec::new();
+        self.frames_dirty = true;
         self.pending_scans = 0;
         if self.samples.is_empty() {
             return;
@@ -1964,6 +2018,7 @@ impl App {
             .into_iter()
             .map(|d| Frame { reveal_s: d.time_s + d.mode.chunk_secs(), decode: d })
             .collect();
+        self.sort_frames();
     }
 
     /// The mode legend, doubling as the on/off control for what is scanned.
@@ -2566,14 +2621,39 @@ impl App {
         self.status = None;
     }
 
-    fn channels_now(&self) -> ChannelSet {
-        ChannelSet::from_decodes(
-            self.frames
-                .iter()
-                .filter(|f| f.reveal_s <= self.t_now)
-                .map(|f| f.decode.clone()),
-            15.0,
-        )
+    /// The channels as they stand at [`App::t_now`], accumulated rather than
+    /// rebuilt.
+    ///
+    /// It used to build a set from every decode revealed so far, on every frame
+    /// drawn, and that cannot be made stable. A channel set is a function of
+    /// the order it is fed — stations are matched to the nearest channel of
+    /// their protocol as they arrive, and ids are handed out as channels are
+    /// created — and [`ChannelSet::from_decodes`] feeds in *time* order while
+    /// the window reveals in *reveal* order. Those are not the same order: a
+    /// JS8 Slow frame is revealed thirty seconds after the cycle it was sent
+    /// in, so it lands in the middle of the time-ordered sequence, and every
+    /// rebuild after it disagrees with the one before all the way down. On
+    /// screen that is a row losing its text and filling in again from nothing,
+    /// and a station changing channel id under everything that holds one — the
+    /// slide, a clear aimed at one row, an open conversation.
+    ///
+    /// So the set is kept and fed each newly revealed frame in reveal order,
+    /// which is what the live path does with decodes as they are decoded. It is
+    /// built afresh only when the past changes rather than the present: the
+    /// clock going backwards, and a scan landing with frames dated before where
+    /// the clock has already reached.
+    fn channels_now(&mut self) -> ChannelSet {
+        let revealed = self.frames.partition_point(|f| f.reveal_s <= self.t_now);
+        if self.frames_dirty || revealed < self.fed_frames {
+            self.file_set = ChannelSet::new(15.0);
+            self.fed_frames = 0;
+            self.frames_dirty = false;
+        }
+        for f in &self.frames[self.fed_frames..revealed] {
+            self.file_set.add(f.decode.clone());
+        }
+        self.fed_frames = revealed;
+        self.file_set.clone()
     }
 
     fn waterfall_texture(
@@ -2812,7 +2892,7 @@ impl App {
             }
             let mut landed = false;
             while let Ok(f) = self.frames_rx.try_recv() {
-                self.frames.extend(f);
+                self.frames_landed(f);
                 self.pending_scans = self.pending_scans.saturating_sub(1);
                 landed = true;
             }
@@ -4597,8 +4677,13 @@ mod tests {
 
         app.arbitrate_scans();
 
-        let kept: Vec<(ModeId, f64)> =
+        // What survived, in frequency order rather than the list's: the frames
+        // are kept in the order they are revealed, and a decode's reveal time
+        // is its own mode's, so the list order is not the order they were
+        // scanned in. See [`App::channels_now`] for why that matters.
+        let mut kept: Vec<(ModeId, f64)> =
             app.frames.iter().map(|f| (f.decode.mode, f.decode.hz)).collect();
+        kept.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         assert_eq!(kept, [(olivia, 745.0), (psk, 1500.0)], "kept {kept:?}");
         // Reveal times are rebuilt with the frames, not left behind.
         for f in &app.frames {
@@ -4687,6 +4772,76 @@ mod tests {
         );
     }
 
+    /// Playing a file forward only ever adds to what a row says.
+    ///
+    /// The file view shows "everything revealed so far", and it used to work
+    /// that out from scratch on every frame it drew. That cannot be stable.
+    /// A channel set depends on the order it is fed, and the order decodes are
+    /// *revealed* in is not the order they were *sent* in: a JS8 Slow frame is
+    /// revealed thirty seconds after the cycle it belongs to, so it arrives in
+    /// the middle of a time-ordered rebuild and every station created after it
+    /// comes out differently — different text on the row, and a different
+    /// channel id under the slide, the clears and any open conversation.
+    ///
+    /// On the demo band it happened within the first few seconds and kept
+    /// happening: rows losing two thirds of their text and filling in again.
+    /// So: play it through, and hold each channel to the two things a reader
+    /// is entitled to assume — that a row keeps its station, and that what it
+    /// has said only ever grows.
+    #[test]
+    fn playing_a_file_forward_only_ever_adds_to_a_row() {
+        let mut app = App::base((300.0, 2600.0));
+        let samples = crate::demo::synth();
+        // One mode revealed long after it was sent, one revealed as it is sent,
+        // and one in between: the mismatch between the two orders is the whole
+        // subject, and six Olivia modes would only make it slower to show.
+        let modes = [
+            ModeId::Js8(ragchew::js8::Mode::Slow),
+            ModeId::Js8(ragchew::js8::Mode::Normal),
+            ModeId::Olivia(ragchew::olivia::OL_8_250),
+            ModeId::Psk(ragchew::psk::PSK31),
+        ];
+        let landing: Vec<Frame> = protocol::decode_all(&samples, 300.0, 2600.0, &modes)
+            .into_iter()
+            .map(|d| Frame { reveal_s: d.time_s + d.mode.chunk_secs(), decode: d })
+            .collect();
+        assert!(landing.len() > 50, "only {} decodes; the band was too quiet", landing.len());
+        app.frames_landed(landing);
+        app.duration_s = samples.len() as f64 / SAMPLE_RATE as f64;
+
+        // (mode, characters said) per channel id, as it was a moment ago.
+        let mut was: HashMap<u64, (ModeId, usize)> = HashMap::new();
+        let mut grew = 0;
+        let mut t = 0.0;
+        while t < app.duration_s {
+            app.t_now = t;
+            for ch in app.channels_now().channels() {
+                let now = (ch.mode, ch.next_index());
+                if let Some(&(mode, said)) = was.get(&ch.id) {
+                    assert_eq!(
+                        mode, now.0,
+                        "at {t:.1}s channel {} changed from {} to {}",
+                        ch.id,
+                        mode.name(),
+                        now.0.name()
+                    );
+                    assert!(
+                        now.1 >= said,
+                        "at {t:.1}s channel {} ({} {:.0} Hz) held {} characters, down from {said}",
+                        ch.id,
+                        ch.mode.name(),
+                        ch.hz,
+                        now.1
+                    );
+                    grew += usize::from(now.1 > said);
+                }
+                was.insert(ch.id, now);
+            }
+            t += 0.25;
+        }
+        assert!(grew > 100, "the rows only grew {grew} times; the test proved little");
+    }
+
     fn a_row(id: u64, hz: f64, drawn: usize, held: usize) -> RowNow {
         RowNow {
             id,
@@ -4758,6 +4913,81 @@ mod tests {
         assert_eq!(said.len(), 1, "{said:?}");
         assert!(said[0].contains("come back as channel 8"), "{}", said[0]);
         assert!(said[0].contains("was channel 7"), "{}", said[0]);
+    }
+
+    /// A row that is nudged aside keeps its text.
+    ///
+    /// When a station appears next to one already on screen, the layout moves
+    /// rows apart to make room. That is a change of *place*, and nothing about
+    /// a row's place has anything to do with what it has said: the text on a
+    /// nudged row must be the text it had a frame ago, whole.
+    #[test]
+    fn a_row_nudged_aside_by_a_newcomer_keeps_its_text() {
+        let psk = ModeId::Psk(ragchew::psk::PSK31);
+        let d = |hz: f64, at: f64, text: &str| protocol::Decode {
+            snr_db: None,
+            mode: psk,
+            hz,
+            time_s: at,
+            quality: 30.0,
+            text: text.to_string(),
+            ends_over: false,
+        };
+
+        let mut app = App::base((0.0, 4000.0));
+        // One station typing from the start, and a second ten seconds later
+        // sixty hertz away: far enough apart to be two channels rather than one
+        // (the set associates within fifteen), close enough that their rows
+        // cannot both sit at their own frequency, so the layout must nudge.
+        let mut frames: Vec<Frame> = Vec::new();
+        for i in 0..200 {
+            let t = 1.0 + i as f64 * 0.2;
+            frames.push(Frame { reveal_s: t + psk.chunk_secs(), decode: d(1000.0, t, "a") });
+            if t >= 11.0 {
+                frames.push(Frame { reveal_s: t + psk.chunk_secs(), decode: d(1060.0, t, "b") });
+            }
+        }
+        app.frames = frames;
+        app.duration_s = 60.0;
+        app.samples = Arc::new(vec![0.0; SAMPLE_RATE as usize * 40]);
+        app.spec = Some(Arc::new(Spectrogram::compute(&app.samples, 0.0, 4000.0, WINDOW / 4)));
+
+        let mut longest = 0usize;
+        let mut moved = false;
+        let mut was_at: Option<f32> = None;
+        for step in 0..150 {
+            app.t_now = 5.0 + step as f64 * 0.1;
+            let out = lay_out(&mut app);
+            let mine: Vec<(String, f32)> = out
+                .shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::Shape::Text(t) if t.pos.x > app.qso_w => {
+                        Some((t.galley.text().to_string(), t.pos.y))
+                    }
+                    _ => None,
+                })
+                .filter(|(s, _)| s.starts_with('a'))
+                .collect();
+            let Some((text, y)) = mine.first() else { continue };
+            moved |= was_at.is_some_and(|prev| (prev - y).abs() > 0.5);
+            was_at = Some(*y);
+
+            assert!(
+                text.chars().count() >= longest,
+                "at t={:.1} the row lost text: {} characters, down from {longest}",
+                app.t_now,
+                text.chars().count()
+            );
+            longest = text.chars().count();
+        }
+        assert_eq!(
+            app.channels_now().channels().len(),
+            2,
+            "the two stations were read as one, so nothing was ever nudged"
+        );
+        assert!(moved, "the newcomer never moved the row, so this test proved nothing");
+        assert!(longest > 20, "the row only ever held {longest} characters");
     }
 
     /// Text filled in behind a station is there, not swept in.
@@ -5027,7 +5257,8 @@ mod tests {
     fn a_clear_does_not_carry_over_to_a_new_scan() {
         let mut app = app_with_traffic(30.0);
         lay_out(&mut app);
-        app.cleared.insert(app.channels_now().channels()[0].id, app.t_now);
+        let id = app.channels_now().channels()[0].id;
+        app.cleared.insert(id, app.t_now);
         app.clear_all(app.t_now);
 
         app.rescan();
