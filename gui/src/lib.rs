@@ -14,6 +14,9 @@ pub mod icon;
 pub mod layout;
 pub mod qso;
 pub mod record;
+/// Keying a transmitter. Pure `std` — the rig is reached over a socket, so this
+/// builds and is tested without the windowing or audio stack.
+pub mod rig;
 pub mod scene;
 pub mod traffic;
 pub mod waterfall;
