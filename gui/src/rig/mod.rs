@@ -33,6 +33,9 @@
 //! transmitting into an empty band on somebody's bench: a key-down that outlasts
 //! its limit, an owner that goes away, and a panic anywhere in the thread.
 
+pub mod elecraft;
+pub mod serial;
+
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -57,6 +60,10 @@ pub enum Keying {
     #[default]
     None,
     RigCtld { host: String, port: u16 },
+    /// An Elecraft radio on a serial cable, spoken to directly — no daemon in
+    /// between, which for the one radio on the bench is one thing to run
+    /// instead of two.
+    Elecraft { device: String, baud: u32 },
 }
 
 /// Why a rig could not be made to do something.
@@ -126,10 +133,10 @@ fn hamlib_says(code: i32) -> Option<&'static str> {
 }
 
 /// What a command was trying to do, for a refusal to quote back.
-const KEYING: &str = "key";
-const READING_PTT: &str = "say whether it is transmitting";
-const READING_DIAL: &str = "say what it is tuned to";
-const TUNING: &str = "tune";
+pub(crate) const KEYING: &str = "key";
+pub(crate) const READING_PTT: &str = "say whether it is transmitting";
+pub(crate) const READING_DIAL: &str = "say what it is tuned to";
+pub(crate) const TUNING: &str = "tune";
 
 /// Something that can put a transmitter on the air.
 pub trait Transmitter: Send {
@@ -394,6 +401,31 @@ pub fn open(keying: &Keying) -> Box<dyn Transmitter> {
     match keying {
         Keying::None => Box::new(Unkeyed),
         Keying::RigCtld { host, port } => Box::new(RigCtld::new(host, *port)),
+        Keying::Elecraft { device, baud } => match serial::Port::open(device, *baud) {
+            Ok(port) => {
+                let what = port.describe().to_string();
+                Box::new(elecraft::Elecraft::new(port, what))
+            }
+            // A port that will not open is not a reason to have no transmitter
+            // at all: this one reports the fault every time it is asked, which
+            // is what puts it on screen instead of in a log nobody is reading.
+            Err(e) => Box::new(Unreachable(format!("{device}: {e}"))),
+        },
+    }
+}
+
+/// A transmitter that could not be opened, and says so whenever it is asked.
+struct Unreachable(String);
+
+impl Transmitter for Unreachable {
+    fn key(&mut self, _on: bool) -> Result<(), Fault> {
+        Err(Fault::Link(self.0.clone()))
+    }
+    fn keyed(&mut self) -> Result<Option<bool>, Fault> {
+        Err(Fault::Link(self.0.clone()))
+    }
+    fn describe(&self) -> String {
+        format!("unreachable ({})", self.0)
     }
 }
 

@@ -139,7 +139,15 @@ submode's UTC cycle, and a message too long for one frame goes out as several,
 one per cycle. The audio goes to the device you point it at, which is all a rig
 on a USB codec (or VOX) needs.
 
-For a rig that wants keying, **☰ ▸ Rig** points the app at hamlib's `rigctld`
+An **Elecraft** KX3 or K3 needs no daemon at all: **☰ ▸ Rig ▸ Elecraft**, the
+serial port the cable is on, and the rate the radio's menu is set to (38400
+from the factory). It keys, tunes and reads the frequency and mode over that one
+cable. What it does not do yet is *read back* whether the radio is
+transmitting — that lives in Elecraft's `IF` record, whose layout wants checking
+against a real radio before anything is read out of it, so the TX indicator
+shows this app's own keying and not a hand on the radio's own PTT.
+
+For any other rig, **☰ ▸ Rig** points the app at hamlib's `rigctld`
 — run `rigctld -m <model> -r <device>` and give it the address. Hamlib will not
 key a rig it has no PTT method for, and says so with "not available on this
 rig"; `--set-conf=ptt_type=RIG` (or `RTS`, or `DTR`) is what it is asking for.

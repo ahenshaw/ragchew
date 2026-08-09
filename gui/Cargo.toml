@@ -43,6 +43,10 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # Reading `pw-dump`, which is how the PipeWire graph is inspected. See
 # `pipewire.rs` for why that is a subprocess rather than libpipewire.
 serde_json = { version = "1", optional = true }
+# Serial ports, for a radio on a cable rather than behind a daemon. `termios`
+# and a handful of constants is all that is wanted, and libc is already in the
+# tree under cpal, so this is a line in a manifest rather than a dependency.
+libc = "0.2"
 # Widget styling for the desktop app: an installable theme that the egui
 # built-ins inherit, plus a few widgets of its own. Pinned to the same egui as
 # eframe pulls in — it tracks egui's release cadence, so a bump here has to move

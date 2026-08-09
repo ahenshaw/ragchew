@@ -2890,6 +2890,7 @@ dependencies = [
  "cpal",
  "eframe",
  "egui-elegance",
+ "libc",
  "png 0.17.16",
  "ragchew",
  "rfd",

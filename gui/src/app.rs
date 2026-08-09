@@ -214,6 +214,10 @@ const VFO_SCALE: f32 = 1.9;
 const TX_RED: Color32 = Color32::from_rgb(255, 60, 60);
 const TX_ELSEWHERE: Color32 = Color32::from_rgb(255, 170, 40);
 
+/// Where a USB serial cable turns up on Linux, which is where an Elecraft
+/// KXUSB lands.
+const DEFAULT_RIG_DEVICE: &str = "/dev/ttyUSB0";
+
 /// Where `rigctld` listens unless told otherwise — hamlib's own default.
 const DEFAULT_RIG_HOST: &str = "127.0.0.1";
 const DEFAULT_RIG_PORT: u16 = 4532;
@@ -833,6 +837,9 @@ struct Settings {
     rig_keying: String,
     rig_host: String,
     rig_port: u16,
+    /// The serial port an Elecraft is on, and the rate its menu is set to.
+    rig_device: String,
+    rig_baud: u32,
 }
 
 impl Default for Settings {
@@ -861,6 +868,8 @@ impl Default for Settings {
             rig_keying: "none".to_string(),
             rig_host: DEFAULT_RIG_HOST.to_string(),
             rig_port: DEFAULT_RIG_PORT,
+            rig_device: DEFAULT_RIG_DEVICE.to_string(),
+            rig_baud: rig::elecraft::KX3_BAUD,
         }
     }
 }
@@ -1536,10 +1545,13 @@ struct App {
     /// never both think they hold the key.
     rig: rig::Keying,
     ptt: Option<rig::Ptt>,
-    /// The daemon's address, kept even while nothing is keying, so that turning
-    /// rig control back on does not ask for it again.
+    /// The daemon's address, and the cable an Elecraft is on, kept even while
+    /// nothing is keying so that turning rig control back on does not ask for
+    /// them again.
     rig_host: String,
     rig_port: u16,
+    rig_device: String,
+    rig_baud: u32,
 
     /// Where the hand has pushed the dial, ahead of the rig.
     ///
@@ -1753,6 +1765,8 @@ impl App {
             ptt: None,
             rig_host: DEFAULT_RIG_HOST.to_string(),
             rig_port: DEFAULT_RIG_PORT,
+            rig_device: DEFAULT_RIG_DEVICE.to_string(),
+            rig_baud: rig::elecraft::KX3_BAUD,
             cursor_hz: None,
             tuning: None,
             dial_pick: 0,
@@ -1788,9 +1802,12 @@ impl App {
             rig_keying: match self.rig {
                 rig::Keying::None => "none".to_string(),
                 rig::Keying::RigCtld { .. } => "rigctld".to_string(),
+                rig::Keying::Elecraft { .. } => "elecraft".to_string(),
             },
             rig_host: self.rig_host.clone(),
             rig_port: self.rig_port,
+            rig_device: self.rig_device.clone(),
+            rig_baud: self.rig_baud,
         }
     }
 
@@ -1816,10 +1833,20 @@ impl App {
         // Anything but the word this build knows leaves the rig alone, which is
         // the setting that touches hardware and so the one to be conservative
         // about: an unreadable file must not leave something keying a radio.
+        if !s.rig_device.trim().is_empty() {
+            self.rig_device = s.rig_device;
+        }
+        if s.rig_baud != 0 {
+            self.rig_baud = s.rig_baud;
+        }
         self.set_keying(match s.rig_keying.as_str() {
             "rigctld" => rig::Keying::RigCtld {
                 host: self.rig_host.clone(),
                 port: self.rig_port,
+            },
+            "elecraft" => rig::Keying::Elecraft {
+                device: self.rig_device.clone(),
+                baud: self.rig_baud,
             },
             _ => rig::Keying::None,
         });
@@ -3867,7 +3894,11 @@ impl App {
                     ui.separator();
                     ui.menu_button("Rig", |ui| {
                         ui.set_min_width(300.0);
-                        let mut pick = usize::from(self.rig != rig::Keying::None);
+                        let mut pick = match self.rig {
+                            rig::Keying::None => 0,
+                            rig::Keying::RigCtld { .. } => 1,
+                            rig::Keying::Elecraft { .. } => 2,
+                        };
                         if ui
                             .add(elegance::SegmentedControl::from_segments(
                                 &mut pick,
@@ -3883,20 +3914,60 @@ impl App {
                                          `--set-conf=ptt_type=RIG` (or RTS, or DTR) if it \
                                          refuses.",
                                     ),
+                                    elegance::Segment::text("Elecraft").hover_text(
+                                        "a KX3 or K3 on a serial cable, spoken to directly — \
+                                         no daemon to run. The rate is whatever the radio's \
+                                         menu says; a KX3 leaves the factory at 38400.",
+                                    ),
                                 ],
                             ))
                             .changed()
                         {
                             let keying = match pick {
-                                0 => rig::Keying::None,
-                                _ => rig::Keying::RigCtld {
+                                1 => rig::Keying::RigCtld {
                                     host: self.rig_host.clone(),
                                     port: self.rig_port,
                                 },
+                                2 => rig::Keying::Elecraft {
+                                    device: self.rig_device.clone(),
+                                    baud: self.rig_baud,
+                                },
+                                _ => rig::Keying::None,
                             };
                             self.set_keying(keying);
                         }
-                        if self.rig != rig::Keying::None {
+                        if matches!(self.rig, rig::Keying::Elecraft { .. }) {
+                            let mut device = self.rig_device.clone();
+                            let mut baud = self.rig_baud;
+                            ui.horizontal(|ui| {
+                                ui.label("port");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut device).desired_width(150.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("baud");
+                                for rate in [4800u32, 9600, 19200, 38400] {
+                                    if ui.selectable_label(baud == rate, rate.to_string()).clicked()
+                                    {
+                                        baud = rate;
+                                    }
+                                }
+                            });
+                            // Rebuilt on any edit, which closes the old port on
+                            // the way past — see the note below about half-typed
+                            // addresses; a half-typed device name is the same
+                            // thing.
+                            if device != self.rig_device || baud != self.rig_baud {
+                                self.rig_device = device;
+                                self.rig_baud = baud;
+                                self.set_keying(rig::Keying::Elecraft {
+                                    device: self.rig_device.clone(),
+                                    baud: self.rig_baud,
+                                });
+                            }
+                        }
+                        if matches!(self.rig, rig::Keying::RigCtld { .. }) {
                             let mut host = self.rig_host.clone();
                             let mut port = self.rig_port;
                             ui.horizontal(|ui| {
@@ -3918,6 +3989,8 @@ impl App {
                                 });
                             }
 
+                        }
+                        if self.rig != rig::Keying::None {
                             let st = self.ptt_state();
                             match (&st.fault, st.linked) {
                                 (Some(f), _) => {
@@ -4791,6 +4864,8 @@ mod tests {
         app.fade_secs = 3.5;
         app.rig_host = "radio.local".to_string();
         app.rig_port = 4599;
+        app.rig_device = "/dev/ttyUSB3".to_string();
+        app.rig_baud = 9600;
         app.set_keying(rig::Keying::RigCtld { host: "radio.local".into(), port: 4599 });
         app.set_view(1200.0, 1400.0);
         for (m, on) in app.modes.iter_mut() {
@@ -4819,6 +4894,10 @@ mod tests {
             "the rig came back as something else"
         );
         assert!(restored.ptt.is_some(), "restored a rig with nobody supervising it");
+        // The cable is remembered even while the daemon is the one in use, so
+        // that switching back does not ask for it again.
+        assert_eq!(restored.rig_device, "/dev/ttyUSB3");
+        assert_eq!(restored.rig_baud, 9600);
         assert_eq!(restored.enabled_modes(), app.enabled_modes());
         assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
     }
@@ -5963,6 +6042,26 @@ mod tests {
         assert!(
             !in_the_status_bar(&out).iter().any(|s| s.ends_with(" Hz")),
             "the bar answered where there was nothing to answer"
+        );
+    }
+
+    /// A radio on a cable is remembered as one.
+    #[test]
+    fn an_elecraft_on_a_cable_survives_a_restart() {
+        let mut app = App::base((0.0, 4000.0));
+        app.rig_device = "/dev/ttyUSB1".to_string();
+        app.rig_baud = 38400;
+        app.set_keying(rig::Keying::Elecraft {
+            device: "/dev/ttyUSB1".into(),
+            baud: 38400,
+        });
+        let text = serde_json::to_string(&app.settings()).unwrap();
+
+        let mut restored = App::base((0.0, 4000.0));
+        restored.apply(serde_json::from_str(&text).unwrap());
+        assert_eq!(
+            restored.rig,
+            rig::Keying::Elecraft { device: "/dev/ttyUSB1".into(), baud: 38400 }
         );
     }
 
