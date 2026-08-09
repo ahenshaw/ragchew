@@ -3266,17 +3266,48 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
-        let samples = tx::modulate(&text, q.hz, q.mode);
+        let (samples, spans) = tx::modulate_spans(&text, q.hz, q.mode);
         // Behind anything already going out, on that mode's next boundary.
         let busy_until = self.tx.as_ref().map_or(0.0, |t| unix_now() + t.busy_for());
         let at = tx::next_start_after(q.mode, busy_until);
+        let (hz, mode) = (q.hz, q.mode);
+
+        // Fail closed. Audio into a rig that did not key is silence at best,
+        // and on a station left on VOX it is a transmission nobody asked this
+        // app to make, out of a path the operator believed was under control.
+        let keying = self.ptt.as_ref().map(|p| p.state());
+        if let Some(st) = keying.filter(|st| !st.linked && st.fault.is_some()) {
+            let why = st.fault.unwrap_or_default();
+            self.warn(format!("not transmitting: {why}"));
+            return;
+        }
+
+        let text_for_log = text.clone();
         q.draft.clear();
         q.push_tx(&text, now_s);
+        let mut queued = None;
         if let Some(t) = self.tx.as_mut() {
-            let end = t.send(samples, at);
+            queued = Some(t.send(samples, at));
+        }
+        if let Some(end) = queued {
             // The outgoing pane keeps it until the whole queue has gone,
             // striking it through as it leaves.
-            q.outgoing.push(crate::qso::Outgoing { text, start_unix: at, end_unix: end });
+            if let Some(q) = self.qsos.active_qso_mut() {
+                q.outgoing.push(crate::qso::Outgoing {
+                    text: text_for_log,
+                    start_unix: at,
+                    end_unix: end,
+                });
+            }
+            // One key-down per burst, never one across the whole message: the
+            // silence between JS8 frames is seconds long and a key held across
+            // it is a bare carrier for as long as the frames either side.
+            if let Some(link) = &self.ptt {
+                for (on, off) in tx::key_spans(at, &spans, tx::KEY_LEAD_S, tx::KEY_TAIL_S) {
+                    link.schedule(on, off);
+                }
+            }
+            let _ = (hz, mode);
         }
         self.status = None;
     }
@@ -6308,6 +6339,49 @@ mod tests {
         fn describe(&self) -> String {
             "a dial".to_string()
         }
+    }
+
+    /// Nothing goes on the air through a rig that is not answering.
+    ///
+    /// Audio into a rig that did not key is silence at best; on a station left
+    /// on VOX it is a transmission nobody asked this app to make, out of a path
+    /// the operator believed was under control. So a link that has failed stops
+    /// the transmission and says why, rather than playing into the dark.
+    #[test]
+    fn a_rig_that_is_not_answering_stops_the_transmission() {
+        let mut app = app_with_a_waterfall(30.0);
+        // A daemon that is not there: the link faults on its first exchange.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        app.rig = rig::Keying::RigCtld { host: "127.0.0.1".into(), port };
+        app.ptt = Some(rig::Ptt::with_transmitter(
+            Box::new(rig::RigCtld::new("127.0.0.1", port).with_timeout(std::time::Duration::from_millis(50))),
+            rig::Limits::default(),
+        ));
+        let began = std::time::Instant::now();
+        while app.ptt_state().fault.is_none() {
+            assert!(began.elapsed() < std::time::Duration::from_secs(2), "no fault was reported");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let channels = app.channels_now();
+        app.qsos.open_for_channel(&channels.channels()[0], app.t_now);
+        if let Some(q) = app.qsos.active_qso_mut() {
+            q.draft = "CQ DE W1AW K".to_string();
+        }
+        app.send_active(app.t_now);
+
+        assert!(app.tx.is_none() || app.tx.as_ref().is_some_and(|t| t.busy_for() == 0.0),
+            "audio was queued into a rig that is not answering");
+        let said = app.status.as_ref().map(|n| n.text.clone()).unwrap_or_default();
+        assert!(said.contains("not transmitting"), "said nothing useful: {said:?}");
+        assert!(
+            app.qsos.active_qso_mut().is_some_and(|q| q.outgoing.is_empty()),
+            "logged an outgoing transmission that never went"
+        );
     }
 
     /// The button stops a transmission it did not start.

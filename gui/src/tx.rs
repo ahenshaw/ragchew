@@ -55,9 +55,26 @@ fn unix_now() -> f64 {
 /// structure: the whole message is one continuous transmission however long it
 /// is, idle either side of it in PSK31's case.
 pub fn modulate(text: &str, hz: f64, mode: ModeId) -> Vec<f32> {
+    modulate_spans(text, hz, mode).0
+}
+
+/// The same, and where in it the signal actually is: `(from, to)` in seconds
+/// from the start, one pair per burst.
+///
+/// The gaps matter to anything holding a transmitter down. A JS8 message too
+/// long for one frame is a sequence of them a cycle apart, and the silence in
+/// between is not small — four seconds in Slow, near two in the others — so a
+/// key held across the whole buffer is a bare carrier on the air for as long
+/// again as the frames it separates. Olivia and PSK31 have one span each, being
+/// one transmission however long.
+pub fn modulate_spans(text: &str, hz: f64, mode: ModeId) -> (Vec<f32>, Vec<(f64, f64)>) {
+    let whole = |a: Vec<f32>| {
+        let secs = a.len() as f64 / RATE as f64;
+        (a, vec![(0.0, secs)])
+    };
     match mode {
-        ModeId::Olivia(m) => olivia::encode(text, hz, m),
-        ModeId::Psk(m) => psk::encode(text, hz, m),
+        ModeId::Olivia(m) => whole(olivia::encode(text, hz, m)),
+        ModeId::Psk(m) => whole(psk::encode(text, hz, m)),
         ModeId::Js8(m) => {
             let sm = submode::of(m);
             let period = sm.period_s as usize * RATE as usize;
@@ -84,6 +101,7 @@ pub fn modulate(text: &str, hz: f64, mode: ModeId) -> Vec<f32> {
             }
 
             let mut out: Vec<f32> = Vec::new();
+            let mut spans: Vec<(f64, f64)> = Vec::new();
             for (cycle, part) in parts.iter().enumerate() {
                 // The end of an over is the receiving station's only reliable
                 // sign that we have finished talking — JS8Call draws it, and
@@ -102,11 +120,30 @@ pub fn modulate(text: &str, hz: f64, mode: ModeId) -> Vec<f32> {
                     out.resize(start + burst.len(), 0.0);
                 }
                 out[start..start + burst.len()].copy_from_slice(&burst);
+                spans.push((
+                    start as f64 / RATE as f64,
+                    (start + burst.len()) as f64 / RATE as f64,
+                ));
             }
-            out
+            (out, spans)
         }
     }
 }
+
+/// When the key must be down for a transmission starting at `at`, given where
+/// its bursts are.
+///
+/// The lead and the tail are the whole of it: a rig wants the key down before
+/// the audio and up after it, and how long before depends on the rig rather
+/// than on us.
+pub fn key_spans(at: f64, spans: &[(f64, f64)], lead: f64, tail: f64) -> Vec<(f64, f64)> {
+    spans.iter().map(|(from, to)| (at + from - lead, at + to + tail)).collect()
+}
+
+/// How long the key goes down before the audio starts, and stays down after it
+/// ends. A tenth of a second either side covers a relay and a linear.
+pub const KEY_LEAD_S: f64 = 0.1;
+pub const KEY_TAIL_S: f64 = 0.1;
 
 /// When a transmission in `mode` may start, in UTC seconds.
 ///
@@ -372,6 +409,65 @@ mod tests {
             got.replace("<>", "").trim() == text,
             "went out as {text:?}, came back as {got:?}"
         );
+    }
+
+    /// A key-down per burst, bracketing the audio — and for JS8, one per
+    /// frame rather than one across the message.
+    ///
+    /// The gaps are the point: a JS8 Slow message leaves four seconds of
+    /// silence between frames, and a key held across it puts a bare carrier on
+    /// the air for that long, every cycle.
+    #[test]
+    fn the_key_goes_down_around_each_burst_and_not_between_them() {
+        let mode = ModeId::Js8(ragchew::js8::Mode::Normal);
+        let text = "CQ CQ DE W1AW W1AW K THE STATION HERE IS RUNNING FIFTY WATTS TO A WIRE \
+                    AND THE WEATHER IS FINE";
+        let (audio, spans) = modulate_spans(text, 1500.0, mode);
+        assert!(spans.len() > 1, "the test message fits in one frame; it proves nothing");
+
+        let period = 15.0;
+        for (i, (from, to)) in spans.iter().enumerate() {
+            // Each frame sits half a second into its own cycle.
+            assert!(
+                (from - (i as f64 * period + JS8_CYCLE_OFFSET_S)).abs() < 1e-6,
+                "frame {i} starts at {from}, not on its cycle"
+            );
+            assert!(to > from, "frame {i} has no length");
+            if i > 0 {
+                let gap = from - spans[i - 1].1;
+                assert!(gap > 1.0, "only {gap:.2}s between frames {} and {i}", i - 1);
+            }
+        }
+        // And the audio is as long as the last frame, not longer.
+        let secs = audio.len() as f64 / RATE as f64;
+        assert!((secs - spans.last().unwrap().1).abs() < 0.01, "{secs} of audio for {spans:?}");
+
+        // The key brackets each of them, and lets go in between.
+        let at = 1_000_000.0;
+        let keys = key_spans(at, &spans, KEY_LEAD_S, KEY_TAIL_S);
+        assert_eq!(keys.len(), spans.len(), "one key-down per burst");
+        for ((on, off), (from, to)) in keys.iter().zip(&spans) {
+            assert!((on - (at + from - KEY_LEAD_S)).abs() < 1e-9, "keyed late");
+            assert!((off - (at + to + KEY_TAIL_S)).abs() < 1e-9, "unkeyed early");
+        }
+        for pair in keys.windows(2) {
+            assert!(pair[1].0 > pair[0].1, "the key never came up between frames");
+        }
+    }
+
+    /// A continuous mode is one burst however long it runs.
+    #[test]
+    fn a_continuous_transmission_is_one_key_down() {
+        for mode in [
+            ModeId::Olivia(ragchew::olivia::OL_8_250),
+            ModeId::Psk(ragchew::psk::PSK31),
+        ] {
+            let (audio, spans) = modulate_spans("CQ DE W1AW K", 1500.0, mode);
+            assert_eq!(spans.len(), 1, "{} broke into bursts", mode.name());
+            assert_eq!(spans[0].0, 0.0);
+            let secs = audio.len() as f64 / RATE as f64;
+            assert!((spans[0].1 - secs).abs() < 1e-9, "{} span is not the whole of it", mode.name());
+        }
     }
 
     #[test]

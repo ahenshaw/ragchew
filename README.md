@@ -156,6 +156,14 @@ assumed — and a rig that cannot answer, which is any station keying over RTS
 with no CAT read-back, is asked once and then left alone rather than treated as
 broken. Nothing keys unless you configure it: the default is no keying at all.
 
+**Send** keys the rig itself once one is configured: the key goes down a
+tenth of a second before the audio and comes up a tenth after it, and a JS8
+message that runs to several frames gets a key-down *each*, since the silence
+between frames is seconds long and a key held across it is a bare carrier. If
+the rig is not answering, the transmission does not go out at all and the
+status bar says why — audio into a rig that did not key is silence at best, and
+on a station left on VOX it is a transmission nobody asked for.
+
 A key-down is always followed by a key-up. One is forced if a transmission
 outlasts its limit, if the app exits, or if the thread doing the keying comes
 apart — the last of those by unwinding through the code that unkeys, since that
