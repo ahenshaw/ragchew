@@ -137,6 +137,7 @@ pub(crate) const KEYING: &str = "key";
 pub(crate) const READING_PTT: &str = "say whether it is transmitting";
 pub(crate) const READING_DIAL: &str = "say what it is tuned to";
 pub(crate) const TUNING: &str = "tune";
+pub(crate) const SETTING_MODE: &str = "change mode";
 
 /// Something that can put a transmitter on the air.
 pub trait Transmitter: Send {
@@ -167,6 +168,12 @@ pub trait Transmitter: Send {
     /// means, which is the rig's business and not this app's.
     fn dial_mode(&mut self) -> Result<Option<String>, Fault> {
         Ok(None)
+    }
+
+    /// Put it in `mode`, which must be one of [`Transmitter::modes`].
+    fn set_mode(&mut self, mode: &str) -> Result<(), Fault> {
+        let _ = mode;
+        Err(Fault::Rejected { doing: SETTING_MODE, code: -4 })
     }
 
     /// What this is, for the log and the settings menu.
@@ -366,6 +373,15 @@ impl Transmitter for RigCtld {
         RigCtld::expect_rprt(&answer, TUNING)
     }
 
+    fn set_mode(&mut self, mode: &str) -> Result<(), Fault> {
+        // Zero for the passband, which hamlib reads as "whatever the rig
+        // already has". Choosing one here would mean this app deciding how wide
+        // a station's receiver should be, which is not its business and is a
+        // setting the operator has already made on the radio.
+        let answer = self.ask(&format!("M {mode} 0"))?;
+        RigCtld::expect_rprt(&answer, SETTING_MODE)
+    }
+
     fn dial_mode(&mut self) -> Result<Option<String>, Fault> {
         // Mode then passband, on two lines. The passband is the rig's own
         // business; what is worth showing is which sideband it is in.
@@ -392,6 +408,24 @@ impl Transmitter for RigCtld {
 /// situation, so both count.
 fn timed_out(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+}
+
+/// The modes a rig of this kind will answer to, in the words it uses for them.
+///
+/// A property of the kind rather than of an open link, so that a menu can be
+/// drawn without opening a serial port to ask — which for a radio on a cable
+/// would mean touching the hardware to populate a list.
+pub fn modes_for(keying: &Keying) -> &'static [&'static str] {
+    match keying {
+        Keying::None => &[],
+        // Hamlib's own names. The data modes are the ones this app is for, so
+        // they lead; the rest are here because an operator who wants to drop to
+        // CW should not have to reach for the radio.
+        Keying::RigCtld { .. } => {
+            &["PKTUSB", "PKTLSB", "USB", "LSB", "CW", "CWR", "RTTY", "RTTYR", "AM", "FM"]
+        }
+        Keying::Elecraft { .. } => elecraft::MODES,
+    }
 }
 
 /// Build the transmitter a setting asks for.
@@ -501,6 +535,8 @@ enum Cmd {
     Cancel,
     /// Tune to this many Hz.
     Tune(f64),
+    /// Change mode.
+    Mode(String),
 }
 
 /// A transmitter under supervision.
@@ -560,6 +596,12 @@ impl Ptt {
     /// answer, never this app's intention.
     pub fn tune(&self, hz: f64) {
         self.tell(Cmd::Tune(hz));
+    }
+
+    /// Put the rig in `mode`. As with tuning, what the interface shows follows
+    /// from the next reading rather than from this.
+    pub fn set_mode(&self, mode: &str) {
+        self.tell(Cmd::Mode(mode.to_string()));
     }
 
     /// Say something to the worker, or say nothing at all: a worker that has
@@ -660,6 +702,7 @@ impl Session {
                     self.set(on);
                 }
                 Ok(Cmd::Span(s)) => self.queued.push(s),
+                Ok(Cmd::Mode(mode)) => self.set_mode(&mode),
                 Ok(Cmd::Tune(hz)) => {
                     // Only the last one. A hand on a wheel outruns a CAT link
                     // at 4800 baud by a wide margin, and a queue of frequencies
@@ -715,6 +758,7 @@ impl Session {
                 }
             }
             Cmd::Tune(hz) => self.tune(hz),
+            Cmd::Mode(mode) => self.set_mode(&mode),
         }
     }
 
@@ -809,6 +853,21 @@ impl Session {
                 st.linked = true;
                 st.fault = None;
                 // Ask again promptly rather than waiting out the slow beat.
+                self.next_dial = std::time::Instant::now();
+            }
+            Err(e) => self.no_link(e),
+        }
+    }
+
+    /// Change mode, and ask what it is straight afterwards rather than
+    /// assuming: a rig that declines must not leave the wrong word on screen.
+    fn set_mode(&mut self, mode: &str) {
+        match self.tx.set_mode(mode) {
+            Ok(()) => {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.linked = true;
+                st.fault = None;
+                drop(st);
                 self.next_dial = std::time::Instant::now();
             }
             Err(e) => self.no_link(e),
@@ -923,9 +982,11 @@ mod tests {
         heard: Arc<Mutex<Vec<String>>>,
         /// What it would tell you its PTT is doing.
         ptt: Arc<AtomicBool>,
-        /// And where it is tuned, in Hz — a real daemon answers `f` and `m`
-        /// whether or not anyone asked it to key, so this one must too.
+        /// And where it is tuned, in Hz, and the mode it is in — a real daemon
+        /// answers `f` and `m` whether or not anyone asked it to key, so this
+        /// one must too.
         dial: Arc<Mutex<f64>>,
+        mode: Arc<Mutex<String>>,
         /// Answer the next command with this hamlib code instead of obeying.
         reject: Arc<Mutex<Option<i32>>>,
         /// Refuse to say what the PTT is doing, for ever — which is what
@@ -947,6 +1008,7 @@ mod tests {
                 heard: Arc::new(Mutex::new(Vec::new())),
                 ptt: Arc::new(AtomicBool::new(false)),
                 dial: Arc::new(Mutex::new(14_074_000.0)),
+                mode: Arc::new(Mutex::new("PKTUSB".to_string())),
                 reject: Arc::new(Mutex::new(None)),
                 deny_reads: Arc::new(AtomicBool::new(false)),
                 deaf: Arc::new(AtomicBool::new(false)),
@@ -954,6 +1016,7 @@ mod tests {
             };
             let (heard, ptt) = (rig.heard.clone(), rig.ptt.clone());
             let dial = rig.dial.clone();
+            let mode = rig.mode.clone();
             let (reject, deaf) = (rig.reject.clone(), rig.deaf.clone());
             let deny_reads = rig.deny_reads.clone();
             let drop_after = rig.drop_after.clone();
@@ -989,7 +1052,16 @@ mod tests {
                                 "f" => format!("{:.0}\n", dial.lock().unwrap()),
                                 // Mode then passband, on two lines, which is
                                 // the shape that catches a client reading one.
-                                "m" => "PKTUSB\n3000\n".to_string(),
+                                "m" => format!("{}\n3000\n", mode.lock().unwrap()),
+                                c if c.starts_with("M ") => {
+                                    match c[2..].split_whitespace().next() {
+                                        Some(name) => {
+                                            *mode.lock().unwrap() = name.to_string();
+                                            "RPRT 0\n".to_string()
+                                        }
+                                        None => "RPRT -1\n".to_string(),
+                                    }
+                                }
                                 c if c.starts_with("F ") => {
                                     match c[2..].trim().parse::<f64>() {
                                         Ok(hz) => {
@@ -1025,6 +1097,9 @@ mod tests {
         }
         fn tuned_to(&self) -> f64 {
             *self.dial.lock().unwrap()
+        }
+        fn mode(&self) -> String {
+            self.mode.lock().unwrap().clone()
         }
     }
 
@@ -1449,6 +1524,35 @@ mod tests {
             "the reading did not follow the rig"
         );
         assert_eq!(ptt.state().fault, None);
+    }
+
+    /// Changing mode is a command the rig answers, and the reading is asked
+    /// for again rather than assumed.
+    #[test]
+    fn the_mode_can_be_changed() {
+        let rig = FakeRig::start();
+        let mut tx = rig.client();
+        tx.set_mode("CW").expect("could not set the mode");
+        assert_eq!(rig.heard(), ["M CW 0"], "spoke a protocol rigctld does not");
+        assert_eq!(rig.mode(), "CW", "the rig did not change mode");
+        assert_eq!(tx.dial_mode(), Ok(Some("CW".to_string())), "the reading did not follow");
+    }
+
+    /// Every mode offered for a rig is one that rig will take.
+    #[test]
+    fn the_modes_offered_are_the_ones_the_rig_knows() {
+        let daemon = Keying::RigCtld { host: "x".into(), port: 1 };
+        assert!(modes_for(&daemon).contains(&"PKTUSB"), "no data mode for a data monitor");
+        assert!(modes_for(&Keying::None).is_empty(), "offered modes with no rig");
+
+        // An Elecraft's list is the one its own protocol has digits for.
+        let elecraft = Keying::Elecraft { device: "x".into(), baud: 38400 };
+        for name in modes_for(&elecraft) {
+            assert!(
+                elecraft::mode_digit(name).is_some(),
+                "{name} is offered and the radio has no digit for it"
+            );
+        }
     }
 
     /// A daemon that is not there does not become a busy loop against it, and

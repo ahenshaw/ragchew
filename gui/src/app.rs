@@ -1566,6 +1566,10 @@ struct App {
     /// the keys put it there. See [`App::vfo`].
     dial_pick: usize,
     dial_by_key: Option<Pos2>,
+    /// Whether the list of modes is showing, which it does while the pointer is
+    /// on the mode or in the list itself.
+    mode_menu: bool,
+
     /// Whether the dial has the keyboard.
     ///
     /// Kept here rather than left to egui's focus, which drops a widget that
@@ -1772,6 +1776,7 @@ impl App {
             dial_pick: 0,
             dial_by_key: None,
             dial_typing: false,
+            mode_menu: false,
             file_set: ChannelSet::new(15.0),
             fed_frames: 0,
             frames_dirty: false,
@@ -2159,14 +2164,54 @@ impl App {
         let origin = egui::pos2(rect.right() - 10.0 - galley.size().x, rect.center().y - digit_h / 2.0);
         painter.galley(origin, galley.clone(), amber);
 
-        // MHz, small, hard against the digits — a rig labels its dial.
-        painter.text(
-            egui::pos2(rect.left() + 10.0, rect.center().y),
+        // The mode, small and hard against the left, the way a rig labels its
+        // own dial — and a control: point at it and the radio's modes drop out
+        // of it, click one and the radio changes.
+        let mode_font = FontId::monospace(self.text_px * 0.85);
+        let showing = st.dial_mode.clone().unwrap_or_default();
+        let mode_at = egui::pos2(rect.left() + 10.0, rect.center().y);
+        let mode_box = painter.text(
+            mode_at,
             egui::Align2::LEFT_CENTER,
-            st.dial_mode.clone().unwrap_or_default(),
-            FontId::monospace(self.text_px * 0.85),
+            &showing,
+            mode_font.clone(),
             VFO_AMBER.gamma_multiply(0.75),
         );
+        let choices = rig::modes_for(&self.rig);
+        if !choices.is_empty() && !showing.is_empty() {
+            // A little room around the word, so pointing at it is not a matter
+            // of hitting eight characters exactly.
+            let hot = mode_box.expand2(egui::vec2(4.0, 3.0));
+            let over_word = ui.interact(hot, dial_id.with("mode"), egui::Sense::click()).hovered();
+            // Kept open while the pointer is on the word *or* in the list.
+            // Without the second half, reaching for a mode dismisses the list
+            // on the way — the same trap the digit arrows fell into.
+            let open = over_word || self.mode_menu;
+            self.mode_menu = false;
+            if open {
+                painter.rect_filled(hot, 2.0, VFO_AMBER.gamma_multiply(0.16));
+                let area = egui::Area::new(dial_id.with("modes"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(hot.left(), hot.bottom() + 1.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style()).fill(VFO_BLACK).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            for name in choices {
+                                let here = showing == *name;
+                                let label = egui::RichText::new(*name)
+                                    .font(mode_font.clone())
+                                    .color(if here { VFO_AMBER } else { VFO_AMBER.gamma_multiply(0.7) });
+                                if ui.selectable_label(here, label).clicked() {
+                                    if let Some(link) = &self.ptt {
+                                        link.set_mode(name);
+                                    }
+                                }
+                            }
+                        });
+                    });
+                self.mode_menu = area.response.hovered() || over_word;
+            }
+        }
 
         // Every digit is its own control, worth its own place value: the one
         // under the pointer is the one that moves, which is how a rig with a

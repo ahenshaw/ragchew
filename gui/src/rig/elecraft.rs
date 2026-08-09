@@ -25,7 +25,13 @@
 
 use std::io::{Read, Write};
 
-use super::{Fault, Transmitter, KEYING, READING_DIAL, READING_PTT, TUNING};
+use super::{Fault, Transmitter, KEYING, READING_DIAL, READING_PTT, SETTING_MODE, TUNING};
+
+/// The modes an Elecraft will answer to, in the words this app shows.
+///
+/// Elecraft numbers them on the wire; these are the names, and `DATA` is the
+/// one a station working these modes lives in.
+pub const MODES: &[&str] = &["DATA", "DATA-REV", "USB", "LSB", "CW", "CW-REV", "AM", "FM"];
 
 /// What a KX3 is set to when it leaves Elecraft.
 pub const KX3_BAUD: u32 = 38400;
@@ -138,6 +144,21 @@ fn mode_name(digit: char) -> &'static str {
     }
 }
 
+/// The digit Elecraft wants for a mode this app names.
+pub(super) fn mode_digit(name: &str) -> Option<char> {
+    Some(match name {
+        "LSB" => '1',
+        "USB" => '2',
+        "CW" => '3',
+        "FM" => '4',
+        "AM" => '5',
+        "DATA" => '6',
+        "CW-REV" => '7',
+        "DATA-REV" => '9',
+        _ => return None,
+    })
+}
+
 impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
     fn key(&mut self, on: bool) -> Result<(), Fault> {
         // Neither is answered, so neither is read back. The rig is asked what
@@ -150,17 +171,9 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
 
     /// Not yet: this radio is told, not asked.
     ///
-    /// Elecraft carries the transmit state inside the `IF` record, which is a
-    /// fixed-width thing whose exact layout I have not been able to check
-    /// against a radio — and a transmit indicator read out of the wrong column
-    /// is worse than none, since the whole point of asking is to catch a rig
-    /// keyed by something other than this app. `None` is the honest answer: it
-    /// means "cannot be asked", the interface already draws that, and keying,
-    /// tuning and mode are unaffected.
-    ///
-    /// Finishing it needs one line from a real KX3 — `IF;` sent to the port and
-    /// the record it answers with, once receiving and once transmitting — and
-    /// then it is a character index and a test with those two strings in it.
+    /// Elecraft carries the transmit state inside the `IF` record, whose exact
+    /// layout wants checking against a radio before anything is read out of it.
+    /// `None` means "cannot be asked", which the interface already draws.
     fn keyed(&mut self) -> Result<Option<bool>, Fault> {
         let _ = READING_PTT;
         Ok(None)
@@ -190,6 +203,16 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
             Some(digit) => Ok(Some(mode_name(digit).to_string())),
             None => Err(Fault::Protocol(format!("expected an MD record, got {answer:?}"))),
         }
+    }
+
+    fn set_mode(&mut self, mode: &str) -> Result<(), Fault> {
+        // A word this radio has no digit for is refused rather than sent: `MD;`
+        // with nonsense after it is a command the radio ignores silently, which
+        // would read here as a mode change that worked and did nothing.
+        let Some(digit) = mode_digit(mode) else {
+            return Err(Fault::Rejected { doing: SETTING_MODE, code: -1 });
+        };
+        self.tell(&format!("MD{digit};"))
     }
 
     fn describe(&self) -> String {
@@ -285,6 +308,25 @@ mod tests {
             let bench = Bench::answering(&format!("MD{digit};"));
             assert_eq!(bench.rig().dial_mode(), Ok(Some(name.to_string())), "MD{digit}");
         }
+    }
+
+    /// Setting a mode is the digit the radio wants, and a word it has no digit
+    /// for is refused rather than sent — `MD` with nonsense after it is a
+    /// command the radio ignores in silence, which would read here as a change
+    /// that worked and did nothing.
+    #[test]
+    fn the_mode_goes_out_as_the_radios_own_digit() {
+        let bench = Bench::default();
+        bench.rig().set_mode("DATA").expect("could not set the mode");
+        assert_eq!(bench.heard(), "AI0;MD6;");
+
+        let bench = Bench::default();
+        assert!(matches!(
+            bench.rig().set_mode("PKTUSB"),
+            Err(Fault::Rejected { doing: SETTING_MODE, .. })
+        ));
+        // Nothing at all: the word is refused before the port is even greeted.
+        assert_eq!(bench.heard(), "", "sent a mode the radio has no digit for");
     }
 
     /// A radio that says nothing is a fault, not an empty answer.

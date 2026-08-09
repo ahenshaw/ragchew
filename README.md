@@ -105,8 +105,9 @@ actually go — while **Esc**, or clicking away, puts back whatever the rig says
 Steps made with the wheel or the arrows need no Enter: each one is complete in
 itself, and reaching for the mouse mid-entry consolidates what you had typed
 and sends it.
-What it shows is what the rig reports — turn the knob on the radio and the
-digits follow — except while the wheel is being turned, when they follow the
+Point at the mode beside the digits and the radio's own modes drop out of it —
+click one and the rig changes to it. What it shows is what the rig reports —
+turn the knob on the radio and the digits follow — except while the wheel is being turned, when they follow the
 hand and hand back a second after it stops.
 
 A band left running fills up with conversations that finished an hour ago, so
