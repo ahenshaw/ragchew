@@ -142,11 +142,9 @@ on a USB codec (or VOX) needs.
 
 An **Elecraft** KX3 or K3 needs no daemon at all: **☰ ▸ Rig ▸ Elecraft**, the
 serial port the cable is on, and the rate the radio's menu is set to (38400
-from the factory). It keys, tunes and reads the frequency and mode over that one
-cable. What it does not do yet is *read back* whether the radio is
-transmitting — that lives in Elecraft's `IF` record, whose layout wants checking
-against a real radio before anything is read out of it, so the TX indicator
-shows this app's own keying and not a hand on the radio's own PTT.
+from the factory). It keys, tunes, reads the frequency and mode, and reads back whether the radio
+is transmitting — so a hand on the radio's own PTT shows on the TX button the
+same as one on the app's.
 
 For any other rig, **☰ ▸ Rig** points the app at hamlib's `rigctld`
 — run `rigctld -m <model> -r <device>` and give it the address. Hamlib will not

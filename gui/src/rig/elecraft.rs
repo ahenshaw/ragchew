@@ -159,6 +159,33 @@ pub(super) fn mode_digit(name: &str) -> Option<char> {
     })
 }
 
+/// Whether an `IF` record says the radio is transmitting.
+///
+/// `IF` is Elecraft's everything-at-once answer, 38 characters wide, and the
+/// transmit flag is one of them. Counted from the end, because everything after
+/// the flag is fixed while what comes before it is not: the eleven digits of
+/// VFO A are the same width on a KX3 and a K3, but nothing is gained by
+/// assuming that when the tail can be counted instead.
+///
+/// From a KX3, receiving on 14.070:
+///
+/// ```text
+/// IF00014070000     -000000 0002000001 ;
+///                                └ transmit flag, ninth from the end
+/// ```
+///
+/// A record that is not the shape this expects gives `None` rather than a
+/// guess — the whole reason for asking is to catch a rig keyed by something
+/// other than this app, and an indicator reading the wrong column would invent
+/// exactly that.
+fn transmitting_in(body: &str) -> Option<bool> {
+    match body.chars().rev().nth(8) {
+        Some('0') => Some(false),
+        Some('1') => Some(true),
+        _ => None,
+    }
+}
+
 impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
     fn key(&mut self, on: bool) -> Result<(), Fault> {
         // Neither is answered, so neither is read back. The rig is asked what
@@ -169,14 +196,16 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
         })
     }
 
-    /// Not yet: this radio is told, not asked.
-    ///
-    /// Elecraft carries the transmit state inside the `IF` record, whose exact
-    /// layout wants checking against a radio before anything is read out of it.
-    /// `None` means "cannot be asked", which the interface already draws.
     fn keyed(&mut self) -> Result<Option<bool>, Fault> {
-        let _ = READING_PTT;
-        Ok(None)
+        let answer = self.ask("IF;")?;
+        let Some(body) = answer.strip_prefix("IF") else {
+            return Err(Fault::Protocol(format!(
+                "{READING_PTT}: expected an IF record, got {answer:?}"
+            )));
+        };
+        // A record this cannot read is one it will not guess at: `None` means
+        // "cannot be asked", which the rest of the app already draws.
+        Ok(transmitting_in(body))
     }
 
     fn dial_hz(&mut self) -> Result<Option<f64>, Fault> {
@@ -327,6 +356,48 @@ mod tests {
         ));
         // Nothing at all: the word is refused before the port is even greeted.
         assert_eq!(bench.heard(), "", "sent a mode the radio has no digit for");
+    }
+
+    /// The transmit flag, out of a pair of records a real KX3 sent.
+    ///
+    /// The one field here read by position rather than by what was sent, so it
+    /// is pinned by example and not by a layout I typed out — an earlier
+    /// attempt at this checked a parser against a record I had invented myself,
+    /// which agreed with itself and proved nothing.
+    ///
+    /// The pair is what makes it evidence. A receiving record alone cannot tell
+    /// the right column from a neighbouring zero; these two differ in exactly
+    /// one place outside the frequency, and it is the place this reads.
+    #[test]
+    fn the_if_record_says_whether_it_is_transmitting() {
+        // Captured from a KX3, receiving on 14.070 and transmitting on 14.078.
+        let rx = "IF00014070000     -000000 0002000001 ";
+        let tx = "IF00014078000     -000000 0012000001 ";
+        let bench = Bench::answering(&format!("{rx};"));
+        assert_eq!(bench.rig().keyed(), Ok(Some(false)), "read a receiving radio as keyed");
+        let bench = Bench::answering(&format!("{tx};"));
+        assert_eq!(bench.rig().keyed(), Ok(Some(true)), "read a transmitting radio as receiving");
+
+        // Aligned, not merely different: outside the frequency the two records
+        // differ in exactly one column, and it is the one being read. Without
+        // this the test would pass just as well on a flag found by luck.
+        let (rx_body, tx_body) = (&rx[2..], &tx[2..]);
+        let differing: Vec<usize> = rx_body
+            .char_indices()
+            .zip(tx_body.chars())
+            .filter(|((_, a), b)| a != b)
+            .map(|((i, _), _)| i)
+            .filter(|i| *i >= 11) // the frequency is theirs to differ in
+            .collect();
+        assert_eq!(differing, [26], "the records differ somewhere unexpected: {differing:?}");
+        assert_eq!(rx_body.len() - 1 - 26, 8, "the column is not where this reads it");
+
+        // A record of another shape is not guessed at.
+        let bench = Bench::answering("IF123;");
+        assert_eq!(bench.rig().keyed(), Ok(None));
+        // And something that is not an IF record at all is a fault.
+        let bench = Bench::answering("MD6;");
+        assert!(matches!(bench.rig().keyed(), Err(Fault::Protocol(_))));
     }
 
     /// A radio that says nothing is a fault, not an empty answer.
