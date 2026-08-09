@@ -108,6 +108,107 @@ const ROW_MEMORY_S: f64 = 120.0;
 /// sees.
 const ROW_BLINK_S: f64 = 0.5;
 
+/// A frequency the hand has asked for, on its way to the rig.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Tuning {
+    hz: f64,
+    /// When it was last touched, on the wall clock.
+    at: f64,
+    /// Whether the rig has been told.
+    ///
+    /// A step of the wheel or an arrow is a whole intent and goes out as it is
+    /// made. A typed number is not: entered a digit at a time it passes through
+    /// seven other frequencies on the way — 04.074.000, 07.074.000 — and any of
+    /// them is a place the radio would actually go, in another band, keyed to
+    /// somebody else's QSO. So typing waits for Enter, and Escape or looking
+    /// away throws it back.
+    sent: bool,
+}
+
+/// How long after the last wheel click the rig's own reading takes over again.
+///
+/// Long enough to cover the gap between readings — the dial is asked for on
+/// half the PTT's beat — and short enough that a hand let go of the wheel sees
+/// the rig's answer rather than its own last guess.
+const TUNING_SETTLES_S: f64 = 1.5;
+
+/// One wheel click, in scroll units. egui reports a notch as about this much;
+/// a touchpad reports a stream of smaller values, which accumulate into the
+/// same thing.
+const SCROLL_NOTCH: f32 = 50.0;
+
+/// How many steps a turn of the wheel is worth.
+///
+/// The magnitude matters. Taking the sign alone — which is what this did at
+/// first — moves one step per frame however hard the wheel is spun, so crossing
+/// a band means a hundred and forty thousand clicks.
+fn notches(scroll: f32) -> f64 {
+    let turns = (scroll / SCROLL_NOTCH) as f64;
+    // A slow touchpad still moves the dial: less than a notch is one step, in
+    // whichever direction it went.
+    if turns.abs() < 1.0 {
+        turns.signum()
+    } else {
+        turns.round()
+    }
+}
+
+/// `value` with the digit in the `place` column set to `digit`.
+///
+/// The column, not the number: setting the hundreds of a frequency leaves every
+/// other digit where it was, which is what typing into a dial means and what
+/// makes eight keystrokes an entry rather than eight tunes.
+fn with_digit(value: f64, place: f64, digit: u32) -> f64 {
+    let value = value.max(0.0);
+    let had = (value / place).floor() % 10.0;
+    (value - had * place + digit as f64 * place).max(0.0)
+}
+
+/// A little triangle, pointing up or down, filling `at`.
+///
+/// Painted rather than typed for the reason the clear mark is: the arrows a
+/// keyboard offers are in none of the fonts egui bundles, and these have to
+/// line up with a digit a few pixels wide.
+fn arrow(painter: &egui::Painter, at: egui::Rect, up: bool, colour: Color32) {
+    let (w, mid) = (at.width() * 0.34, at.center().x);
+    let (near, far) = if up { (at.bottom(), at.top()) } else { (at.top(), at.bottom()) };
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(mid - w, near),
+            egui::pos2(mid + w, near),
+            egui::pos2(mid, far),
+        ],
+        colour,
+        Stroke::NONE,
+    ));
+}
+
+/// A frequency the way a rig shows it: megahertz, kilohertz, hertz, in groups
+/// a reader can say out loud — 14.074.000 rather than 14074000.
+///
+/// All the way down to single hertz. A digital station cares about them: the
+/// modes here are tens of hertz wide, the app's own readouts are quoted to a
+/// tenth, and a dial that stopped at tens would be the one number on the screen
+/// that could not say where a signal was.
+fn megahertz(hz: f64) -> String {
+    let total = hz.round().max(0.0) as u64;
+    let (mhz, rest) = (total / 1_000_000, total % 1_000_000);
+    format!("{mhz}.{:03}.{:03}", rest / 1000, rest % 1000)
+}
+
+/// A frequency typed but not yet entered: the same dial, not yet the truth.
+const VFO_PENDING: Color32 = Color32::from_rgb(180, 220, 255);
+
+/// A radio's own readout: amber on black, as every rig on the desk has been
+/// since they stopped being analogue. It is not the palette's to theme — the
+/// point of it is that it looks like the dial it is showing.
+const VFO_AMBER: Color32 = Color32::from_rgb(255, 176, 0);
+const VFO_BLACK: Color32 = Color32::from_rgb(12, 10, 8);
+
+/// How much larger than body text the frequency is drawn. Big enough to read
+/// from where an operator sits, which is not where the mouse is.
+const VFO_SCALE: f32 = 1.9;
+
 /// Transmitting because this app asked for it, and transmitting for a reason it
 /// does not know. Two colours because they call for two different reactions.
 const TX_RED: Color32 = Color32::from_rgb(255, 60, 60);
@@ -1440,6 +1541,29 @@ struct App {
     rig_host: String,
     rig_port: u16,
 
+    /// Where the hand has pushed the dial, ahead of the rig.
+    ///
+    /// Tuning cannot read the rig back between one wheel click and the next:
+    /// the rig is asked twice a second and a hand moves faster than that, so
+    /// every click inside the same reading would work from the same stale
+    /// number and ask for the same frequency again. The hand accumulates here
+    /// instead, and the rig's own reading takes over once it stops.
+    tuning: Option<Tuning>,
+
+    /// Which digit the dial is pointed at, counted from the right, and whether
+    /// the keys put it there. See [`App::vfo`].
+    dial_pick: usize,
+    dial_by_key: Option<Pos2>,
+    /// Whether the dial has the keyboard.
+    ///
+    /// Kept here rather than left to egui's focus, which drops a widget that
+    /// asks for focus without being a text field: the dial held the keyboard
+    /// for exactly one keystroke and then lost it, whatever it told the memory
+    /// about still wanting it. It is given up when a real text field takes the
+    /// keyboard — the reply box is directly beneath and must win — and on
+    /// Escape.
+    dial_typing: bool,
+
     /// The frequency under the pointer, while it is somewhere that has one.
     ///
     /// Measured as the panorama is drawn and reported by the status bar, which
@@ -1630,6 +1754,10 @@ impl App {
             rig_host: DEFAULT_RIG_HOST.to_string(),
             rig_port: DEFAULT_RIG_PORT,
             cursor_hz: None,
+            tuning: None,
+            dial_pick: 0,
+            dial_by_key: None,
+            dial_typing: false,
             file_set: ChannelSet::new(15.0),
             fed_frames: 0,
             frames_dirty: false,
@@ -1928,6 +2056,350 @@ impl App {
         said
     }
 
+    /// The rig's frequency, as a rig shows it.
+    ///
+    /// Amber on black and half again the size of everything else, because it is
+    /// read from across the room rather than from the mouse — and because a
+    /// frequency in body text among conversations reads as another line of
+    /// conversation.
+    ///
+    /// What it shows is what the *rig* reports, never what this app last asked
+    /// for. A hand on the knob moves it; a tune this app sends does not, until
+    /// the rig confirms it. Scrolling over it tunes, in steps that follow the
+    /// modifier: a hundred hertz to place a signal, ten to sit exactly on one,
+    /// a kilohertz to go looking.
+    fn vfo(&mut self, ui: &mut egui::Ui) {
+        if self.ptt.is_none() {
+            return;
+        }
+        let st = self.ptt_state();
+
+        let wall = unix_now();
+        let digit_h = self.text_px * VFO_SCALE;
+        let arrow_h = (self.text_px * 0.5).max(7.0);
+        let height = digit_h + 2.0 * (arrow_h + 3.0) + 8.0;
+        // The key and the dial on one row, the same height, because they are
+        // one instrument: the two things an operator's hand goes to, with the
+        // reply box directly beneath them.
+        // An id of its own, rather than the one the layout would generate: a
+        // generated id is a function of how many widgets came before, so it
+        // moves when anything above it does — and focus, which is held by id,
+        // goes with it. The dial held the keyboard for exactly one keystroke
+        // before this.
+        let dial_id = ui.id().with("vfo dial");
+        let row = ui.horizontal(|ui| {
+            self.tx_button(ui, height);
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), height),
+                egui::Sense::hover(),
+            );
+            let resp = ui.interact(rect, dial_id, egui::Sense::click_and_drag());
+            (rect, resp)
+        });
+        let (rect, resp) = row.inner;
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, VFO_BLACK);
+
+        // While the wheel is turning the digits follow the hand; once it stops
+        // they are the rig's again. Anything else means scrolling a dial whose
+        // digits lag a second behind the wheel.
+        let shown = match self.tuning {
+            Some(t) if wall - t.at < TUNING_SETTLES_S || !t.sent => Some(t.hz),
+            _ => st.dial_hz,
+        };
+        let reading = match shown {
+            Some(hz) => megahertz(hz),
+            // Linked and silent about it, or not linked at all: either way the
+            // dial is unknown, and dashes say that where a zero would lie.
+            None => "--.---.---".to_string(),
+        };
+        let dim = shown.is_none();
+        // Typed and not yet entered is drawn cooler than a frequency the radio
+        // is actually on — the difference between what the dial says and what
+        // the rig is doing has to be visible while it exists.
+        let pending = self.tuning.is_some_and(|t| !t.sent);
+        let amber = match (dim, pending) {
+            (true, _) => VFO_AMBER.gamma_multiply(0.35),
+            (_, true) => VFO_PENDING,
+            _ => VFO_AMBER,
+        };
+
+        // Laid out first, drawn after: every digit needs its own rectangle, and
+        // the only honest source for where a digit sits is the galley that
+        // draws it.
+        let font = FontId::monospace(digit_h);
+        let galley = painter.layout_no_wrap(reading.clone(), font, amber);
+        let origin = egui::pos2(rect.right() - 10.0 - galley.size().x, rect.center().y - digit_h / 2.0);
+        painter.galley(origin, galley.clone(), amber);
+
+        // MHz, small, hard against the digits — a rig labels its dial.
+        painter.text(
+            egui::pos2(rect.left() + 10.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            st.dial_mode.clone().unwrap_or_default(),
+            FontId::monospace(self.text_px * 0.85),
+            VFO_AMBER.gamma_multiply(0.75),
+        );
+
+        // Every digit is its own control, worth its own place value: the one
+        // under the pointer is the one that moves, which is how a rig with a
+        // knob per decade behaves and needs no modifier to say which decade is
+        // meant. Counted from the right, skipping the separators.
+        let mut places: Vec<(egui::Rect, f64)> = Vec::new();
+        if let Some(row) = galley.rows.first() {
+            let mut power = 0i32;
+            for glyph in row.glyphs.iter().rev() {
+                if !glyph.chr.is_ascii_digit() && glyph.chr != '-' {
+                    continue;
+                }
+                let at = origin + glyph.pos.to_vec2();
+                let box_ = egui::Rect::from_min_size(
+                    egui::pos2(at.x, rect.center().y - digit_h / 2.0),
+                    egui::vec2(glyph.advance_width, digit_h),
+                );
+                places.push((box_, 10f64.powi(power)));
+                power += 1;
+            }
+        }
+
+        // What the wheel did this frame, as the window received it rather than
+        // as egui interpreted it: the processed delta has had ctrl+wheel taken
+        // out of it to become `zoom_delta` and shift+wheel moved onto the x
+        // axis, so a dial reading that sees nothing for either.
+        let scroll = ui.input(|i| {
+            let mut turned = 0.0f32;
+            for event in &i.events {
+                if let egui::Event::MouseWheel { unit, delta, .. } = event {
+                    let d = if delta.y != 0.0 { delta.y } else { delta.x };
+                    turned += match unit {
+                        egui::MouseWheelUnit::Line => d * SCROLL_NOTCH,
+                        egui::MouseWheelUnit::Page => d * SCROLL_NOTCH * 10.0,
+                        egui::MouseWheelUnit::Point => d,
+                    };
+                }
+            }
+            turned
+        });
+
+        let live = st.dial_hz.is_some();
+        self.dial_pick = self.dial_pick.min(places.len().saturating_sub(1));
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let focus = dial_id;
+
+        // Where the pointer is, if it is on a digit. The mouse and the keys
+        // both move one selection, and the last one used owns it: hover takes
+        // it back the moment the pointer actually moves, and until then the
+        // keys keep it. Two indicators — a hover highlight and a separate caret
+        // — would be two answers to "which digit will move", which is one too
+        // many.
+        let under_pointer =
+            pointer.and_then(|p| places.iter().position(|(box_, _)| box_.contains(p)));
+        let pointer_moved = self.dial_by_key.is_none_or(|was| pointer.is_none_or(|p| p != was));
+        if let (Some(i), true) = (under_pointer, pointer_moved) {
+            self.dial_pick = i;
+            self.dial_by_key = None;
+        }
+
+        // Where the arrows for the selected digit are. Known before the click
+        // is interpreted, because a click on one of them is a step and must not
+        // also be read as pointing the dial somewhere: an arrow is not over a
+        // digit, so the rule below would have sent the cursor to the far end
+        // and taken the arrow out from under the mouse in the same frame.
+        let arrows = places.get(self.dial_pick).map(|(box_, _)| {
+            (
+                egui::Rect::from_min_size(
+                    egui::pos2(box_.left(), box_.top() - arrow_h - 3.0),
+                    egui::vec2(box_.width(), arrow_h),
+                ),
+                egui::Rect::from_min_size(
+                    egui::pos2(box_.left(), box_.bottom() + 3.0),
+                    egui::vec2(box_.width(), arrow_h),
+                ),
+            )
+        });
+        let on_arrow = pointer.zip(arrows).is_some_and(|(p, (up, down))| {
+            up.contains(p) || down.contains(p)
+        });
+
+        // A click anywhere else on the dial takes the keys, and puts the
+        // selection where it was clicked — on the leftmost digit if that was
+        // not on one, which is where an operator typing a whole frequency
+        // starts.
+        if resp.clicked() {
+            self.dial_typing = true;
+            if !on_arrow {
+                self.dial_pick = under_pointer.unwrap_or(places.len().saturating_sub(1));
+                self.dial_by_key = None;
+            }
+        }
+        // A text field taking the keyboard always wins: the reply box is
+        // directly beneath this and an operator typing into it must not have
+        // their digits stolen by a dial they happened to click earlier.
+        if ui.memory(|m| m.focused().is_some()) {
+            self.dial_typing = false;
+        }
+        let typing = self.dial_typing;
+        // And a click anywhere but the dial hands the keyboard back, which is
+        // what clicking away from anything else in a window does.
+        if self.dial_typing && ui.input(|i| i.pointer.any_click()) && !resp.clicked() {
+            self.dial_typing = false;
+        }
+        // A number typed and not entered is not a frequency anybody asked for.
+        // Looking away is not confirmation, so it goes back to the rig's own.
+        if !typing && self.tuning.is_some_and(|t| !t.sent) {
+            self.tuning = None;
+        }
+
+        let mut moved: Option<f64> = None;
+        let mut typed: Option<f64> = None;
+
+        // The keys, when the dial has them. The wheel and the arrows are aimed
+        // by the pointer and need no focus; the keyboard is aimed by the
+        // selection and must have it, or the dial would take keystrokes meant
+        // for the reply box directly beneath it.
+        if typing && live {
+            // Taken with `consume_key`, not read: egui moves focus between
+            // widgets on the arrow keys, so a dial that only *looks* at them
+            // gets one keystroke and then loses the keyboard to whatever is
+            // next in the panel. Consuming them settles who they belong to.
+            let (left, right, up, down, enter, escape) = ui.input_mut(|i| {
+                let m = egui::Modifiers::NONE;
+                (
+                    i.consume_key(m, egui::Key::ArrowLeft),
+                    i.consume_key(m, egui::Key::ArrowRight),
+                    i.consume_key(m, egui::Key::ArrowUp),
+                    i.consume_key(m, egui::Key::ArrowDown),
+                    i.consume_key(m, egui::Key::Enter),
+                    i.consume_key(m, egui::Key::Escape),
+                )
+            });
+            if left {
+                self.dial_pick = (self.dial_pick + 1).min(places.len() - 1);
+                self.dial_by_key = pointer;
+            }
+            if right {
+                self.dial_pick = self.dial_pick.saturating_sub(1);
+                self.dial_by_key = pointer;
+            }
+            let place = places.get(self.dial_pick).map(|(_, p)| *p).unwrap_or(1.0);
+            if up {
+                moved = Some(place);
+            }
+            if down {
+                moved = Some(-place);
+            }
+            // What sends a typed frequency. Nothing else does.
+            if enter {
+                if let Some(t) = self.tuning.filter(|t| !t.sent) {
+                    if let Some(link) = &self.ptt {
+                        link.tune(t.hz);
+                    }
+                    self.tuning = Some(Tuning { sent: true, at: wall, ..t });
+                }
+            }
+            // Put it back to whatever the radio actually says.
+            if escape {
+                self.tuning = None;
+                self.dial_typing = false;
+            }
+
+            // Digits from the text events rather than the key codes, so that a
+            // numeric keypad counts. The column is read again for each one:
+            // several can arrive in a single event — a paste, or a keyboard
+            // faster than a frame — and each belongs one place along from the
+            // last.
+            let texts: Vec<String> = ui.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Text(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for text in texts {
+                for c in text.chars().filter_map(|c| c.to_digit(10)) {
+                    let place = places.get(self.dial_pick).map(|(_, p)| *p).unwrap_or(1.0);
+                    let base = typed.unwrap_or_else(|| self.tuning_from(st.dial_hz, wall));
+                    typed = Some(with_digit(base, place, c));
+                    // Along to the next column, the way a keypad fills.
+                    self.dial_pick = self.dial_pick.saturating_sub(1);
+                    self.dial_by_key = pointer;
+                }
+            }
+        }
+
+        // The digit the dial is pointed at, and the arrows that step it. They
+        // are the cursor: there is nothing else on screen saying which digit is
+        // live, and nothing else needed.
+        // `on_arrow` is in there because the arrows are widgets of their own,
+        // and egui gives hover to the topmost: a pointer resting on an arrow
+        // leaves the dial underneath unhovered, and without this the arrows
+        // vanished from under the mouse that had reached for them.
+        if live && (typing || under_pointer.is_some() || on_arrow || resp.hovered()) {
+            if let (Some((box_, place)), Some((up, down))) =
+                (places.get(self.dial_pick).copied(), arrows)
+            {
+                let up_hit = ui.interact(up, focus.with("up"), egui::Sense::click());
+                let down_hit = ui.interact(down, focus.with("down"), egui::Sense::click());
+                painter.rect_filled(box_, 2.0, amber.gamma_multiply(if typing { 0.28 } else { 0.16 }));
+                arrow(&painter, up, true, VFO_AMBER.gamma_multiply(if up_hit.hovered() { 1.0 } else { 0.6 }));
+                arrow(&painter, down, false, VFO_AMBER.gamma_multiply(if down_hit.hovered() { 1.0 } else { 0.6 }));
+                if up_hit.clicked() {
+                    moved = Some(place);
+                } else if down_hit.clicked() {
+                    moved = Some(-place);
+                } else if under_pointer == Some(self.dial_pick) && scroll != 0.0 {
+                    moved = Some(place * notches(scroll));
+                }
+            }
+        }
+
+        if live {
+            // Over the dial but not over a digit: a hundred hertz a notch, the
+            // step somebody sweeping for a signal wants.
+            if moved.is_none() && under_pointer.is_none() && resp.hovered() && scroll != 0.0 {
+                moved = Some(100.0 * notches(scroll));
+            }
+            // A step goes out as it is made; a typed digit waits for the rest
+            // of the number.
+            // A step of the wheel or an arrow takes over: whatever was typed
+            // and not yet entered is consolidated with it and the lot goes to
+            // the rig. The mouse is a complete intent by itself, so nothing
+            // about it should wait for a keystroke.
+            if let Some(moved) = moved {
+                let hz = (self.tuning_from(st.dial_hz, wall) + moved).max(0.0);
+                self.tuning = Some(Tuning { hz, at: wall, sent: true });
+                if let Some(link) = &self.ptt {
+                    link.tune(hz);
+                }
+            } else if let Some(hz) = typed {
+                self.tuning = Some(Tuning { hz, at: wall, sent: false });
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
+
+        let hover = match (st.dial_hz, st.fault.as_deref()) {
+            (_, Some(fault)) => fault.to_string(),
+            (Some(_), None) => "what the rig is tuned to. Scroll or click the arrows over a \
+                                digit to step it, and the rig follows at once. Click to type: \
+                                ←→ to move, digits to fill, Enter to send it, Esc to put it \
+                                back. 100 Hz a click off the digits."
+                .to_string(),
+            (None, None) => "the rig does not report its frequency".to_string(),
+        };
+        resp.on_hover_text(hover);
+    }
+
+    /// Where the next wheel click should count from: what the hand has already
+    /// asked for, until it has stopped long enough for the rig to answer.
+    fn tuning_from(&self, rig_says: Option<f64>, wall: f64) -> f64 {
+        match self.tuning {
+            Some(t) if wall - t.at < TUNING_SETTLES_S || !t.sent => t.hz,
+            _ => rig_says.unwrap_or_default(),
+        }
+    }
+
     /// The manual key, and the only place the window says it is transmitting.
     ///
     /// It shows three states, and the third is the reason the rig is asked
@@ -1937,7 +2409,7 @@ impl App {
     /// transmitting for a reason this app does not know about is the one a
     /// reader most needs to be told about and the one it cannot fix by
     /// releasing a button.
-    fn tx_button(&mut self, ui: &mut egui::Ui) {
+    fn tx_button(&mut self, ui: &mut egui::Ui, height: f32) {
         let st = self.ptt_state();
         let ours = st.asked;
         let theirs = st.rig_says == Some(true) && !ours;
@@ -1955,7 +2427,10 @@ impl App {
             (true, false) => Some(legible(ui.visuals().dark_mode, TX_RED)),
             (true, true) => Some(legible(ui.visuals().dark_mode, TX_ELSEWHERE)),
         };
-        let mut button = egui::Button::new(label);
+        // Wide enough for the longest thing it says — "TX 120s" — so that a
+        // key-down does not resize the control under the hand about to press
+        // it again.
+        let mut button = egui::Button::new(label).min_size(egui::vec2(66.0, height));
         if let Some(c) = colour {
             button = button.fill(c.gamma_multiply(0.35)).stroke(Stroke::new(1.0, c));
         }
@@ -2550,6 +3025,87 @@ impl App {
         now_s: f64,
     ) -> (bool, bool) {
         let (mut send, mut abort) = (false, false);
+        let dark = ui.visuals().dark_mode;
+        let mut ready = false;
+        // The composer is a panel of its own along the *top* edge, and the log
+        // takes what is left, so growing the window grows the part worth
+        // reading rather than the part being typed into.
+        //
+        // At the top because of where the hand is. The dial and the key sit
+        // directly above this panel, and an operator working a station moves
+        // between those and this box and nothing else — putting the box at the
+        // foot of the panel put the length of the log between the three things
+        // used together. Panels are what egui gives you for "this sticks to
+        // that edge"; the alternative was reserving a guessed height for the
+        // composer, which it did — 96 pixels, right up until the send row grew
+        // a countdown and an abort button.
+        egui::Panel::top("qso_composer").show(ui, |ui| {
+            // The outgoing buffer is its own pane above the entry box, not a
+            // stand-in for it: what is leaving stays visible, struck through as
+            // far as it has got, while the next message is being typed. A
+            // composer that disappeared while transmitting made the operator
+            // wait out the burst before starting the reply.
+            if !q.outgoing.is_empty() {
+                Self::outgoing_text(ui, &q.outgoing);
+            }
+            let resp = ui.add(
+                elegance::TextArea::new(&mut q.draft)
+                    .rows(2)
+                    .desired_width(f32::INFINITY)
+                    .hint("reply…"),
+            );
+            if q.want_focus {
+                resp.request_focus();
+                q.want_focus = false;
+            }
+            // Neither protocol can carry a newline — JS8's free-text alphabet
+            // is 44 characters and has none, and Olivia would put a bare
+            // control code on the air — so Enter has nothing useful to insert
+            // and means send instead. Any newline arriving by other means, a
+            // paste, is dropped for the same reason rather than transmitted as
+            // something odd.
+            let entered = resp.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+            if q.draft.contains('\n') {
+                q.draft.retain(|c| c != '\n');
+            }
+            ready = !q.draft.trim().is_empty();
+            if entered && ready {
+                send = true;
+            }
+            ui.horizontal(|ui| {
+                // Green for the affirmative action, red for the one that stops
+                // a transmission already going out: the accents carry the
+                // meaning, so neither has to be read to be told apart.
+                send |= ui
+                    .add(
+                        elegance::Button::new("Send")
+                            .accent(elegance::Accent::Green)
+                            .enabled(ready),
+                    )
+                    .on_hover_text(match (q.mode.period_s(), busy > 0.0) {
+                        (_, true) => "Enter, or click. Queued behind what is going out.".to_string(),
+                        (Some(p), _) => {
+                            format!("Enter, or click. Goes out on the next {p} s cycle.")
+                        }
+                        (None, _) => "Enter, or click. Goes out immediately.".to_string(),
+                    })
+                    .clicked();
+                if busy > 0.0 {
+                    ui.add(elegance::Indicator::new(elegance::IndicatorState::Connecting));
+                    let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 190, 120));
+                    ui.colored_label(c, format!("TX {busy:.0} s"));
+                    abort = ui
+                        .add(
+                            elegance::Button::new("Abort")
+                                .accent(elegance::Accent::Red)
+                                .size(elegance::ButtonSize::Small),
+                        )
+                        .clicked();
+                }
+            });
+        });
+
         egui::Grid::new("qso_info").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
             let field = |ui: &mut egui::Ui, label: &str, v: &mut String| {
                 ui.label(label);
@@ -2659,82 +3215,6 @@ impl App {
 
         ui.separator();
 
-        // The log takes whatever height is left over once the reply box and the
-        // send button have had theirs, so growing the window grows the part
-        // worth reading rather than the part being typed into.
-        // The composer is a panel of its own along the bottom edge, and the
-        // log takes what is left. Panels are what egui gives you for "this
-        // sticks to that edge"; the alternative was reserving a guessed height
-        // for the composer, which it did — 96 pixels, right up until the send
-        // row grew a countdown and an abort button.
-        let dark = ui.visuals().dark_mode;
-        let mut ready = false;
-        egui::Panel::bottom("qso_composer").show(ui, |ui| {
-            // The outgoing buffer is its own pane above the entry box, not a
-            // stand-in for it: what is leaving stays visible, struck through as
-            // far as it has got, while the next message is being typed. A
-            // composer that disappeared while transmitting made the operator
-            // wait out the burst before starting the reply.
-            if !q.outgoing.is_empty() {
-                Self::outgoing_text(ui, &q.outgoing);
-            }
-            let resp = ui.add(
-                elegance::TextArea::new(&mut q.draft)
-                    .rows(2)
-                    .desired_width(f32::INFINITY)
-                    .hint("reply…"),
-            );
-            if q.want_focus {
-                resp.request_focus();
-                q.want_focus = false;
-            }
-            // Neither protocol can carry a newline — JS8's free-text alphabet
-            // is 44 characters and has none, and Olivia would put a bare
-            // control code on the air — so Enter has nothing useful to insert
-            // and means send instead. Any newline arriving by other means, a
-            // paste, is dropped for the same reason rather than transmitted as
-            // something odd.
-            let entered = resp.has_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-            if q.draft.contains('\n') {
-                q.draft.retain(|c| c != '\n');
-            }
-            ready = !q.draft.trim().is_empty();
-            if entered && ready {
-                send = true;
-            }
-            ui.horizontal(|ui| {
-                // Green for the affirmative action, red for the one that stops
-                // a transmission already going out: the accents carry the
-                // meaning, so neither has to be read to be told apart.
-                send |= ui
-                    .add(
-                        elegance::Button::new("Send")
-                            .accent(elegance::Accent::Green)
-                            .enabled(ready),
-                    )
-                    .on_hover_text(match (q.mode.period_s(), busy > 0.0) {
-                        (_, true) => "Enter, or click. Queued behind what is going out.".to_string(),
-                        (Some(p), _) => {
-                            format!("Enter, or click. Goes out on the next {p} s cycle.")
-                        }
-                        (None, _) => "Enter, or click. Goes out immediately.".to_string(),
-                    })
-                    .clicked();
-                if busy > 0.0 {
-                    ui.add(elegance::Indicator::new(elegance::IndicatorState::Connecting));
-                    let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 190, 120));
-                    ui.colored_label(c, format!("TX {busy:.0} s"));
-                    abort = ui
-                        .add(
-                            elegance::Button::new("Abort")
-                                .accent(elegance::Accent::Red)
-                                .size(elegance::ButtonSize::Small),
-                        )
-                        .clicked();
-                }
-            });
-        });
 
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
@@ -3597,14 +4077,6 @@ impl App {
                     self.clear_all(t_now);
                 }
 
-                // Keying by hand: for tuning up, for checking into a dummy
-                // load, for anything the Send path does not cover. It sits on
-                // the bar rather than in a menu for the same reason the fire
-                // alarm is not in a cupboard — while it is down it is the most
-                // important thing on the screen, and it has to be reachable and
-                // visible without opening anything.
-                self.tx_button(ui);
-
                 // Last on the bar, deliberately. Its readout gains and loses
                 // digits as playback runs, and anything to its right would be
                 // shoved back and forth for the whole recording.
@@ -3760,7 +4232,12 @@ impl App {
             .default_size(self.qso_w)
             .min_size(MIN_QSO_W)
             .frame(qso_frame)
-            .show(ui, |ui| self.qso_panel(ui, t_now));
+            .show(ui, |ui| {
+                // The rig's own readout, above the conversations: what the
+                // station is doing, over what the people on it are saying.
+                self.vfo(ui);
+                self.qso_panel(ui, t_now);
+            });
         // The panel's own rect, not its contents': the contents are inset by
         // the frame margin, and feeding that back as next launch's width would
         // shave a few pixels off the panel every time the app was restarted.
@@ -4518,10 +4995,151 @@ mod tests {
             events: at.map(egui::Event::PointerMoved).into_iter().collect(),
             ..Default::default()
         };
-        // `run_ui` hands the callback a `Ui` covering the whole window, which
-        // is exactly what eframe gives `App::ui`.
         (window, ctx.run_ui(input, |ui| app.draw(ui)))
     }
+
+
+    /// A dial under a hand: one context, one frame per gesture, so that hover
+    /// and focus mean what they mean in a running window.
+    ///
+    /// Everything about this widget depends on state carried between frames —
+    /// egui resolves hover against the frame before, focus outlives a frame,
+    /// and the selection is deliberately sticky — so a helper that builds a
+    /// fresh context per frame (which is what `lay_out` does) can test none of
+    /// it.
+    struct Hand {
+        ctx: egui::Context,
+        window: Rect,
+        at: Pos2,
+    }
+
+    impl Hand {
+        fn new() -> Hand {
+            Hand {
+                ctx: egui::Context::default(),
+                window: Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 800.0)),
+                at: Pos2::new(-100.0, -100.0),
+            }
+        }
+
+        fn frame(&mut self, app: &mut App, events: Vec<egui::Event>) -> egui::FullOutput {
+            let input = egui::RawInput {
+                screen_rect: Some(self.window),
+                events,
+                ..Default::default()
+            };
+            self.ctx.clone().run_ui(input, |ui| app.draw(ui))
+        }
+
+        /// Move the pointer there and let the window see it.
+        fn hover(&mut self, app: &mut App, at: Pos2) -> egui::FullOutput {
+            self.at = at;
+            self.frame(app, vec![egui::Event::PointerMoved(at)])
+        }
+
+        fn wheel(&mut self, app: &mut App, notches: f32) {
+            self.frame(
+                app,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, notches * SCROLL_NOTCH),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                }],
+            );
+        }
+
+        fn click(&mut self, app: &mut App) {
+            let at = self.at;
+            let mut events = vec![egui::Event::PointerMoved(at)];
+            events.extend(
+                [true, false]
+                    .into_iter()
+                    .map(|pressed| egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }),
+            );
+            self.frame(app, events);
+        }
+
+        fn type_text(&mut self, app: &mut App, text: &str) {
+            self.frame(app, vec![egui::Event::Text(text.to_string())]);
+        }
+
+        /// Where a digit is drawn, in this hand's own window.
+        ///
+        /// Measured here rather than from a `lay_out` elsewhere because a
+        /// layout is a property of the context that produced it: a coordinate
+        /// taken from one context can be a few points out in another, which for
+        /// a control the size of a digit is the difference between hitting it
+        /// and missing.
+        fn digit(&mut self, app: &mut App, from_right: usize) -> Pos2 {
+            // Twice: the first frame of a context lays out, the second settles.
+            let at = self.at;
+            self.frame(app, vec![egui::Event::PointerMoved(at)]);
+            let out = self.frame(app, vec![egui::Event::PointerMoved(at)]);
+            let (origin, galley) = out
+                .shapes
+                .iter()
+                .find_map(|cs| match &cs.shape {
+                    egui::Shape::Text(t)
+                        if t.galley.text().matches('.').count() == 2 && t.pos.x < 400.0 =>
+                    {
+                        Some((t.pos, t.galley.clone()))
+                    }
+                    _ => None,
+                })
+                .expect("the dial was not drawn");
+            let row = galley.rows.first().expect("the reading had no row");
+            let glyph = row
+                .glyphs
+                .iter()
+                .rev()
+                .filter(|g| g.chr.is_ascii_digit())
+                .nth(from_right)
+                .expect("that digit is not on the dial");
+            // `glyph.pos` is a baseline position, so only its x is of use; the
+            // widget lays its boxes down the middle of the row.
+            egui::pos2(
+                origin.x + glyph.pos.x + glyph.advance_width / 2.0,
+                origin.y + app.text_px * VFO_SCALE / 2.0,
+            )
+        }
+
+        fn press(&mut self, app: &mut App, key: egui::Key) {
+            self.frame(
+                app,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+        }
+    }
+
+    /// An app with a dial on it, reading `hz`.
+    fn app_with_a_dial(hz: f64) -> App {
+        let mut app = app_with_a_waterfall(30.0);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.rig = rig::Keying::RigCtld { host: "x".into(), port: 1 };
+        app.ptt =
+            Some(rig::Ptt::with_transmitter(Box::new(Dial(flag, hz)), rig::Limits::default()));
+        let began = std::time::Instant::now();
+        while app.ptt_state().dial_hz.is_none() {
+            assert!(began.elapsed() < std::time::Duration::from_secs(2), "the dial never read");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            lay_out(&mut app);
+        }
+        app
+    }
+
+
 
     /// The play/pause button must not change size or shift its icon when it is
     /// clicked: the bar is one row, and a control that twitches under the
@@ -4739,56 +5357,63 @@ mod tests {
         );
     }
 
-    /// The whole composer sits at the foot of the QSO panel — the reply box as
-    /// well as the button under it — and the log fills the space above.
+    /// The whole composer sits at the head of the QSO panel — the reply box as
+    /// well as the button, one directly above the other.
     ///
-    /// Checking only the button is not enough: an earlier attempt left the
-    /// reply box up against the log at y=326 while the button sat correctly at
-    /// y=780, and a test that looked only for "Send" passed it.
+    /// Both halves, because they came apart once: a layout change left the
+    /// reply box up against the log while the button sat at the far end of the
+    /// panel, and a test that looked only for "Send" passed it.
+    ///
+    /// At the head rather than the foot because of where the hand is. The dial
+    /// and the key are drawn directly above this panel, and working a station
+    /// means moving between those and this box — with the composer at the foot,
+    /// the whole length of the log sat between the three controls used
+    /// together.
     #[test]
-    fn the_composer_sits_at_the_foot_of_the_qso_panel() {
+    fn the_composer_sits_at_the_head_of_the_qso_panel() {
         let mut app = app_with_traffic(30.0);
         lay_out(&mut app);
         let channels = app.channels_now();
         app.qsos.open_for_channel(&channels.channels()[0], app.t_now);
 
-        let window_h = 800.0f32; // per `lay_out`
         let out = lay_out(&mut app);
-        let (mut reply_y, mut send_y, mut lowest_log_y) = (None, None, f32::MIN);
-        let mut status_y = None;
+        let (mut reply_y, mut send_y, mut highest_log_y) = (None, None, f32::MAX);
+        let mut tab_y = None;
         for cs in &out.shapes {
             if let egui::Shape::Text(t) = &cs.shape {
                 match t.galley.text() {
                     "Send" => send_y = Some(t.pos.y),
                     "reply…" => reply_y = Some(t.pos.y),
-                    s if s.ends_with("threads") => status_y = Some(t.pos.y),
-                    s if s.contains("K2N") => lowest_log_y = lowest_log_y.max(t.pos.y),
+                    // The tab strip is the ceiling: the composer belongs under
+                    // the tabs, not over them.
+                    // The new-QSO button, which is the top of the tab strip.
+                    s if s.trim() == "+" => tab_y = Some(t.pos.y),
+                    // A log line by its offset stamp — "+  0:05" — which
+                    // nothing else in the panel draws. Matching the station's
+                    // call would find the tab it labels, at the very top.
+                    // A log line by its offset stamp — "+  0:00" — which
+                    // nothing else in the panel draws. Matching the station's
+                    // call would find the tab it labels, at the very top.
+                    s if s.trim_start().starts_with('+') && s.contains(':') => {
+                        highest_log_y = highest_log_y.min(t.pos.y)
+                    }
                     _ => {}
                 }
             }
         }
         let send_y = send_y.expect("the Send button should be drawn");
         let reply_y = reply_y.expect("the reply box should be drawn");
-        // The status line is the floor now, not the window's edge. Measured at
-        // 784 of 800, with Send at 754.5 just above it.
-        let floor = status_y.expect("the status bar should be drawn");
-        assert!(
-            send_y < floor,
-            "Send at y={send_y} is below the status line at {floor}"
-        );
-        assert!(
-            send_y > floor - 40.0,
-            "Send sits at y={send_y}, adrift of the status line at {floor} rather than \
-             at the foot of the panel"
-        );
-        assert!(
-            reply_y > window_h - 120.0,
-            "the reply box sits at y={reply_y}, adrift of the composer at {send_y}"
-        );
         assert!(reply_y < send_y, "the reply box should be above its button");
         assert!(
-            lowest_log_y > f32::MIN && lowest_log_y < reply_y,
-            "the log ({lowest_log_y}) should be above the composer ({reply_y})"
+            send_y - reply_y < 80.0,
+            "the reply box at {reply_y} and its button at {send_y} have come apart"
+        );
+        if let Some(tab_y) = tab_y {
+            assert!(reply_y > tab_y, "the composer at {reply_y} is above the tabs at {tab_y}");
+        }
+        assert!(
+            highest_log_y < f32::MAX && highest_log_y > send_y,
+            "the log ({highest_log_y}) should be below the composer ({send_y})"
         );
     }
 
@@ -5360,6 +5985,331 @@ mod tests {
         }
     }
 
+    /// A frequency reads as a frequency, in the groups an operator says out
+    /// loud rather than as seven undifferentiated digits.
+    #[test]
+    fn the_dial_reads_the_way_an_operator_says_it() {
+        assert_eq!(megahertz(14_074_000.0), "14.074.000");
+        assert_eq!(megahertz(7_078_000.0), "7.078.000");
+        assert_eq!(megahertz(3_573_250.0), "3.573.250");
+        assert_eq!(megahertz(1_840_000.0), "1.840.000");
+        // All the way down to single hertz: the modes here are tens of hertz
+        // wide, so the last digit is one an operator uses.
+        assert_eq!(megahertz(14_074_004.0), "14.074.004");
+        assert_eq!(megahertz(0.0), "0.000.000");
+    }
+
+    /// A wheel is worth what it was turned, not one step a frame.
+    ///
+    /// Taking the sign alone — which this did at first — meant a flick moved
+    /// one step however hard the wheel was spun, so crossing a band was a
+    /// thousand flicks. It felt, in the operator's words, very slow.
+    #[test]
+    fn the_wheel_is_worth_what_it_was_turned() {
+        assert_eq!(notches(SCROLL_NOTCH), 1.0);
+        assert_eq!(notches(-SCROLL_NOTCH), -1.0);
+        assert_eq!(notches(SCROLL_NOTCH * 6.0), 6.0);
+        // A touchpad's dribble still moves it, and by a whole step.
+        assert_eq!(notches(3.0), 1.0);
+        assert_eq!(notches(-3.0), -1.0);
+    }
+
+    /// Consecutive clicks accumulate, rather than each one starting again from
+    /// what the rig last said.
+    ///
+    /// This is what made tuning feel stuck. The dial is read twice a second and
+    /// a hand moves faster, so every click inside one reading computed the same
+    /// "current + 100" and asked for the same frequency — a second of scrolling
+    /// moved the rig one step.
+    #[test]
+    fn clicks_accumulate_instead_of_re_reading_a_stale_dial() {
+        let mut app = App::base((0.0, 4000.0));
+        let rig_says = Some(14_074_000.0);
+        let t0 = 1000.0;
+
+        // Four clicks inside one reading of the rig, which does not move.
+        let mut target = app.tuning_from(rig_says, t0);
+        for i in 0..4 {
+            let at = t0 + i as f64 * 0.05;
+            target = app.tuning_from(rig_says, at) + 100.0 * notches(SCROLL_NOTCH);
+            app.tuning = Some(Tuning { hz: target, at, sent: true });
+        }
+        assert_eq!(target, 14_074_400.0, "four clicks of 100 Hz should be 400 Hz");
+
+        // Once the hand stops — measured from the last click, not the first —
+        // the rig's own answer takes over again.
+        let quiet = app.tuning.unwrap().at + TUNING_SETTLES_S + 0.1;
+        assert_eq!(app.tuning_from(Some(14_074_400.0), quiet), 14_074_400.0);
+        assert_eq!(
+            app.tuning_from(Some(7_000_000.0), quiet),
+            7_000_000.0,
+            "the rig's own dial should win once the hand is off the wheel"
+        );
+        // And while the hand is still on it, the rig moving underneath does not
+        // drag the digits out from under the wheel.
+        let mid = app.tuning.unwrap().at + 0.2;
+        assert_eq!(app.tuning_from(Some(7_000_000.0), mid), 14_074_400.0);
+    }
+
+    /// Every digit is its own control, worth its own decade.
+    ///
+    /// This is what a rig with a knob per decade does, and it says which step
+    /// is meant by where the pointer is rather than by a modifier — which
+    /// matters here because the modifiers were never available: ctrl+wheel is
+    /// taken by egui to become `zoom_delta` and shift+wheel is moved onto the
+    /// x axis before any widget sees it.
+    #[test]
+    fn each_digit_tunes_its_own_decade() {
+        // Counting from the right of 14.074.000: hertz, tens, hundreds, then
+        // the kilohertz group, then megahertz.
+        let steps = [
+            (0usize, 1.0),
+            (1, 10.0),
+            (2, 100.0),
+            (4, 10_000.0),
+            (6, 1_000_000.0),
+            (7, 10_000_000.0),
+        ];
+        for (from_right, step) in steps {
+            let mut app = app_with_a_dial(14_074_000.0);
+            let mut hand = Hand::new();
+            let at = hand.digit(&mut app, from_right);
+            hand.hover(&mut app, at);
+            hand.hover(&mut app, at);
+            hand.wheel(&mut app, 1.0);
+            assert_eq!(
+                app.tuning.map(|t| t.hz),
+                Some(14_074_000.0 + step),
+                "a notch over the digit {from_right} places from the right should move {step} Hz"
+            );
+        }
+    }
+
+    /// The arrows step the digit the dial is pointed at, and pointing is done
+    /// by hovering it.
+    #[test]
+    fn the_arrows_step_the_digit_they_sit_over() {
+        for (up, want) in [(true, 14_074_100.0), (false, 14_073_900.0)] {
+            let mut app = app_with_a_dial(14_074_000.0);
+            let mut hand = Hand::new();
+            let hundreds = hand.digit(&mut app, 2);
+            hand.hover(&mut app, hundreds);
+            hand.hover(&mut app, hundreds);
+
+            let arrow_h = (app.text_px * 0.5).max(7.0);
+            let digit_h = app.text_px * VFO_SCALE;
+            let reach = digit_h / 2.0 + 3.0 + arrow_h / 2.0;
+            let at = egui::pos2(hundreds.x, hundreds.y + if up { -reach } else { reach });
+            hand.hover(&mut app, at);
+            hand.click(&mut app);
+
+            assert_eq!(
+                app.tuning.map(|t| t.hz),
+                Some(want),
+                "the {} arrow over the hundreds digit should have stepped it",
+                if up { "up" } else { "down" }
+            );
+            assert!(app.tuning.is_some_and(|t| t.sent), "a step should go straight to the rig");
+        }
+    }
+
+    /// Typing fills the dial a digit at a time and waits for Enter.
+    ///
+    /// Entered a digit at a time, a frequency passes through others on the way:
+    /// 14.074.000 typed towards 7.078.000 goes through 74.074.000 and
+    /// 70.074.000, each of them somewhere the radio would actually go. So the
+    /// digits are shown, and nothing reaches the rig until Enter.
+    #[test]
+    fn typing_a_frequency_waits_for_enter() {
+        let mut app = app_with_a_dial(14_074_000.0);
+        let mut hand = Hand::new();
+        let leftmost = hand.digit(&mut app, 7);
+        // Click the dial to take the keys, with the cursor where it was clicked.
+        hand.hover(&mut app, leftmost);
+        hand.hover(&mut app, leftmost);
+        hand.click(&mut app);
+
+        hand.type_text(&mut app, "0");
+        hand.type_text(&mut app, "7");
+        hand.type_text(&mut app, "0");
+        hand.type_text(&mut app, "7");
+        hand.type_text(&mut app, "8");
+        let typed = app.tuning.expect("nothing was typed in");
+        assert_eq!(typed.hz, 7_078_000.0, "the digits did not fill from the left");
+        assert!(!typed.sent, "a half-typed frequency reached the rig");
+
+        hand.press(&mut app, egui::Key::Enter);
+        assert!(app.tuning.is_some_and(|t| t.sent), "Enter did not send it");
+        assert_eq!(app.tuning.map(|t| t.hz), Some(7_078_000.0));
+    }
+
+    /// Escape puts back whatever the radio actually says.
+    #[test]
+    fn escape_abandons_what_was_typed() {
+        let mut app = app_with_a_dial(14_074_000.0);
+        let mut hand = Hand::new();
+        let leftmost = hand.digit(&mut app, 7);
+        hand.hover(&mut app, leftmost);
+        hand.hover(&mut app, leftmost);
+        hand.click(&mut app);
+        hand.type_text(&mut app, "07");
+        assert!(app.tuning.is_some_and(|t| !t.sent));
+
+        hand.press(&mut app, egui::Key::Escape);
+        assert_eq!(app.tuning, None, "Escape left the typed frequency on the dial");
+    }
+
+    /// A hand that types and then reaches for the wheel gets both: the digits
+    /// it typed, stepped, and sent — no keystroke needed for a gesture that
+    /// never used the keyboard to finish.
+    #[test]
+    fn the_wheel_consolidates_what_was_typed() {
+        let mut app = app_with_a_dial(14_074_000.0);
+        let mut hand = Hand::new();
+        let leftmost = hand.digit(&mut app, 7);
+        hand.hover(&mut app, leftmost);
+        hand.hover(&mut app, leftmost);
+        hand.click(&mut app);
+        hand.type_text(&mut app, "07078");
+        assert_eq!(app.tuning.map(|t| t.hz), Some(7_078_000.0));
+        assert!(app.tuning.is_some_and(|t| !t.sent));
+
+        // Onto the hundreds digit, and a notch.
+        let hundreds = hand.digit(&mut app, 2);
+        hand.hover(&mut app, hundreds);
+        hand.hover(&mut app, hundreds);
+        hand.wheel(&mut app, 1.0);
+
+        let now = app.tuning.expect("the wheel lost the edit");
+        assert_eq!(now.hz, 7_078_100.0, "the wheel did not build on what was typed");
+        assert!(now.sent, "a wheel step should go to the rig without Enter");
+    }
+
+    /// The keys move the cursor, and the mouse takes it back when it moves —
+    /// the last device used owns it, so there is never a question of which
+    /// digit is live.
+    #[test]
+    fn the_cursor_belongs_to_whichever_was_used_last() {
+        let mut app = app_with_a_dial(14_074_000.0);
+        let mut hand = Hand::new();
+        let hundreds = hand.digit(&mut app, 2);
+        hand.hover(&mut app, hundreds);
+        hand.hover(&mut app, hundreds);
+        hand.click(&mut app);
+        assert_eq!(app.dial_pick, 2, "clicking a digit should point at it");
+
+        // Left, twice: onto the tens of kilohertz.
+        hand.press(&mut app, egui::Key::ArrowLeft);
+        hand.press(&mut app, egui::Key::ArrowLeft);
+        assert_eq!(app.dial_pick, 4, "the arrow keys did not move the cursor");
+
+        // The pointer has not moved, so hovering does not drag it back.
+        hand.frame(&mut app, Vec::new());
+        assert_eq!(app.dial_pick, 4, "hover took the cursor back without the mouse moving");
+
+        // And when the mouse does move, it does.
+        let tens = hand.digit(&mut app, 1);
+        hand.hover(&mut app, tens);
+        hand.hover(&mut app, tens);
+        assert_eq!(app.dial_pick, 1, "the mouse did not take the cursor back");
+    }
+
+    /// Up and down step the digit under the cursor, as the arrows do.
+    #[test]
+    fn the_up_and_down_keys_step_the_selected_digit() {
+        let mut app = app_with_a_dial(14_074_000.0);
+        let mut hand = Hand::new();
+        let hundreds = hand.digit(&mut app, 2);
+        hand.hover(&mut app, hundreds);
+        hand.hover(&mut app, hundreds);
+        hand.click(&mut app);
+
+        hand.press(&mut app, egui::Key::ArrowUp);
+        assert_eq!(app.tuning.map(|t| t.hz), Some(14_074_100.0));
+        hand.press(&mut app, egui::Key::ArrowDown);
+        hand.press(&mut app, egui::Key::ArrowDown);
+        assert_eq!(app.tuning.map(|t| t.hz), Some(14_073_900.0));
+        assert!(app.tuning.is_some_and(|t| t.sent), "a key step should reach the rig");
+    }
+
+    /// The readout shows what the rig says, in amber, larger than the text
+    /// around it — and says so plainly when the rig will not say.
+    #[test]
+    fn the_vfo_shows_the_rigs_own_frequency() {
+        let mut app = app_with_a_waterfall(30.0);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.rig = rig::Keying::RigCtld { host: "x".into(), port: 1 };
+        app.ptt = Some(rig::Ptt::with_transmitter(
+            Box::new(Dial(flag.clone(), 14_074_000.0)),
+            rig::Limits::default(),
+        ));
+
+        let began = std::time::Instant::now();
+        let (reading, size, colour) = loop {
+            let out = lay_out(&mut app);
+            let found = out.shapes.iter().find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text().contains("14.074") => Some((
+                    t.galley.text().to_string(),
+                    t.galley.job.sections[0].format.font_id.size,
+                    t.fallback_color,
+                )),
+                _ => None,
+            });
+            if let Some(f) = found {
+                break f;
+            }
+            assert!(began.elapsed() < std::time::Duration::from_secs(2), "no reading was drawn");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(reading, "14.074.000");
+        assert!(size > app.text_px * 1.5, "drawn at {size}, no larger than the text at {}", app.text_px);
+        assert_eq!(colour, VFO_AMBER, "the dial is not amber");
+    }
+
+    /// A rig that does not report its frequency gets dashes, not a zero: a
+    /// station reading 0.000.00 off its own window would be a station that
+    /// believes it.
+    #[test]
+    fn a_dial_that_cannot_be_read_shows_dashes() {
+        let mut app = app_with_a_waterfall(30.0);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        app.rig = rig::Keying::RigCtld { host: "x".into(), port: 1 };
+        app.ptt =
+            Some(rig::Ptt::with_transmitter(Box::new(Flag(flag)), rig::Limits::default()));
+
+        let out = lay_out(&mut app);
+        assert!(
+            drawn(&out).iter().any(|(s, _)| s.starts_with("--.---")),
+            "a silent dial did not say so: {:?}",
+            drawn(&out).iter().map(|(s, _)| s.clone()).take(8).collect::<Vec<_>>()
+        );
+    }
+
+    /// A transmitter that also has a dial on it.
+    struct Dial(std::sync::Arc<std::sync::atomic::AtomicBool>, f64);
+    impl rig::Transmitter for Dial {
+        fn key(&mut self, on: bool) -> Result<(), rig::Fault> {
+            self.0.store(on, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn keyed(&mut self) -> Result<Option<bool>, rig::Fault> {
+            Ok(Some(self.0.load(std::sync::atomic::Ordering::SeqCst)))
+        }
+        fn dial_hz(&mut self) -> Result<Option<f64>, rig::Fault> {
+            Ok(Some(self.1))
+        }
+        fn tune(&mut self, hz: f64) -> Result<(), rig::Fault> {
+            self.1 = hz;
+            Ok(())
+        }
+        fn dial_mode(&mut self) -> Result<Option<String>, rig::Fault> {
+            Ok(Some("PKTUSB".to_string()))
+        }
+        fn describe(&self) -> String {
+            "a dial".to_string()
+        }
+    }
+
     /// The button stops a transmission it did not start.
     ///
     /// It used to toggle against its own intent, so a rig transmitting for any
@@ -5399,13 +6349,15 @@ mod tests {
         }
     }
 
-    /// The bar says TX while the rig is keyed, and says nothing when it is not.
+    /// The window says TX while the rig is keyed, and says nothing when it is
+    /// not. The key sits beside the dial, at the head of the QSO panel, where
+    /// the hand that works a station already is.
     ///
     /// Drawn rather than asserted on the state, because the state being right
     /// while the button stays grey is exactly the failure that matters: this is
     /// the only thing on screen that says the station is transmitting.
     #[test]
-    fn the_toolbar_says_when_the_rig_is_keyed() {
+    fn the_window_says_when_the_rig_is_keyed() {
         let mut app = app_with_a_waterfall(30.0);
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.rig = rig::Keying::RigCtld { host: "x".into(), port: 1 };

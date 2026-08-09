@@ -90,6 +90,25 @@ station. Point at the waterfall or the band bar and the status bar reads out the
 frequency under the cursor — an offset from the dial, like every frequency here
 — which is how you find what to tune to before there is any text to click.
 
+The rig's frequency reads out above the conversations, amber on black. Every
+digit is its own control: scroll over one and it steps its own decade, from
+single hertz at the right to tens of megahertz at the left, and small arrows
+appear over and under it for a hand that would rather click. Anywhere else on
+the readout a click of the wheel is a hundred hertz.
+
+Click the readout and it takes the keyboard: **←→** move between digits, **↑↓**
+step the one you are on, and typing a digit fills it and moves along, so a whole
+frequency goes in as eight keystrokes from the left. A typed frequency shows in
+a different colour until **Enter** sends it — entered a digit at a time it
+passes through others on the way, and any of those is somewhere the radio would
+actually go — while **Esc**, or clicking away, puts back whatever the rig says.
+Steps made with the wheel or the arrows need no Enter: each one is complete in
+itself, and reaching for the mouse mid-entry consolidates what you had typed
+and sends it.
+What it shows is what the rig reports — turn the knob on the radio and the
+digits follow — except while the wheel is being turned, when they follow the
+hand and hand back a second after it stops.
+
 A band left running fills up with conversations that finished an hour ago, so
 the window can be told to forget: **☰ ▸ forget** is how long a station's text
 stays on its row, and **fade** is how long it takes to go once it is that old.
@@ -127,8 +146,8 @@ rig"; `--set-conf=ptt_type=RIG` (or `RTS`, or `DTR`) is what it is asking for.
 That applies to hamlib's own dummy too, which is the cheapest way to watch the
 whole path work without a radio on the bench:
 `rigctld -m 1 -r /dev/null --set-conf=ptt_type=RIG`. The **TX**
-button on the toolbar then keys and unkeys by hand, for tuning up or checking
-into a dummy load, and goes red for as long as the rig is transmitting, with a
+button beside the frequency readout then keys and unkeys by hand, for tuning up
+or checking into a dummy load, and goes red for as long as the rig is transmitting, with a
 count of how long it has been down. It goes amber instead when the rig is
 transmitting for a reason the app did not ask for — a hand on the front panel, a
 foot switch, a line stuck down — because that is worth telling apart from your
