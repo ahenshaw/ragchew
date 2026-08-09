@@ -128,6 +128,8 @@ fn hamlib_says(code: i32) -> Option<&'static str> {
 /// What a command was trying to do, for a refusal to quote back.
 const KEYING: &str = "key";
 const READING_PTT: &str = "say whether it is transmitting";
+const READING_DIAL: &str = "say what it is tuned to";
+const TUNING: &str = "tune";
 
 /// Something that can put a transmitter on the air.
 pub trait Transmitter: Send {
@@ -141,6 +143,24 @@ pub trait Transmitter: Send {
     ///
     /// `None` from a transport that cannot be asked.
     fn keyed(&mut self) -> Result<Option<bool>, Fault>;
+
+    /// What the rig is tuned to, in Hz, if it can be asked. `None` from a
+    /// transport that cannot.
+    fn dial_hz(&mut self) -> Result<Option<f64>, Fault> {
+        Ok(None)
+    }
+
+    /// Tune it.
+    fn tune(&mut self, hz: f64) -> Result<(), Fault> {
+        let _ = hz;
+        Err(Fault::Rejected { doing: TUNING, code: -4 })
+    }
+
+    /// The mode it is in — `USB`, `PKTUSB`, `FM` — and nothing about what that
+    /// means, which is the rig's business and not this app's.
+    fn dial_mode(&mut self) -> Result<Option<String>, Fault> {
+        Ok(None)
+    }
 
     /// What this is, for the log and the settings menu.
     fn describe(&self) -> String;
@@ -235,6 +255,28 @@ impl RigCtld {
         }
     }
 
+    /// A command whose answer runs to more than one line.
+    ///
+    /// `m` is the reason: it answers with the mode and then the passband, on
+    /// two lines. Reading one and leaving the other in the socket does not
+    /// fail — it desynchronises the stream, and every answer after it belongs
+    /// to the command before, which is the kind of fault that reads as the rig
+    /// having gone mad.
+    ///
+    /// An error is a single line whatever was asked, so the count is what is
+    /// wanted only when the first line is not one.
+    fn ask_lines(&mut self, cmd: &str, lines: usize) -> Result<Vec<String>, Fault> {
+        let first = self.ask(cmd)?;
+        if first.starts_with("RPRT ") || lines <= 1 {
+            return Ok(vec![first]);
+        }
+        let mut out = vec![first];
+        for _ in 1..lines {
+            out.push(self.read_line(cmd)?);
+        }
+        Ok(out)
+    }
+
     fn round_trip(&mut self, cmd: &str) -> Result<String, Fault> {
         let io = self.connect()?;
         let line = format!("{cmd}\n");
@@ -243,6 +285,11 @@ impl RigCtld {
             .map_err(|e| Fault::Link(format!("sending {cmd:?}: {e}")))?;
         io.get_mut().flush().map_err(|e| Fault::Link(format!("sending {cmd:?}: {e}")))?;
 
+        self.read_line(cmd)
+    }
+
+    fn read_line(&mut self, cmd: &str) -> Result<String, Fault> {
+        let io = self.connect()?;
         let mut answer = String::new();
         match io.read_line(&mut answer) {
             // End of stream: the daemon has gone. A link fault, so `ask` gives
@@ -292,6 +339,39 @@ impl Transmitter for RigCtld {
                 Ok(()) => Err(Fault::Protocol(format!("expected a PTT state, got {answer:?}"))),
             },
         }
+    }
+
+    fn dial_hz(&mut self) -> Result<Option<f64>, Fault> {
+        let answer = self.ask("f")?;
+        match answer.trim().parse::<f64>() {
+            Ok(hz) if hz > 0.0 => Ok(Some(hz)),
+            _ => match RigCtld::expect_rprt(&answer, READING_DIAL) {
+                // As with the PTT: a rig that cannot be asked is ordinary.
+                Err(Fault::Rejected { code: -4 | -11, .. }) => Ok(None),
+                Err(e) => Err(e),
+                Ok(()) => Err(Fault::Protocol(format!("expected a frequency, got {answer:?}"))),
+            },
+        }
+    }
+
+    fn tune(&mut self, hz: f64) -> Result<(), Fault> {
+        let answer = self.ask(&format!("F {:.0}", hz.max(0.0)))?;
+        RigCtld::expect_rprt(&answer, TUNING)
+    }
+
+    fn dial_mode(&mut self) -> Result<Option<String>, Fault> {
+        // Mode then passband, on two lines. The passband is the rig's own
+        // business; what is worth showing is which sideband it is in.
+        let answer = self.ask_lines("m", 2)?;
+        let first = answer.first().cloned().unwrap_or_default();
+        if first.starts_with("RPRT ") {
+            return match RigCtld::expect_rprt(&first, READING_DIAL) {
+                Err(Fault::Rejected { code: -4 | -11, .. }) => Ok(None),
+                Err(e) => Err(e),
+                Ok(()) => Ok(None),
+            };
+        }
+        Ok(Some(first))
     }
 
     fn describe(&self) -> String {
@@ -363,6 +443,10 @@ pub struct State {
     pub keyed_for: f64,
     /// The last thing that went wrong, still worth showing after it has.
     pub fault: Option<String>,
+    /// What the rig is tuned to, in Hz, and the mode it is in — as the rig
+    /// says, not as this app last asked for. Turning the knob shows up here.
+    pub dial_hz: Option<f64>,
+    pub dial_mode: Option<String>,
 }
 
 /// One stretch of time the rig should be transmitting for.
@@ -383,6 +467,8 @@ enum Cmd {
     /// Drop everything scheduled and un-key if a span is what is holding it
     /// down.
     Cancel,
+    /// Tune to this many Hz.
+    Tune(f64),
 }
 
 /// A transmitter under supervision.
@@ -437,6 +523,13 @@ impl Ptt {
         self.tell(Cmd::Cancel);
     }
 
+    /// Tune the rig. The reading comes back through [`Ptt::state`] when the rig
+    /// confirms it, not when this is called: what the dial says is the rig's
+    /// answer, never this app's intention.
+    pub fn tune(&self, hz: f64) {
+        self.tell(Cmd::Tune(hz));
+    }
+
     /// Say something to the worker, or say nothing at all: a worker that has
     /// gone has already un-keyed, which is the only thing a caller here needs
     /// to be true.
@@ -485,6 +578,10 @@ struct Session {
     /// that keys without read-back is asked once rather than twice a second
     /// for the rest of the session.
     can_ask: bool,
+    /// The same for the dial, which is a separate question: plenty of rigs
+    /// report a frequency and no PTT.
+    can_ask_dial: bool,
+    next_dial: std::time::Instant,
     /// When the link may next be tried, after one has failed.
     retry_at: Option<std::time::Instant>,
 }
@@ -515,12 +612,14 @@ impl Session {
             holding: None,
             next_poll: std::time::Instant::now(),
             can_ask: true,
+            can_ask_dial: true,
+            next_dial: std::time::Instant::now(),
             retry_at: None,
         }
     }
 
     fn run(mut self, cmds: std::sync::mpsc::Receiver<Cmd>) {
-        loop {
+        'pumping: loop {
             let wait = self.until_something_happens();
             match cmds.recv_timeout(wait) {
                 Ok(Cmd::Now(on)) => {
@@ -529,6 +628,26 @@ impl Session {
                     self.set(on);
                 }
                 Ok(Cmd::Span(s)) => self.queued.push(s),
+                Ok(Cmd::Tune(hz)) => {
+                    // Only the last one. A hand on a wheel outruns a CAT link
+                    // at 4800 baud by a wide margin, and a queue of frequencies
+                    // to pass through on the way is a rig that keeps tuning
+                    // after the hand has stopped.
+                    let mut hz = hz;
+                    while let Ok(next) = cmds.try_recv() {
+                        match next {
+                            Cmd::Tune(newer) => hz = newer,
+                            // Anything else is not a frequency and must not be
+                            // dropped on the floor with them.
+                            other => {
+                                self.tune(hz);
+                                self.act(other);
+                                continue 'pumping;
+                            }
+                        }
+                    }
+                    self.tune(hz);
+                }
                 Ok(Cmd::Cancel) => {
                     self.queued.clear();
                     if self.holding.take().is_some() {
@@ -542,7 +661,28 @@ impl Session {
             self.work_the_schedule();
             self.mind_the_limit();
             self.ask_the_rig();
+            self.ask_the_dial();
             self.publish();
+        }
+    }
+
+    /// Do what a command says. Only for the ones pulled out of the queue while
+    /// coalescing tunes; the rest are handled where they arrive.
+    fn act(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Now(on) => {
+                self.queued.clear();
+                self.holding = None;
+                self.set(on);
+            }
+            Cmd::Span(s) => self.queued.push(s),
+            Cmd::Cancel => {
+                self.queued.clear();
+                if self.holding.take().is_some() {
+                    self.set(false);
+                }
+            }
+            Cmd::Tune(hz) => self.tune(hz),
         }
     }
 
@@ -624,6 +764,45 @@ impl Session {
                 self.retry_at = Some(now + Duration::from_secs_f64(self.limits.retry_s));
                 self.no_link(e);
             }
+        }
+    }
+
+    /// Send the rig somewhere. The state follows from the next reading, not
+    /// from this: a tune that the rig declines must not leave the window
+    /// showing a frequency nothing is listening on.
+    fn tune(&mut self, hz: f64) {
+        match self.tx.tune(hz) {
+            Ok(()) => {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.linked = true;
+                st.fault = None;
+                // Ask again promptly rather than waiting out the slow beat.
+                self.next_dial = std::time::Instant::now();
+            }
+            Err(e) => self.no_link(e),
+        }
+    }
+
+    /// What the rig is tuned to. Asked for on a slower beat than the PTT: a
+    /// dial moves when a hand moves it, and every reading is a CAT transaction.
+    fn ask_the_dial(&mut self) {
+        let now = std::time::Instant::now();
+        if !self.can_ask_dial || now < self.next_dial || self.retry_at.is_some_and(|t| now < t) {
+            return;
+        }
+        self.next_dial = now + Duration::from_secs_f64((self.limits.poll_s * 2.0).max(0.2));
+        match self.tx.dial_hz() {
+            Ok(hz) => {
+                self.can_ask_dial = hz.is_some();
+                let mode = self.tx.dial_mode().ok().flatten();
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.linked = true;
+                st.dial_hz = hz;
+                if mode.is_some() {
+                    st.dial_mode = mode;
+                }
+            }
+            Err(e) => self.no_link(e),
         }
     }
 
@@ -712,6 +891,9 @@ mod tests {
         heard: Arc<Mutex<Vec<String>>>,
         /// What it would tell you its PTT is doing.
         ptt: Arc<AtomicBool>,
+        /// And where it is tuned, in Hz — a real daemon answers `f` and `m`
+        /// whether or not anyone asked it to key, so this one must too.
+        dial: Arc<Mutex<f64>>,
         /// Answer the next command with this hamlib code instead of obeying.
         reject: Arc<Mutex<Option<i32>>>,
         /// Refuse to say what the PTT is doing, for ever — which is what
@@ -732,12 +914,14 @@ mod tests {
                 port,
                 heard: Arc::new(Mutex::new(Vec::new())),
                 ptt: Arc::new(AtomicBool::new(false)),
+                dial: Arc::new(Mutex::new(14_074_000.0)),
                 reject: Arc::new(Mutex::new(None)),
                 deny_reads: Arc::new(AtomicBool::new(false)),
                 deaf: Arc::new(AtomicBool::new(false)),
                 drop_after: Arc::new(AtomicUsize::new(usize::MAX)),
             };
             let (heard, ptt) = (rig.heard.clone(), rig.ptt.clone());
+            let dial = rig.dial.clone();
             let (reject, deaf) = (rig.reject.clone(), rig.deaf.clone());
             let deny_reads = rig.deny_reads.clone();
             let drop_after = rig.drop_after.clone();
@@ -770,6 +954,19 @@ mod tests {
                                 "t" => {
                                     format!("{}\n", u8::from(ptt.load(Ordering::SeqCst)))
                                 }
+                                "f" => format!("{:.0}\n", dial.lock().unwrap()),
+                                // Mode then passband, on two lines, which is
+                                // the shape that catches a client reading one.
+                                "m" => "PKTUSB\n3000\n".to_string(),
+                                c if c.starts_with("F ") => {
+                                    match c[2..].trim().parse::<f64>() {
+                                        Ok(hz) => {
+                                            *dial.lock().unwrap() = hz;
+                                            "RPRT 0\n".to_string()
+                                        }
+                                        Err(_) => "RPRT -1\n".to_string(),
+                                    }
+                                }
                                 _ => "RPRT -1\n".to_string(),
                             },
                         };
@@ -793,6 +990,9 @@ mod tests {
         }
         fn transmitting(&self) -> bool {
             self.ptt.load(Ordering::SeqCst)
+        }
+        fn tuned_to(&self) -> f64 {
+            *self.dial.lock().unwrap()
         }
     }
 
@@ -1169,15 +1369,54 @@ mod tests {
     #[test]
     fn a_rig_that_refuses_to_key_is_not_shown_as_transmitting() {
         let rig = FakeRig::start();
-        let ptt = Ptt::with_transmitter(Box::new(rig.client()), quick());
-        *rig.reject.lock().unwrap() = Some(-1);
+        // Refuse everything, so the refusal under test cannot be spent on a
+        // poll that happened to go first.
+        let ptt = Ptt::with_transmitter(Box::new(AlwaysRefuses), quick());
         ptt.key(true);
+        let _ = &rig;
 
         assert!(wait_until(|| ptt.state().fault.is_some()), "said nothing about the refusal");
         assert!(!ptt.state().asked, "claimed to be transmitting after a refusal");
         assert_eq!(ptt.state().keyed_for, 0.0, "started a clock over a refused key-down");
         let said = ptt.state().fault.unwrap();
         assert!(said.contains("ptt_type"), "did not say what to check: {said}");
+    }
+
+    /// A rig that says no to everything, for the cases about what a refusal
+    /// means rather than about which command drew it.
+    struct AlwaysRefuses;
+    impl Transmitter for AlwaysRefuses {
+        fn key(&mut self, _on: bool) -> Result<(), Fault> {
+            Err(Fault::Rejected { doing: KEYING, code: -1 })
+        }
+        fn keyed(&mut self) -> Result<Option<bool>, Fault> {
+            Ok(None)
+        }
+        fn describe(&self) -> String {
+            "a rig that says no".to_string()
+        }
+    }
+
+    /// What the rig is tuned to comes from the rig, and tuning it moves it.
+    #[test]
+    fn the_dial_is_read_from_the_rig_and_can_be_moved() {
+        let rig = FakeRig::start();
+        let ptt = Ptt::with_transmitter(Box::new(rig.client()), quick());
+        assert!(
+            wait_until(|| ptt.state().dial_hz == Some(14_074_000.0)),
+            "never read the dial: {:?}",
+            ptt.state()
+        );
+        // The mode comes back off the two-line answer, not half of it.
+        assert_eq!(ptt.state().dial_mode.as_deref(), Some("PKTUSB"));
+
+        ptt.tune(7_078_000.0);
+        assert!(wait_until(|| rig.tuned_to() == 7_078_000.0), "the rig did not move");
+        assert!(
+            wait_until(|| ptt.state().dial_hz == Some(7_078_000.0)),
+            "the reading did not follow the rig"
+        );
+        assert_eq!(ptt.state().fault, None);
     }
 
     /// A daemon that is not there does not become a busy loop against it, and
