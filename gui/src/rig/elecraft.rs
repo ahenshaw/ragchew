@@ -454,11 +454,11 @@ mod tests {
     /// Power in watts and the filter in hertz, in the units the radio wants:
     /// `PC` counts watts and `BW` counts tens of hertz, so 2.7 kHz is 0270.
     ///
-    /// **Unverified against a radio.** These two are read from Elecraft's
-    /// reference rather than from a record off the wire, unlike `IF` — the
-    /// shapes are simple and symmetrical, but the units are exactly the kind of
-    /// thing to check before trusting: a filter set ten times too wide is a
-    /// receiver listening to the whole band.
+    /// Confirmed against a KX3: five watts and 2.7 kHz set from the app read
+    /// back as five watts and 2.7 kHz on the radio's own display. Worth having
+    /// checked — the units are exactly the kind of thing to get wrong, and a
+    /// filter set ten times too wide is a receiver listening to the whole
+    /// band.
     #[test]
     fn power_and_filter_go_out_in_the_radios_own_units() {
         let bench = Bench::default();
