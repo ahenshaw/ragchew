@@ -183,6 +183,26 @@ fn arrow(painter: &egui::Painter, at: egui::Rect, up: bool, colour: Color32) {
     ));
 }
 
+/// Where a signal actually is on the band: the dial, plus or minus the audio
+/// offset the app hears it at.
+///
+/// The sign is the sideband's, which is why this waited for the mode to be
+/// readable. On upper sideband a tone at 1500 Hz of audio is 1500 Hz *above*
+/// the dial; on lower it is that far below. In anything else — FM, AM, CW —
+/// an audio offset is not a displacement from the dial in a way worth printing
+/// as a frequency, so nothing is printed.
+///
+/// `None` when the dial is unknown or the mode is not one of the four, rather
+/// than a number that would be wrong in a way nobody could see.
+fn on_the_band(dial: Option<f64>, mode: Option<&str>, audio_hz: f64) -> Option<f64> {
+    let sign = match mode? {
+        "USB" | "PKTUSB" | "DATA" => 1.0,
+        "LSB" | "PKTLSB" | "DATA-REV" => -1.0,
+        _ => return None,
+    };
+    Some(dial? + sign * audio_hz)
+}
+
 /// A frequency the way a rig shows it: megahertz, kilohertz, hertz, in groups
 /// a reader can say out loud — 14.074.000 rather than 14074000.
 ///
@@ -2954,6 +2974,9 @@ impl App {
         // hand has nothing to measure, so there they are the operator's to set.
         let modes = self.enabled_modes();
         let busy = self.tx.as_ref().map_or(0.0, |t| t.busy_for());
+        // Read before the QSO is borrowed: with a rig on the other end, a
+        // station's audio offset can be said as the frequency it really is.
+        let rig = self.ptt_state();
         let Some(q) = self.qsos.active_qso_mut() else { return };
         let bound = q.channel.is_some();
 
@@ -2961,7 +2984,8 @@ impl App {
         // own text cursor and its own scroll position in the log. Without it
         // egui identifies the widgets by where they sit in the layout, and all
         // the tabs — being the same layout — would share one set.
-        let (send, abort) = ui.push_id(q.id, |ui| Self::qso_body(ui, q, &modes, bound, busy, now_s)).inner;
+        let (send, abort) = ui.push_id(q.id, |ui| Self::qso_body(ui, q, &modes, bound, busy, now_s, rig.dial_hz, rig.dial_mode))
+            .inner;
 
         if abort {
             if let Some(t) = self.tx.as_mut() {
@@ -3195,6 +3219,7 @@ impl App {
 
     /// The active QSO's info, log, reply box and send button. Returns whether
     /// the operator asked to send, and whether they asked to abort.
+    #[allow(clippy::too_many_arguments)]
     fn qso_body(
         ui: &mut egui::Ui,
         q: &mut crate::qso::Qso,
@@ -3202,6 +3227,10 @@ impl App {
         bound: bool,
         busy: f64,
         now_s: f64,
+        // What the rig is tuned to and the sideband it is in, so a station's
+        // audio offset can be said as the frequency it really is.
+        dial: Option<f64>,
+        dial_mode: Option<String>,
     ) -> (bool, bool) {
         let (mut send, mut abort) = (false, false);
         let dark = ui.visuals().dark_mode;
@@ -3324,16 +3353,26 @@ impl App {
                     Some(db) => format!("{db:+.0} dB"),
                     None => "— dB".to_string(),
                 };
+                // With a rig on the other end of a cable, the audio offset can
+                // be said as the frequency it actually is: the dial plus or
+                // minus it, depending on the sideband. That is the number an
+                // operator writes in a log or says on the air, and until now
+                // the app knew both halves of it and printed neither.
+                let on_band = on_the_band(dial, dial_mode.as_deref(), q.hz)
+                    .map(|hz| format!("{}  ", megahertz(hz)))
+                    .unwrap_or_default();
                 ui.label(format!(
-                    "{:.0} Hz  {:+.1} drift  {snr}  ×{:.1}",
+                    "{on_band}{:.0} Hz  {:+.1} drift  {snr}  ×{:.1}",
                     q.hz,
                     q.drift_hz,
                     q.quality.max(0.0)
                 ))
                 .on_hover_text(
-                    "carrier, how far it has wandered since first heard, the station's \
-                     signal-to-noise in 2.5 kHz — the figure a signal report means — and \
-                     the last decode's confidence in multiples of the mode's noise floor",
+                    "where the station is on the band — the dial plus this audio offset, \
+                     as the sideband has it — then the offset itself, how far it has \
+                     wandered since first heard, the station's signal-to-noise in 2.5 kHz \
+                     — the figure a signal report means — and the last decode's confidence \
+                     in multiples of the mode's noise floor",
                 );
             } else {
                 ui.horizontal(|ui| {
@@ -6374,6 +6413,29 @@ mod tests {
         let mut restored = App::base((0.0, 4000.0));
         restored.apply(serde_json::from_str(&text).unwrap());
         assert!(restored.rig_more, "the window forgot that they were open");
+    }
+
+    /// An audio offset becomes a frequency on the band, with the sideband
+    /// deciding which way.
+    ///
+    /// The sign is the whole of it. On upper sideband a station heard at
+    /// 1500 Hz is 1500 Hz above the dial; on lower it is that far below, and a
+    /// log written from the wrong one is off by three kilohertz.
+    #[test]
+    fn an_offset_becomes_the_frequency_it_really_is() {
+        let dial = Some(14_074_000.0);
+        assert_eq!(on_the_band(dial, Some("USB"), 1500.0), Some(14_075_500.0));
+        assert_eq!(on_the_band(dial, Some("PKTUSB"), 1500.0), Some(14_075_500.0));
+        assert_eq!(on_the_band(dial, Some("DATA"), 1500.0), Some(14_075_500.0));
+        assert_eq!(on_the_band(dial, Some("LSB"), 1500.0), Some(14_072_500.0));
+        assert_eq!(on_the_band(dial, Some("DATA-REV"), 1500.0), Some(14_072_500.0));
+
+        // Nothing is printed where an offset is not a displacement from the
+        // dial, or where the dial is unknown.
+        assert_eq!(on_the_band(dial, Some("FM"), 1500.0), None);
+        assert_eq!(on_the_band(dial, Some("CW"), 1500.0), None);
+        assert_eq!(on_the_band(dial, None, 1500.0), None);
+        assert_eq!(on_the_band(None, Some("USB"), 1500.0), None);
     }
 
     /// A frequency reads as a frequency, in the groups an operator says out
