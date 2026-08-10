@@ -285,9 +285,10 @@ const VFO_SCALE: f32 = 1.9;
 const TX_RED: Color32 = Color32::from_rgb(255, 60, 60);
 const TX_ELSEWHERE: Color32 = Color32::from_rgb(255, 170, 40);
 
-/// Where a USB serial cable turns up on Linux, which is where an Elecraft
-/// KXUSB lands.
-const DEFAULT_RIG_DEVICE: &str = "/dev/ttyUSB0";
+/// Where a USB serial cable is likeliest to turn up on this platform, which is
+/// where an Elecraft KXUSB lands. Only what shows before anything is detected
+/// or saved — see [`rig::serial::DEFAULT_DEVICE`].
+const DEFAULT_RIG_DEVICE: &str = rig::serial::DEFAULT_DEVICE;
 
 /// Where `rigctld` listens unless told otherwise — hamlib's own default.
 const DEFAULT_RIG_HOST: &str = "127.0.0.1";
@@ -1680,6 +1681,15 @@ struct App {
     /// is open — see [`PW_REFRESH_S`].
     pw: crate::pipewire::Routing,
     pw_at: Option<std::time::Instant>,
+
+    /// Serial ports the machine says it has, as of [`App::rig_ports_at`].
+    ///
+    /// Held for the same reason as [`App::pw`]: the menu that shows them
+    /// redraws every frame, and finding them means reading a directory or the
+    /// registry. Refreshed only while that menu is open — see
+    /// [`PORT_REFRESH_S`].
+    rig_ports: Vec<rig::serial::Candidate>,
+    rig_ports_at: Option<std::time::Instant>,
 }
 
 /// How stale the routing list may get while its menu is open.
@@ -1688,6 +1698,13 @@ struct App {
 /// a browser tab started *because* the menu was empty shows up without the
 /// operator wondering whether the feature works.
 const PW_REFRESH_S: f64 = 1.5;
+
+/// How stale the list of serial ports may get while its menu is open.
+///
+/// Same bargain as [`PW_REFRESH_S`], and the same reason to keep it short: the
+/// operator who finds the list empty goes and plugs the cable in, and wants to
+/// see it appear without having closed and reopened anything.
+const PORT_REFRESH_S: f64 = 1.5;
 
 /// One line for the status bar.
 ///
@@ -1861,6 +1878,8 @@ impl App {
             cleared_all_at: f64::NEG_INFINITY,
             pw: crate::pipewire::Routing::default(),
             pw_at: None,
+            rig_ports: Vec::new(),
+            rig_ports_at: None,
         }
     }
 
@@ -3925,6 +3944,13 @@ impl App {
         let pw_stale = self
             .pw_at
             .is_none_or(|t| t.elapsed().as_secs_f64() > PW_REFRESH_S);
+        // Same again for the serial ports, and for the same reason: the menu
+        // asks, the scan happens once afterwards rather than inside a closure
+        // that runs per frame.
+        let mut want_ports = false;
+        let ports_stale = self
+            .rig_ports_at
+            .is_none_or(|t| t.elapsed().as_secs_f64() > PORT_REFRESH_S);
         let mut chosen_output: Option<Option<String>> = None; // Some(None) = default
         let mut modes_changed = false;
         let mut open_file: Option<PathBuf> = None;
@@ -4207,11 +4233,36 @@ impl App {
                         if matches!(self.rig, rig::Keying::Elecraft { .. }) {
                             let mut device = self.rig_device.clone();
                             let mut baud = self.rig_baud;
+                            want_ports |= ports_stale;
                             ui.horizontal(|ui| {
                                 ui.label("port");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut device).desired_width(150.0),
                                 );
+                                // The list is a shortcut, not the setting: the
+                                // field above stays the answer, because a port
+                                // that has not enumerated — a cable plugged in
+                                // a moment ago, a virtual port from something
+                                // else — is still one the operator can type.
+                                ui.menu_button("…", |ui| {
+                                    ui.set_min_width(320.0);
+                                    if self.rig_ports.is_empty() {
+                                        ui.weak("no serial ports found");
+                                    }
+                                    for port in &self.rig_ports {
+                                        let on = port.path == device;
+                                        if ui
+                                            .selectable_label(on, &port.label)
+                                            .on_hover_text(&port.path)
+                                            .clicked()
+                                        {
+                                            device = port.path.clone();
+                                            ui.close();
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text("serial ports this machine has");
                             });
                             ui.horizontal(|ui| {
                                 ui.label("baud");
@@ -4547,6 +4598,10 @@ impl App {
         if want_pw {
             self.pw = crate::pipewire::survey();
             self.pw_at = Some(std::time::Instant::now());
+        }
+        if want_ports {
+            self.rig_ports = rig::serial::ports();
+            self.rig_ports_at = Some(std::time::Instant::now());
         }
 
         // switch input device if the user picked a different one

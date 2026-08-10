@@ -43,15 +43,33 @@ serde = { version = "1", optional = true, features = ["derive"] }
 # Reading `pw-dump`, which is how the PipeWire graph is inspected. See
 # `pipewire.rs` for why that is a subprocess rather than libpipewire.
 serde_json = { version = "1", optional = true }
-# Serial ports, for a radio on a cable rather than behind a daemon. `termios`
-# and a handful of constants is all that is wanted, and libc is already in the
-# tree under cpal, so this is a line in a manifest rather than a dependency.
-libc = "0.2"
 # Widget styling for the desktop app: an installable theme that the egui
 # built-ins inherit, plus a few widgets of its own. Pinned to the same egui as
 # eframe pulls in — it tracks egui's release cadence, so a bump here has to move
 # with one there.
 egui-elegance = { version = "0.14", optional = true }
+
+# Serial ports, for a radio on a cable rather than behind a daemon. Neither of
+# these is a dependency in any meaningful sense: on Unix cpal already pulls in
+# libc, and on Windows winit already pulls in windows-sys, so each platform is
+# asking for a header it has rather than adding a crate to its build. `termios`
+# on one side and `DCB` on the other is all that is wanted — see `rig/serial`
+# for why that is by hand rather than a serial-port crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Kept at the version winit resolves to, so the two unify into one build of it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_Communication",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    # Not for anything this asks the security API to do: `CreateFileW` takes a
+    # `SECURITY_ATTRIBUTES` pointer, which is null here, and windows-sys gates
+    # the whole function on the feature that declares the type.
+    "Win32_Security",
+] }
 
 [dev-dependencies]
 png = "0.17"

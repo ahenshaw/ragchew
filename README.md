@@ -142,9 +142,12 @@ on a USB codec (or VOX) needs.
 
 An **Elecraft** KX3 or K3 needs no daemon at all: **☰ ▸ Rig ▸ Elecraft**, the
 serial port the cable is on, and the rate the radio's menu is set to (38400
-from the factory). It keys, tunes, reads the frequency and mode, and reads back whether the radio
-is transmitting — so a hand on the radio's own PTT shows on the TX button the
-same as one on the app's.
+from the factory). The **…** beside the port lists what the machine says it has
+— `/dev/serial/by-id/…` on Linux, named after the adapter rather than the order
+it enumerated in, `cu.` devices on macOS, `COM` ports on Windows — and the field
+stays typeable for a port that list does not know about. It keys, tunes, reads
+the frequency and mode, and reads back whether the radio is transmitting — so a
+hand on the radio's own PTT shows on the TX button the same as one on the app's.
 
 For any other rig, **☰ ▸ Rig** points the app at hamlib's `rigctld`
 — run `rigctld -m <model> -r <device>` and give it the address. Hamlib will not
