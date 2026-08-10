@@ -149,6 +149,15 @@ stays typeable for a port that list does not know about. It keys, tunes, reads
 the frequency and mode, and reads back whether the radio is transmitting — so a
 hand on the radio's own PTT shows on the TX button the same as one on the app's.
 
+A **Yaesu** is the same deal on the same two settings: **☰ ▸ Rig ▸ Yaesu**, for
+an FT-991A, FT-891, FT-710, FTDX10, FTDX101, and back through the FT-450D and
+FTDX3000. The rate is menu 031, `CAT RATE`, and these leave the factory at 4800
+rather than an Elecraft's 38400. One thing it does not do: show the receiver's
+filter, or shade the waterfall outside it. Yaesu reports the filter as an index
+into a per-mode table rather than a width in hertz, and there is no honest way
+to turn one into the other — so it is left unanswered instead of guessed at.
+The older FT-817 and FT-857 speak a different, binary CAT and are not this.
+
 For any other rig, **☰ ▸ Rig** points the app at hamlib's `rigctld`
 — run `rigctld -m <model> -r <device>` and give it the address. Hamlib will not
 key a rig it has no PTT method for, and says so with "not available on this
@@ -180,12 +189,14 @@ apart — the last of those by unwinding through the code that unkeys, since tha
 is the only mechanism a panic cannot skip.
 
 Each directly-driven radio is its own feature, so a build carries only the
-protocols it will use. `elecraft` is on by default and is the only one so far;
-`serial` is the port underneath, turned on by whichever rig features are rather
-than chosen directly.
+protocols it will use. `elecraft` and `yaesu` are both on by default; `serial`
+is the port underneath and `cat` the command language the two share, turned on
+by whichever rig features are rather than chosen directly.
 
 ```
-cargo build --release                                              # rigctld + Elecraft
+cargo build --release                                              # rigctld + both radios
+cargo build --release -p ragchew-gui --no-default-features \
+    --features desktop,yaesu                                       # rigctld + Yaesu
 cargo build --release -p ragchew-gui --no-default-features \
     --features desktop                                             # rigctld only
 ```

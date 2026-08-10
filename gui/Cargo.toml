@@ -14,7 +14,7 @@ name = "ragchew"
 path = "src/main.rs"
 
 [features]
-default = ["desktop", "elecraft"]
+default = ["desktop", "elecraft", "yaesu"]
 # The interactive eframe app + live audio. Disable (`--no-default-features`) to
 # build just the pure rendering pieces (e.g. the render_png example) without the
 # windowing/audio stack.
@@ -48,8 +48,17 @@ desktop = [
 # it is a port with nothing to say into it.
 serial = ["dep:libc", "dep:windows-sys"]
 
+# Semicolon-terminated ASCII CAT, which both makes below happen to speak. Also
+# not a rig, and turned on the same way: it is the link, not the vocabulary.
+cat = ["serial"]
+
 # An Elecraft KX3 or K3 on a serial cable.
-elecraft = ["serial"]
+elecraft = ["cat"]
+
+# A Yaesu on a serial cable: FT-991A, FT-891, FT-710, FTDX10, FTDX101, and back
+# through the FT-450D and FTDX3000. The older 5-byte binary CAT of an FT-817 or
+# FT-857 is a different protocol and is not this.
+yaesu = ["cat"]
 
 [dependencies]
 ragchew = { path = ".." }

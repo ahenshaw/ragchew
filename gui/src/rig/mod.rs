@@ -33,10 +33,17 @@
 //! transmitting into an empty band on somebody's bench: a key-down that outlasts
 //! its limit, an owner that goes away, and a panic anywhere in the thread.
 
+/// Semicolon-terminated ASCII CAT, which both directly-driven makes speak.
+/// Behind `cat`, which their features turn on.
+#[cfg(feature = "cat")]
+mod cat;
 /// A KX3 or K3, spoken to directly. Behind the `elecraft` feature — see the
 /// manifest for why each directly-driven rig is its own.
 #[cfg(feature = "elecraft")]
 pub mod elecraft;
+/// An FT-991A, FT-891, FT-710 or FTDX, spoken to directly. Behind `yaesu`.
+#[cfg(feature = "yaesu")]
+pub mod yaesu;
 /// The port every directly-driven rig is reached over. Behind `serial`, which
 /// the rig features turn on rather than the operator.
 #[cfg(feature = "serial")]
@@ -71,6 +78,29 @@ pub enum Keying {
     /// instead of two.
     #[cfg(feature = "elecraft")]
     Elecraft { device: String, baud: u32 },
+    /// A Yaesu on a serial cable, spoken to directly. Same reasoning as the
+    /// Elecraft, and a different command set behind the same kind of link.
+    #[cfg(feature = "yaesu")]
+    Yaesu { device: String, baud: u32 },
+}
+
+impl Keying {
+    /// Whether the rig is reached over a serial port, and so has a port and a
+    /// rate to configure.
+    ///
+    /// True for every directly-driven radio and false for `rigctld`, which is
+    /// reached over a socket, and for keying nothing at all. This is what the
+    /// settings panel asks rather than naming a make, so a radio added here
+    /// gets the port and rate controls without touching the interface.
+    pub fn on_a_cable(&self) -> bool {
+        match self {
+            Keying::None | Keying::RigCtld { .. } => false,
+            #[cfg(feature = "elecraft")]
+            Keying::Elecraft { .. } => true,
+            #[cfg(feature = "yaesu")]
+            Keying::Yaesu { .. } => true,
+        }
+    }
 }
 
 /// Why a rig could not be made to do something.
@@ -506,6 +536,8 @@ pub fn modes_for(keying: &Keying) -> &'static [&'static str] {
         }
         #[cfg(feature = "elecraft")]
         Keying::Elecraft { .. } => elecraft::MODES,
+        #[cfg(feature = "yaesu")]
+        Keying::Yaesu { .. } => yaesu::MODES,
     }
 }
 
@@ -516,6 +548,14 @@ pub fn open(keying: &Keying) -> Box<dyn Transmitter> {
     match keying {
         Keying::None => Box::new(Unkeyed),
         Keying::RigCtld { host, port } => Box::new(RigCtld::new(host, *port)),
+        #[cfg(feature = "yaesu")]
+        Keying::Yaesu { device, baud } => match serial::Port::open(device, *baud) {
+            Ok(port) => {
+                let what = port.describe().to_string();
+                Box::new(yaesu::Yaesu::new(port, what))
+            }
+            Err(e) => Box::new(Unreachable(format!("{device}: {e}"))),
+        },
         #[cfg(feature = "elecraft")]
         Keying::Elecraft { device, baud } => match serial::Port::open(device, *baud) {
             Ok(port) => {

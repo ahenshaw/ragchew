@@ -345,6 +345,16 @@ const KEYERS: &[Keyer] = &[
         hover: "a KX3 or K3 on a serial cable, spoken to directly — no daemon to run. The \
                 rate is whatever the radio's menu says; a KX3 leaves the factory at 38400.",
     },
+    #[cfg(feature = "yaesu")]
+    Keyer {
+        tag: "yaesu",
+        label: "Yaesu",
+        hover: "an FT-991A, FT-891, FT-710 or FTDX on a serial cable, spoken to directly — \
+                no daemon to run. The rate is menu 031, CAT RATE, and an FT-991A leaves the \
+                factory at 4800 rather than the Elecraft's 38400. The filter is not shown \
+                for these: a Yaesu reports its width as a table index rather than a number \
+                of hertz. Not the older FT-817 or FT-857, which speak a different CAT.",
+    },
 ];
 
 /// The word for a setting, as written to the settings file.
@@ -354,6 +364,8 @@ fn keying_tag(keying: &rig::Keying) -> &'static str {
         rig::Keying::RigCtld { .. } => "rigctld",
         #[cfg(feature = "elecraft")]
         rig::Keying::Elecraft { .. } => "elecraft",
+        #[cfg(feature = "yaesu")]
+        rig::Keying::Yaesu { .. } => "yaesu",
     }
 }
 
@@ -2845,6 +2857,11 @@ impl App {
                 device: self.rig_device.clone(),
                 baud: self.rig_baud,
             },
+            #[cfg(feature = "yaesu")]
+            "yaesu" => rig::Keying::Yaesu {
+                device: self.rig_device.clone(),
+                baud: self.rig_baud,
+            },
             _ => rig::Keying::None,
         }
     }
@@ -4300,8 +4317,12 @@ impl App {
                                 self.set_keying(keying);
                             }
                         }
-                        #[cfg(feature = "elecraft")]
-                        if matches!(self.rig, rig::Keying::Elecraft { .. }) {
+                        // Every radio on a cable gets the same two settings,
+                        // asked for as "is this on a cable" rather than by
+                        // make: the port and the rate are the same question
+                        // whoever built the radio.
+                        #[cfg(feature = "serial")]
+                        if self.rig.on_a_cable() {
                             let mut device = self.rig_device.clone();
                             let mut baud = self.rig_baud;
                             want_ports |= ports_stale;
@@ -4337,6 +4358,9 @@ impl App {
                             });
                             ui.horizontal(|ui| {
                                 ui.label("baud");
+                                // The four every CAT radio here offers: an
+                                // Elecraft's menu and a Yaesu's menu 031 list
+                                // the same set.
                                 for rate in [4800u32, 9600, 19200, 38400] {
                                     if ui.selectable_label(baud == rate, rate.to_string()).clicked()
                                     {
@@ -4348,13 +4372,16 @@ impl App {
                             // the way past — see the note below about half-typed
                             // addresses; a half-typed device name is the same
                             // thing.
+                            //
+                            // Rebuilt as whatever make is selected, by asking
+                            // the current setting for its own tag: the panel
+                            // does not know which radio it is editing and has
+                            // no reason to.
                             if device != self.rig_device || baud != self.rig_baud {
                                 self.rig_device = device;
                                 self.rig_baud = baud;
-                                self.set_keying(rig::Keying::Elecraft {
-                                    device: self.rig_device.clone(),
-                                    baud: self.rig_baud,
-                                });
+                                let keying = self.keying_for(keying_tag(&self.rig));
+                                self.set_keying(keying);
                             }
                         }
                         if matches!(self.rig, rig::Keying::RigCtld { .. }) {
@@ -6528,6 +6555,35 @@ mod tests {
         // Whatever else is compiled in, doing nothing is always on offer and
         // is always what an unselected control falls back to.
         assert_eq!(KEYERS[0].tag, "none", "the first choice is not the harmless one");
+    }
+
+    /// Switching between two radios on a cable keeps the cable.
+    ///
+    /// The port and the rate are one shared pair rather than one per make, so
+    /// changing which radio is on the other end does not ask for them again —
+    /// and the settings panel rebuilds whichever make is selected by asking the
+    /// current setting for its own tag, rather than naming one.
+    #[test]
+    #[cfg(all(feature = "elecraft", feature = "yaesu"))]
+    fn changing_make_keeps_the_port_and_rate() {
+        let mut app = App::base((0.0, 4000.0));
+        app.rig_device = "/dev/ttyUSB4".to_string();
+        app.rig_baud = 19200;
+
+        let elecraft = app.keying_for("elecraft");
+        assert_eq!(
+            elecraft,
+            rig::Keying::Elecraft { device: "/dev/ttyUSB4".into(), baud: 19200 }
+        );
+
+        let yaesu = app.keying_for("yaesu");
+        assert_eq!(yaesu, rig::Keying::Yaesu { device: "/dev/ttyUSB4".into(), baud: 19200 });
+
+        // And both are radios the port-and-rate panel offers itself for, which
+        // is what the panel asks rather than naming a make.
+        assert!(elecraft.on_a_cable() && yaesu.on_a_cable());
+        assert!(!rig::Keying::None.on_a_cable());
+        assert!(!rig::Keying::RigCtld { host: "x".into(), port: 1 }.on_a_cable());
     }
 
     /// The rate the settings start at is the one the radio leaves the factory

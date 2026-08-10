@@ -22,9 +22,13 @@
 //! one cable and no daemon, and because the protocol is small enough that
 //! supporting it directly costs less than explaining how to run hamlib. The
 //! daemon stays for every other radio.
+//!
+//! The link itself — reading an answer, and matching it to the question that
+//! was asked — is [`super::cat`], which the Yaesu driver shares.
 
 use std::io::{Read, Write};
 
+use super::cat::Cat;
 use super::{
     Fault, Transmitter, KEYING, READING_DIAL, READING_PTT, SETTING_MODE, SETTING_POWER,
     SETTING_WIDTH, TUNING,
@@ -40,103 +44,14 @@ pub const MODES: &[&str] = &["DATA", "DATA-REV", "USB", "LSB", "CW", "CW-REV", "
 pub const KX3_BAUD: u32 = 38400;
 
 /// An Elecraft radio, over anything that carries bytes.
-///
-/// Generic over the link so the protocol can be tested without a radio or a
-/// serial port: everything below the `;` is exercised against a pair of buffers.
 pub struct Elecraft<L> {
-    link: L,
+    cat: Cat<L>,
     what: String,
-    /// Cleared once the radio has been told to stop volunteering.
-    greeted: bool,
 }
 
 impl<L: Read + Write + Send> Elecraft<L> {
     pub fn new(link: L, what: String) -> Elecraft<L> {
-        Elecraft { link, what, greeted: false }
-    }
-
-    /// Ask a question and read *its* answer.
-    ///
-    /// Records are matched to the question by their two-letter prefix rather
-    /// than taken in order, and anything else that turns up is discarded. A
-    /// radio volunteers: `AI0;` is meant to stop it, and on a KX3 being tuned
-    /// by hand it does not entirely — each change of frequency can produce an
-    /// `FA` nobody asked for. Read in order, one of those puts every answer
-    /// after it one command out of step, and what comes back is the tail of the
-    /// record before: a frequency that is somebody's previous reading, then
-    /// eventually a partial record that parses as nothing at all.
-    ///
-    /// Which is what "the rig answered nonsense" was, in the middle of tuning
-    /// from 14 MHz to 7.
-    ///
-    /// Commands that *set* something are answered by nothing at all, so they do
-    /// not come through here — a read after `TX;` would wait out the timeout
-    /// and report a radio that is working perfectly as one that is not.
-    fn ask(&mut self, query: &str) -> Result<String, Fault> {
-        self.greet()?;
-        self.write(query)?;
-        let want = query.trim_end_matches(';');
-        // Bounded, so a radio talking continuously cannot hold this thread:
-        // past a handful of unrelated records the link is not one this can use,
-        // and saying so beats reading for ever.
-        for _ in 0..8 {
-            let answer = self.read_answer(query)?;
-            if answer.starts_with(want) {
-                return Ok(answer);
-            }
-        }
-        Err(Fault::Protocol(format!("{query:?} was answered with records for other commands")))
-    }
-
-    fn tell(&mut self, command: &str) -> Result<(), Fault> {
-        self.greet()?;
-        self.write(command)
-    }
-
-    fn greet(&mut self) -> Result<(), Fault> {
-        if !self.greeted {
-            self.greeted = true;
-            self.write("AI0;")?;
-        }
-        Ok(())
-    }
-
-    fn write(&mut self, command: &str) -> Result<(), Fault> {
-        self.link
-            .write_all(command.as_bytes())
-            .and_then(|()| self.link.flush())
-            .map_err(|e| Fault::Link(format!("sending {command:?}: {e}")))
-    }
-
-    fn read_answer(&mut self, command: &str) -> Result<String, Fault> {
-        let mut answer = String::new();
-        let mut byte = [0u8; 1];
-        // Elecraft's longest answer is `IF`, at 38 characters; the bound is
-        // generous and only exists so that a radio babbling cannot hold this
-        // thread for ever.
-        while answer.len() < 128 {
-            match self.link.read(&mut byte) {
-                // A configured port returns nothing when its read timer
-                // expires, which is the shape a silent radio has.
-                Ok(0) => return Err(Fault::Timeout),
-                Ok(_) => {
-                    let c = byte[0] as char;
-                    if c == ';' {
-                        return Ok(answer);
-                    }
-                    // Anything before the answer proper — a stray newline, the
-                    // tail of something the radio said unprompted — is not part
-                    // of it.
-                    if !c.is_control() {
-                        answer.push(c);
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(Fault::Timeout),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(Fault::Link(format!("reading the answer to {command:?}: {e}"))),
-            }
-        }
-        Err(Fault::Protocol(format!("{command:?} was answered at length and without a `;`")))
+        Elecraft { cat: Cat::new(link), what }
     }
 }
 
@@ -214,14 +129,14 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
     fn key(&mut self, on: bool) -> Result<(), Fault> {
         // Neither is answered, so neither is read back. The rig is asked what
         // it is doing separately, which is the only honest way to know.
-        self.tell(if on { "TX;" } else { "RX;" }).map_err(|e| match e {
+        self.cat.tell(if on { "TX;" } else { "RX;" }).map_err(|e| match e {
             Fault::Link(m) => Fault::Link(format!("{KEYING}: {m}")),
             other => other,
         })
     }
 
     fn keyed(&mut self) -> Result<Option<bool>, Fault> {
-        let answer = self.ask("IF;")?;
+        let answer = self.cat.ask("IF;")?;
         let Some(body) = answer.strip_prefix("IF") else {
             return Err(Fault::Protocol(format!(
                 "{READING_PTT}: expected an IF record, got {answer:?}"
@@ -233,7 +148,7 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
     }
 
     fn dial_hz(&mut self) -> Result<Option<f64>, Fault> {
-        let answer = self.ask("FA;")?;
+        let answer = self.cat.ask("FA;")?;
         match frequency_in(&answer) {
             Some(hz) => Ok(Some(hz)),
             None => Err(Fault::Protocol(format!(
@@ -247,11 +162,11 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
         if hz > 99_999_999_999 {
             return Err(Fault::Rejected { doing: TUNING, code: -1 });
         }
-        self.tell(&format!("FA{hz:011};"))
+        self.cat.tell(&format!("FA{hz:011};"))
     }
 
     fn dial_mode(&mut self) -> Result<Option<String>, Fault> {
-        let answer = self.ask("MD;")?;
+        let answer = self.cat.ask("MD;")?;
         match answer.strip_prefix("MD").and_then(|d| d.chars().next()) {
             Some(digit) => Ok(Some(mode_name(digit).to_string())),
             None => Err(Fault::Protocol(format!("expected an MD record, got {answer:?}"))),
@@ -265,24 +180,24 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
         let Some(digit) = mode_digit(mode) else {
             return Err(Fault::Rejected { doing: SETTING_MODE, code: -1 });
         };
-        self.tell(&format!("MD{digit};"))
+        self.cat.tell(&format!("MD{digit};"))
     }
 
     fn power_w(&mut self) -> Result<Option<f64>, Fault> {
         // `PCnnn;` — watts, three digits.
-        let answer = self.ask("PC;")?;
+        let answer = self.cat.ask("PC;")?;
         Ok(answer.strip_prefix("PC").and_then(|d| d.trim().parse::<f64>().ok()))
     }
 
     fn set_power_w(&mut self, watts: f64) -> Result<(), Fault> {
         let w = watts.round().clamp(0.0, 999.0) as u32;
         let _ = SETTING_POWER;
-        self.tell(&format!("PC{w:03};"))
+        self.cat.tell(&format!("PC{w:03};"))
     }
 
     fn width_hz(&mut self) -> Result<Option<f64>, Fault> {
         // `BWnnnn;` — the filter width in tens of hertz, so 0270 is 2.70 kHz.
-        let answer = self.ask("BW;")?;
+        let answer = self.cat.ask("BW;")?;
         Ok(answer
             .strip_prefix("BW")
             .and_then(|d| d.trim().parse::<f64>().ok())
@@ -292,7 +207,7 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
     fn set_width_hz(&mut self, hz: f64) -> Result<(), Fault> {
         let tens = (hz / 10.0).round().clamp(0.0, 9999.0) as u32;
         let _ = SETTING_WIDTH;
-        self.tell(&format!("BW{tens:04};"))
+        self.cat.tell(&format!("BW{tens:04};"))
     }
 
     fn describe(&self) -> String {
@@ -303,49 +218,16 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use crate::rig::cat::bench::Bench;
 
-    /// A radio made of two buffers: what it was told, and what it will say.
-    #[derive(Clone, Default)]
-    struct Bench {
-        heard: Arc<Mutex<Vec<u8>>>,
-        says: Arc<Mutex<Vec<u8>>>,
+    /// The bench radio, wired to this driver.
+    trait AsElecraft {
+        fn rig(&self) -> Elecraft<Bench>;
     }
 
-    impl Bench {
-        fn answering(answer: &str) -> Bench {
-            let b = Bench::default();
-            b.says.lock().unwrap().extend_from_slice(answer.as_bytes());
-            b
-        }
-        fn heard(&self) -> String {
-            String::from_utf8(self.heard.lock().unwrap().clone()).unwrap()
-        }
+    impl AsElecraft for Bench {
         fn rig(&self) -> Elecraft<Bench> {
             Elecraft::new(self.clone(), "a bench".to_string())
-        }
-    }
-
-    impl Read for Bench {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let mut says = self.says.lock().unwrap();
-            if says.is_empty() {
-                return Ok(0); // a silent radio, as a timed-out port reads
-            }
-            let n = buf.len().min(says.len());
-            buf[..n].copy_from_slice(&says[..n]);
-            says.drain(..n);
-            Ok(n)
-        }
-    }
-
-    impl Write for Bench {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.heard.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
         }
     }
 
