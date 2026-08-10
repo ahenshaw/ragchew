@@ -2182,7 +2182,13 @@ impl App {
             // A little room around the word, so pointing at it is not a matter
             // of hitting eight characters exactly.
             let hot = mode_box.expand2(egui::vec2(4.0, 3.0));
-            let over_word = ui.interact(hot, dial_id.with("mode"), egui::Sense::click()).hovered();
+            // Where the pointer is, by geometry rather than by asking egui
+            // whether this is hovered. Hover belongs to the topmost layer, and
+            // a tooltip is a layer: with one open over the list, neither the
+            // word nor the list is hovered, the list closes, and reaching for
+            // an option dismisses it.
+            let at = ui.input(|i| i.pointer.interact_pos());
+            let over_word = at.is_some_and(|p| hot.contains(p));
             // Kept open while the pointer is on the word *or* in the list.
             // Without the second half, reaching for a mode dismisses the list
             // on the way — the same trap the digit arrows fell into.
@@ -2209,7 +2215,10 @@ impl App {
                             }
                         });
                     });
-                self.mode_menu = area.response.hovered() || over_word;
+                // Same again: the pointer inside the list's own rectangle,
+                // not egui's opinion about who is hovered.
+                let over_list = at.is_some_and(|p| area.response.rect.contains(p));
+                self.mode_menu = over_list || over_word;
             }
         }
 
@@ -2451,6 +2460,13 @@ impl App {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
         }
 
+        // No tooltip while the modes are showing. It is help about the digits,
+        // it is drawn in a layer above everything here, and it would sit over
+        // the list it has nothing to do with — hiding the options and taking
+        // the hover that keeps the list open.
+        if self.mode_menu {
+            return;
+        }
         let hover = match (st.dial_hz, st.fault.as_deref()) {
             (_, Some(fault)) => fault.to_string(),
             (Some(_), None) => "what the rig is tuned to. Scroll or click the arrows over a \
@@ -6158,6 +6174,54 @@ mod tests {
         fn describe(&self) -> String {
             "a flag".to_string()
         }
+    }
+
+    /// The list of modes stays up while the pointer travels into it, and
+    /// nothing is drawn over it while it is there.
+    ///
+    /// Both were the same fault. The dial's tooltip is a layer above the list:
+    /// it covered the options, and while the pointer was over *it* neither the
+    /// word nor the list counted as hovered — so reaching for an option closed
+    /// the thing being reached for.
+    #[test]
+    fn the_mode_list_survives_being_reached_for() {
+        let mut app = app_with_a_dial(14_074_000.0);
+        app.rig = rig::Keying::RigCtld { host: "x".into(), port: 1 };
+        let mut hand = Hand::new();
+
+        // Found in this hand's own window: a layout belongs to the context that
+        // produced it, and one measured elsewhere is a few points out.
+        hand.hover(&mut app, Pos2::new(-50.0, -50.0));
+        let out = hand.hover(&mut app, Pos2::new(-50.0, -50.0));
+        let word = out
+            .shapes
+            .iter()
+            .find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text() == "PKTUSB" => Some(t.pos),
+                _ => None,
+            })
+            .expect("the mode was not drawn");
+        let on_word = egui::pos2(word.x + 8.0, word.y + 6.0);
+
+        hand.hover(&mut app, on_word);
+        hand.hover(&mut app, on_word);
+        assert!(app.mode_menu, "pointing at the mode did not open the list");
+
+        // What is drawn while it is open: the modes, and not the tooltip.
+        let out = hand.hover(&mut app, on_word);
+        let drawn_now: Vec<String> =
+            drawn(&out).into_iter().map(|(s, _)| s).collect();
+        assert!(drawn_now.iter().any(|s| s == "CW"), "the list is not showing: {drawn_now:?}");
+        assert!(
+            !drawn_now.iter().any(|s| s.starts_with("what the rig is tuned to")),
+            "the dial's tooltip is drawn over the list"
+        );
+
+        // Now move down into the list, which is below the word — the travel
+        // that used to dismiss it.
+        let into_list = egui::pos2(on_word.x, on_word.y + 24.0);
+        hand.hover(&mut app, into_list);
+        assert!(app.mode_menu, "the list closed while the pointer moved into it");
     }
 
     /// A frequency reads as a frequency, in the groups an operator says out
