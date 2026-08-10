@@ -30,7 +30,7 @@ use std::io::{Read, Write};
 
 use super::cat::Cat;
 use super::{
-    Fault, Transmitter, KEYING, READING_DIAL, READING_PTT, SETTING_MODE, SETTING_POWER,
+    Fault, Range, Transmitter, KEYING, READING_DIAL, READING_PTT, SETTING_MODE, SETTING_POWER,
     SETTING_WIDTH, TUNING,
 };
 
@@ -210,6 +210,33 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
         self.cat.tell(&format!("BW{tens:04};"))
     }
 
+    // No `power_range_w`, and the reason is worth writing down so it is not
+    // rediscovered as an oversight.
+    //
+    // A KX3 makes 15 watts and a K3 makes 110, and they answer the same
+    // commands — `PC;` reports the setting, not the ceiling, so there is
+    // nothing here to read it from. Which radio this is could be had from
+    // `OM;`, whose answer identifies the model, but writing that parser
+    // without a radio to check it against would produce a slider that is
+    // confidently wrong, and a power slider that stops in the wrong place is
+    // exactly the kind of quiet error the rest of this file avoids.
+    //
+    // So the power keeps its value box until somebody reads `OM;` off a real
+    // one. That is a smaller failure than the alternative: the operator types
+    // a number, as they did before, rather than dragging to a limit that was
+    // invented here.
+
+    /// The DSP filter's range, which is the radio's and not the model's.
+    ///
+    /// `BW` counts tens of hertz and will take four digits, but the passband a
+    /// K3 or a KX3 will actually make is 50 Hz to 4.0 kHz — the same DSP in
+    /// both, so unlike the power this does not depend on knowing which radio is
+    /// on the end. The lower end is the narrowest CW filter and the upper is
+    /// the widest the roofing filters pass.
+    fn width_range_hz(&mut self) -> Result<Option<Range>, Fault> {
+        Ok(Range::new(50.0, 4000.0))
+    }
+
     fn describe(&self) -> String {
         format!("Elecraft on {}", self.what)
     }
@@ -356,6 +383,26 @@ mod tests {
 
         let bench = Bench::answering("BW0270;");
         assert_eq!(bench.rig().width_hz(), Ok(Some(2700.0)));
+    }
+
+    /// The filter has a range and the power does not, and that is deliberate.
+    ///
+    /// The same DSP is in a K3 and a KX3, so the passband is the radio's and
+    /// not the model's. The power is the model's: 15 watts against 110, with
+    /// nothing in this command set to say which is on the end — `PC;` reports
+    /// the setting, never the ceiling. Until `OM;` has been read off a real
+    /// radio, no slider beats a slider that stops at the wrong watt.
+    ///
+    /// Here so that filling the gap in is a deliberate act with a test to
+    /// update, rather than something that looks like an oversight.
+    #[test]
+    fn the_filter_has_a_range_and_the_power_does_not() {
+        let bench = Bench::default();
+        assert_eq!(bench.rig().width_range_hz(), Ok(Range::new(50.0, 4000.0)));
+        assert_eq!(bench.rig().power_range_w(), Ok(None), "claimed to know the radio's ceiling");
+        // And neither question costs the radio anything: both are answered
+        // from what this file knows, so nothing was said down the cable.
+        assert_eq!(bench.heard(), "");
     }
 
     /// An answer is matched to its question, not taken in turn.

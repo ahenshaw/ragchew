@@ -240,8 +240,47 @@ pub trait Transmitter: Send {
         Err(Fault::Rejected { doing: SETTING_WIDTH, code: -4 })
     }
 
+    /// The range this rig will accept for [`Transmitter::set_power_w`], in
+    /// watts, and for [`Transmitter::set_width_hz`], in Hz.
+    ///
+    /// `None` means "not known", which is a different thing from "no limit" and
+    /// is treated as one: the interface draws a slider only over a range a rig
+    /// actually agreed to, and falls back to a plain value box otherwise. An
+    /// invented range would put a number on screen that no radio ever said —
+    /// and a track whose right-hand end asks for a power the rig does not have
+    /// is worse than no track, because it looks authoritative.
+    ///
+    /// Asked once per link rather than polled: a rig's limits do not move while
+    /// it is plugged in. See [`Session::ranges`].
+    fn power_range_w(&mut self) -> Result<Option<Range>, Fault> {
+        Ok(None)
+    }
+    fn width_range_hz(&mut self) -> Result<Option<Range>, Fault> {
+        Ok(None)
+    }
+
     /// What this is, for the log and the settings menu.
     fn describe(&self) -> String;
+}
+
+/// What a rig will accept for a setting: least, and most.
+///
+/// A pair rather than a `RangeInclusive` because it crosses a thread boundary
+/// inside [`State`] and is copied about, and because both ends are read
+/// separately by the widget that draws it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Range {
+    pub lo: f64,
+    pub hi: f64,
+}
+
+impl Range {
+    /// A range, or `None` if it is not one: a rig that answers with its maximum
+    /// below its minimum, or with either end not a number, has not told us
+    /// anything usable and must not be turned into a slider.
+    pub fn new(lo: f64, hi: f64) -> Option<Range> {
+        (lo.is_finite() && hi.is_finite() && hi > lo).then_some(Range { lo, hi })
+    }
 }
 
 /// A transmitter nobody is keying.
@@ -491,11 +530,40 @@ impl Transmitter for RigCtld {
         RigCtld::expect_rprt(&answer, SETTING_POWER)
     }
 
+    /// The rig's own power range, which hamlib knows exactly.
+    ///
+    /// `RFPOWER` is a fraction of the rig's maximum, so `power2mW` at 1.0 *is*
+    /// that maximum, for whatever radio the daemon was started against. No
+    /// table of models, no guessing: the same command already used to read the
+    /// current power, asked at the ends instead of at the setting.
+    ///
+    /// Per band and mode, because hamlib's answer is — a rig that makes a
+    /// hundred watts on 20 m and ten on 6 m gives two different answers here,
+    /// and the one for where the operator actually is is the useful one.
+    fn power_range_w(&mut self) -> Result<Option<Range>, Fault> {
+        let dial = self.dial_hz()?.unwrap_or(14_074_000.0);
+        let at = |me: &mut Self, fraction: f64| -> Result<Option<f64>, Fault> {
+            let answer = me.ask(&format!("2 {fraction} {dial:.0} PKTUSB"))?;
+            Ok(answer.trim().parse::<f64>().ok().map(|mw| mw / 1000.0))
+        };
+        // A daemon that will not convert — an older hamlib, or a rig with no
+        // power control — is not a fault, it is a rig without a slider.
+        let (Some(lo), Some(hi)) = (at(self, 0.0)?, at(self, 1.0)?) else {
+            return Ok(None);
+        };
+        Ok(Range::new(lo, hi))
+    }
+
     fn width_hz(&mut self) -> Result<Option<f64>, Fault> {
         // The passband is the second line of `m`, in Hz.
         let answer = self.ask_lines("m", 2)?;
         Ok(answer.get(1).and_then(|w| w.trim().parse::<f64>().ok()))
     }
+
+    // No `width_range_hz`: hamlib's passband list lives in `\dump_caps`, whose
+    // output is a page of loosely-formatted prose meant for a person, per mode,
+    // and parsing it for two numbers would be a great deal of guessing at a
+    // format with no promise of stability. The width keeps its value box.
 
     fn set_width_hz(&mut self, hz: f64) -> Result<(), Fault> {
         // Hamlib sets a passband with the mode, so the mode has to be named
@@ -645,6 +713,12 @@ pub struct State {
     /// rig reports them.
     pub power_w: Option<f64>,
     pub width_hz: Option<f64>,
+    /// What the rig said it will accept for each, if it said. Asked once when
+    /// the link comes up, not polled — limits do not move while a radio is
+    /// plugged in. `None` is "not known", and the interface draws no slider
+    /// rather than an invented one.
+    pub power_range_w: Option<Range>,
+    pub width_range_hz: Option<Range>,
 }
 
 /// One stretch of time the rig should be transmitting for.
@@ -818,6 +892,11 @@ struct Session {
     /// rather than costing half a second of quiet on every poll for ever.
     power_misses: u32,
     width_misses: u32,
+    /// Whether the rig has been asked what it will accept. Asked once on the
+    /// first poll that gets an answer at all, because a radio's limits do not
+    /// change while it is plugged in — and on `rigctld` the question costs two
+    /// round trips, which is not a thing to spend twice a second.
+    ranges_asked: bool,
 }
 
 impl Drop for Session {
@@ -851,6 +930,7 @@ impl Session {
             misses: 0,
             power_misses: 0,
             width_misses: 0,
+            ranges_asked: false,
             retry_at: None,
         }
     }
@@ -1086,6 +1166,16 @@ impl Session {
                     true => self.tx.width_hz().inspect_err(|_| self.width_misses += 1).ok().flatten(),
                     false => None,
                 };
+                // Once, on the first poll the rig answers at all. A radio's
+                // limits do not move while it is plugged in, and a rig that
+                // will not say is not asked again for the life of the link.
+                let ranges = (!self.ranges_asked).then(|| {
+                    self.ranges_asked = true;
+                    (
+                        self.tx.power_range_w().ok().flatten(),
+                        self.tx.width_range_hz().ok().flatten(),
+                    )
+                });
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.linked = true;
                 st.dial_hz = hz;
@@ -1097,6 +1187,10 @@ impl Session {
                 }
                 if width.is_some() {
                     st.width_hz = width;
+                }
+                if let Some((power_range, width_range)) = ranges {
+                    st.power_range_w = power_range;
+                    st.width_range_hz = width_range;
                 }
             }
             Err(e) => self.no_link(e),
@@ -1223,6 +1317,10 @@ mod tests {
         deaf: Arc<AtomicBool>,
         /// Close the link after this many commands, then wait for another.
         drop_after: Arc<AtomicUsize>,
+        /// Refuse `power2mW`, which is what an older hamlib does and what a rig
+        /// with no power control does — the case that has to leave the setting
+        /// without a slider rather than with an invented one.
+        no_convert: Arc<AtomicBool>,
     }
 
     impl FakeRig {
@@ -1239,6 +1337,7 @@ mod tests {
                 deny_reads: Arc::new(AtomicBool::new(false)),
                 deaf: Arc::new(AtomicBool::new(false)),
                 drop_after: Arc::new(AtomicUsize::new(usize::MAX)),
+                no_convert: Arc::new(AtomicBool::new(false)),
             };
             let (heard, ptt) = (rig.heard.clone(), rig.ptt.clone());
             let dial = rig.dial.clone();
@@ -1246,6 +1345,7 @@ mod tests {
             let (reject, deaf) = (rig.reject.clone(), rig.deaf.clone());
             let deny_reads = rig.deny_reads.clone();
             let drop_after = rig.drop_after.clone();
+            let no_convert = rig.no_convert.clone();
             thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { return };
@@ -1285,6 +1385,23 @@ mod tests {
                                             *mode.lock().unwrap() = name.to_string();
                                             "RPRT 0\n".to_string()
                                         }
+                                        None => "RPRT -1\n".to_string(),
+                                    }
+                                }
+                                // `power2mW`: hamlib converting a fraction of
+                                // the rig's maximum into milliwatts, which is
+                                // how that maximum is discovered. This bench
+                                // is a hundred-watt rig.
+                                c if c.starts_with("2 ")
+                                    && no_convert.load(Ordering::SeqCst) =>
+                                {
+                                    "RPRT -1\n".to_string()
+                                }
+                                c if c.starts_with("2 ") => {
+                                    match c[2..].split_whitespace().next().and_then(|f| {
+                                        f.parse::<f64>().ok()
+                                    }) {
+                                        Some(fraction) => format!("{:.0}\n", fraction * 100_000.0),
                                         None => "RPRT -1\n".to_string(),
                                     }
                                 }
@@ -1762,6 +1879,50 @@ mod tests {
         assert_eq!(rig.heard(), ["M CW 0"], "spoke a protocol rigctld does not");
         assert_eq!(rig.mode(), "CW", "the rig did not change mode");
         assert_eq!(tx.dial_mode(), Ok(Some("CW".to_string())), "the reading did not follow");
+    }
+
+    /// Hamlib knows the rig's maximum exactly, so the slider can.
+    ///
+    /// `RFPOWER` is a fraction of that maximum, so converting 1.0 to milliwatts
+    /// *is* the maximum, for whatever radio the daemon was started against — no
+    /// table of models and nothing invented here. The bench is a hundred-watt
+    /// rig, so that is what comes back.
+    #[test]
+    fn the_daemon_reports_the_rigs_own_power_range() {
+        let rig = FakeRig::start();
+        let mut tx = rig.client();
+        assert_eq!(tx.power_range_w(), Ok(Range::new(0.0, 100.0)));
+    }
+
+    /// A daemon that will not convert leaves the setting without a slider,
+    /// rather than reporting a fault or inventing a ceiling.
+    ///
+    /// An older hamlib, or a rig with no power control, answers `RPRT -1` — and
+    /// the honest reading of that is "this rig did not say", which the
+    /// interface already draws as a value box on its own.
+    #[test]
+    fn a_daemon_that_will_not_convert_gives_no_range() {
+        let rig = FakeRig::start();
+        let mut tx = rig.client();
+        rig.no_convert.store(true, Ordering::SeqCst);
+        assert_eq!(tx.power_range_w(), Ok(None), "invented a range from a refusal");
+        // The rig is still perfectly usable: only the range is missing, and
+        // the power itself still reads and sets.
+        assert_eq!(tx.dial_hz(), Ok(Some(14_074_000.0)), "lost the link over a missing range");
+    }
+
+    /// A range that is not one is not a slider.
+    ///
+    /// Every one of these would draw a track: backwards, of zero width, or with
+    /// an end that is not a number. A rig answering any of them has told us
+    /// nothing, and a control built on nothing is worse than no control.
+    #[test]
+    fn a_nonsense_range_is_refused() {
+        assert!(Range::new(0.0, 100.0).is_some());
+        assert!(Range::new(100.0, 0.0).is_none(), "took a maximum below the minimum");
+        assert!(Range::new(5.0, 5.0).is_none(), "took a range with no width");
+        assert!(Range::new(0.0, f64::NAN).is_none(), "took a maximum that is not a number");
+        assert!(Range::new(f64::NEG_INFINITY, 1.0).is_none(), "took an infinite minimum");
     }
 
     /// Every mode offered for a rig is one that rig will take.

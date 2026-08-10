@@ -240,6 +240,13 @@ impl<L: Read + Write + Send> Transmitter for Yaesu<L> {
     // defaults — see the note at the top of this file. `SH` is an index into a
     // per-mode table, not hertz, and a guess here would shade the waterfall
     // wrongly while looking certain.
+    //
+    // Neither range is given either. `PC` tops out at 100 W on an FT-991A and
+    // an FT-891, and at 200 on an FTDX101 — a per-model number, and `ID;` does
+    // return a model code that would settle it. Writing that table from a
+    // manual, with no radio to check a single entry against, is how a slider
+    // ends up stopping at the wrong watt on somebody's radio. The value box
+    // stands until one of these is on a bench.
 
     fn describe(&self) -> String {
         format!("Yaesu on {}", self.what)
@@ -407,6 +414,23 @@ mod tests {
         assert_eq!(bench.rig().width_hz(), Ok(None), "invented a filter width");
         // And nothing was said to the radio to find that out.
         assert_eq!(bench.heard(), "", "asked the radio about a width it cannot report");
+    }
+
+    /// Neither setting claims a range, and that is deliberate.
+    ///
+    /// `PC` tops out at 100 W on an FT-991A and 200 on an FTDX101 — a
+    /// per-model number that `ID;` would settle, and that writing from a manual
+    /// with no radio to check would settle wrongly. The width has no range for
+    /// the simpler reason that it has no value either.
+    ///
+    /// Here so that filling either in is a deliberate act with a test to
+    /// update, rather than something that looks like an oversight.
+    #[test]
+    fn no_range_is_claimed_for_either_setting() {
+        let bench = Bench::default();
+        assert_eq!(bench.rig().power_range_w(), Ok(None), "claimed to know the radio's ceiling");
+        assert_eq!(bench.rig().width_range_hz(), Ok(None));
+        assert_eq!(bench.heard(), "", "asked the radio about limits it was never going to give");
     }
 
     /// The link's own behaviour, through this driver: a radio that volunteers

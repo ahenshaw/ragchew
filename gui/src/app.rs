@@ -306,6 +306,49 @@ const DEFAULT_RIG_DEVICE: &str = "";
 /// number through the settings file untouched.
 const DEFAULT_RIG_BAUD: u32 = 38_400;
 
+/// A slider with no number on it, beside a value box that already has one.
+///
+/// egui's own `Slider` carries its own value box, which is the widget that was
+/// tried and rejected: in a panel this narrow the track it leaves over is a few
+/// dozen pixels, and a few dozen pixels of track across a hundred watts is not
+/// a control, it is a target. So the number stays in the `DragValue` and this
+/// draws only the track, given every pixel left in the row.
+///
+/// Returns whether the operator moved it.
+fn track(ui: &mut egui::Ui, v: &mut f64, lo: f64, hi: f64) -> bool {
+    // Whatever the label and the box did not use. Floored, because a grid cell
+    // can report almost nothing while it is being laid out for the first time
+    // and a zero-width slider cannot be grabbed at all.
+    ui.spacing_mut().slider_width = ui.available_width().max(MIN_TRACK_W);
+    ui.add(egui::Slider::new(v, lo..=hi).show_value(false)).changed()
+}
+
+/// Narrowest a track may be drawn.
+///
+/// The complaint that started this was a slider too small to use, so there is a
+/// floor rather than only a stretch: a panel dragged narrow shrinks the text
+/// before it shrinks this.
+const MIN_TRACK_W: f32 = 90.0;
+
+/// A setting's tooltip, with a word about the missing slider when one is.
+///
+/// Which settings get a track depends on the radio, not on the interface: a
+/// `rigctld` rig states its power exactly and says nothing about its passband,
+/// an Elecraft is the other way round, and a Yaesu says neither. On screen that
+/// reads as one control having a slider and its neighbour not, which looks like
+/// an oversight — it looked like one to the person who wrote it, with the whole
+/// design in front of him. The rig is what did not say, and a tooltip is the
+/// only place that can be said.
+fn hint(about: &str, ranged: bool) -> String {
+    match ranged {
+        true => about.to_string(),
+        false => format!(
+            "{about}\n\nThis rig does not report the range it will accept, so there is no \
+             track to drag. Type the figure, or drag the figure itself."
+        ),
+    }
+}
+
 /// A way of keying, as the settings offer it.
 ///
 /// The tag is the word written to the settings file, so the menu and the file
@@ -328,10 +371,13 @@ struct Keyer {
 const KEYERS: &[Keyer] = &[
     Keyer {
         tag: "none",
-        label: "none",
+        label: "None",
         hover: "nothing is keyed: the rig decides, on VOX or a straight-through interface",
     },
     Keyer {
+        // Lower case on purpose, and the one segment that stays that way: this
+        // is the name of a program the operator types, not a word. `Rigctld` is
+        // not a thing that exists.
         tag: "rigctld",
         label: "rigctld",
         hover: "hamlib's daemon: run `rigctld -m <model> -r <device>` and give its address \
@@ -2680,47 +2726,82 @@ impl App {
             grip.on_hover_text(if self.rig_more {
                 "hide the rig's settings"
             } else {
-                "the rig's settings: power, and the receiver's filter"
+                "the rig's settings: power, and the receiver's bandwidth"
             });
         }
         if has_settings && self.rig_more {
             let mut set_power: Option<f64> = None;
             let mut set_width: Option<f64> = None;
-            ui.horizontal(|ui| {
+            // A label column and a value column, the same grid the QSO panel
+            // uses for its fields — so the two boxes start at the same x
+            // whichever of them the rig reports, and the whole thing reads as
+            // one form rather than two controls that happened to land in a row.
+            //
+            // The unit lives on the value, not in the label. `W` standing where
+            // `Power` belongs made the row read as a unit and a name side by
+            // side, which is two different kinds of word doing one job.
+            //
+            // A third column carries a slider, but only where the rig has said
+            // what it will accept — see [`rig::Transmitter::power_range_w`]. A
+            // track whose ends were invented here would be a control that looks
+            // like it knows the radio and does not.
+            egui::Grid::new("rig_settings").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
                 if let Some(w) = st.power_w {
                     let mut watts = w;
-                    ui.label("W");
+                    // Where the rig has not said, the box keeps a clamp wide
+                    // enough that nothing which used to be typeable stops
+                    // being. It guards against a nonsense drag; it is not a
+                    // claim about the radio, which is why no track is drawn
+                    // over it.
+                    let known = st.power_range_w;
+                    let (lo, hi) = known.map_or((0.0, 999.0), |r| (r.lo, r.hi));
+                    ui.label("Power");
                     if ui
-                        .add(egui::DragValue::new(&mut watts).speed(0.5).range(0.0..=100.0))
-                        .on_hover_text("transmit power, in watts")
+                        .add(
+                            egui::DragValue::new(&mut watts)
+                                .speed(0.5)
+                                .range(lo..=hi)
+                                .suffix(" W"),
+                        )
+                        .on_hover_text(hint("transmit power", known.is_some()))
                         .changed()
                     {
                         set_power = Some(watts);
                     }
+                    if known.is_some() && track(ui, &mut watts, lo, hi) {
+                        set_power = Some(watts);
+                    }
+                    ui.end_row();
                 }
                 if let Some(hz) = st.width_hz {
                     let mut khz = hz / 1000.0;
-                    ui.separator();
-                    ui.label("filter");
+                    let known = st.width_range_hz;
+                    let (lo, hi) = known.map_or((0.1, 9.99), |r| (r.lo / 1000.0, r.hi / 1000.0));
+                    ui.label("Bandwidth");
                     if ui
                         .add(
                             egui::DragValue::new(&mut khz)
                                 .speed(0.05)
-                                .range(0.1..=4.0)
+                                .range(lo..=hi)
                                 .fixed_decimals(2)
                                 .suffix(" kHz"),
                         )
-                        .on_hover_text(
-                            "the receiver's filter. Anything outside it is shaded on the \
-                             waterfall: the app draws the band, the radio decides how much \
-                             of it you can hear. Taken as centred on 1500 Hz, which is what \
-                             a rig's data modes use — no rig reports the centre in a way \
+                        .on_hover_text(hint(
+                            "how wide the receiver's filter is. Anything outside it is shaded \
+                             on the waterfall: the app draws the band, the radio decides how \
+                             much of it you can hear. Taken as centred on 1500 Hz, which is \
+                             what a rig's data modes use — no rig reports the centre in a way \
                              this can rely on.",
-                        )
+                            known.is_some(),
+                        ))
                         .changed()
                     {
                         set_width = Some(khz * 1000.0);
                     }
+                    if known.is_some() && track(ui, &mut khz, lo, hi) {
+                        set_width = Some(khz * 1000.0);
+                    }
+                    ui.end_row();
                 }
             });
             if let Some(link) = &self.ptt {
@@ -4326,48 +4407,61 @@ impl App {
                             let mut device = self.rig_device.clone();
                             let mut baud = self.rig_baud;
                             want_ports |= ports_stale;
-                            ui.horizontal(|ui| {
-                                ui.label("port");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut device).desired_width(150.0),
-                                );
-                                // The list is a shortcut, not the setting: the
-                                // field above stays the answer, because a port
-                                // that has not enumerated — a cable plugged in
-                                // a moment ago, a virtual port from something
-                                // else — is still one the operator can type.
-                                ui.menu_button("…", |ui| {
-                                    ui.set_min_width(320.0);
-                                    if self.rig_ports.found.is_empty() {
-                                        ui.weak("no serial ports found");
-                                    }
-                                    for port in &self.rig_ports.found {
-                                        let on = port.path == device;
-                                        if ui
-                                            .selectable_label(on, &port.label)
-                                            .on_hover_text(&port.path)
-                                            .clicked()
-                                        {
-                                            device = port.path.clone();
-                                            ui.close();
+                            egui::Grid::new("rig_cable")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Port");
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut device)
+                                                .desired_width(150.0),
+                                        );
+                                        // The list is a shortcut, not the
+                                        // setting: the field beside it stays the
+                                        // answer, because a port that has not
+                                        // enumerated — a cable plugged in a
+                                        // moment ago, a virtual port from
+                                        // something else — is still one the
+                                        // operator can type.
+                                        ui.menu_button("…", |ui| {
+                                            ui.set_min_width(320.0);
+                                            if self.rig_ports.found.is_empty() {
+                                                ui.weak("no serial ports found");
+                                            }
+                                            for port in &self.rig_ports.found {
+                                                let on = port.path == device;
+                                                if ui
+                                                    .selectable_label(on, &port.label)
+                                                    .on_hover_text(&port.path)
+                                                    .clicked()
+                                                {
+                                                    device = port.path.clone();
+                                                    ui.close();
+                                                }
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text("serial ports this machine has");
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Baud");
+                                    ui.horizontal(|ui| {
+                                        // The four every CAT radio here offers:
+                                        // an Elecraft's menu and a Yaesu's menu
+                                        // 031 list the same set.
+                                        for rate in [4800u32, 9600, 19200, 38400] {
+                                            if ui
+                                                .selectable_label(baud == rate, rate.to_string())
+                                                .clicked()
+                                            {
+                                                baud = rate;
+                                            }
                                         }
-                                    }
-                                })
-                                .response
-                                .on_hover_text("serial ports this machine has");
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("baud");
-                                // The four every CAT radio here offers: an
-                                // Elecraft's menu and a Yaesu's menu 031 list
-                                // the same set.
-                                for rate in [4800u32, 9600, 19200, 38400] {
-                                    if ui.selectable_label(baud == rate, rate.to_string()).clicked()
-                                    {
-                                        baud = rate;
-                                    }
-                                }
-                            });
+                                    });
+                                    ui.end_row();
+                                });
                             // Rebuilt on any edit, which closes the old port on
                             // the way past — see the note below about half-typed
                             // addresses; a half-typed device name is the same
@@ -4387,12 +4481,31 @@ impl App {
                         if matches!(self.rig, rig::Keying::RigCtld { .. }) {
                             let mut host = self.rig_host.clone();
                             let mut port = self.rig_port;
-                            ui.horizontal(|ui| {
-                                ui.label("host");
-                                ui.add(egui::TextEdit::singleline(&mut host).desired_width(140.0));
-                                ui.label("port");
-                                ui.add(egui::DragValue::new(&mut port).range(1..=65535));
-                            });
+                            // The same two-column grid as the cable panel, so
+                            // the menu keeps one label column whichever rig is
+                            // selected and switching between them does not
+                            // reflow everything under the control.
+                            //
+                            // `Port` here is a TCP port and `Port` there is a
+                            // device: the same word for two things, which is
+                            // survivable only because the two panels are never
+                            // on screen together. `Host` and `Port` is what an
+                            // address is called, and inventing a different word
+                            // to avoid the collision would cost more than it
+                            // saved.
+                            egui::Grid::new("rig_daemon")
+                                .num_columns(2)
+                                .spacing([8.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Host");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut host).desired_width(140.0),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Port");
+                                    ui.add(egui::DragValue::new(&mut port).range(1..=65535));
+                                    ui.end_row();
+                                });
                             // Rebuilt on any edit, which takes the rig off the
                             // air on the way past: an address being typed into
                             // is an address that is wrong most of the time, and
@@ -6555,6 +6668,29 @@ mod tests {
         // Whatever else is compiled in, doing nothing is always on offer and
         // is always what an unselected control falls back to.
         assert_eq!(KEYERS[0].tag, "none", "the first choice is not the harmless one");
+    }
+
+    /// A control with no slider says why, and one with a slider does not.
+    ///
+    /// Which settings get a track is the radio's business, not the interface's:
+    /// a `rigctld` rig states its power and not its passband, an Elecraft the
+    /// other way round. On screen that is one control with a track and its
+    /// neighbour without, which reads as a bug unless something says otherwise.
+    /// This text is the only thing that does, so it has to appear exactly when
+    /// the slider does not.
+    #[test]
+    fn a_missing_slider_explains_itself() {
+        let ranged = hint("transmit power", true);
+        assert_eq!(ranged, "transmit power", "explained away a slider that is there");
+
+        let bare = hint("transmit power", false);
+        assert!(bare.starts_with("transmit power"), "lost what the setting is: {bare:?}");
+        assert!(bare.contains("no track to drag"), "did not say why there is no slider: {bare:?}");
+        // The continuation escapes in that literal are easy to get wrong, and a
+        // tooltip reading "no  track" or "notrack" would be the sort of thing
+        // nobody reports and everybody notices.
+        assert!(!bare.contains("  "), "double space in a tooltip: {bare:?}");
+        assert!(!bare.contains('\t'), "tab in a tooltip: {bare:?}");
     }
 
     /// Switching between two radios on a cable keeps the cable.
