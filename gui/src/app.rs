@@ -288,7 +288,74 @@ const TX_ELSEWHERE: Color32 = Color32::from_rgb(255, 170, 40);
 /// Where a USB serial cable is likeliest to turn up on this platform, which is
 /// where an Elecraft KXUSB lands. Only what shows before anything is detected
 /// or saved — see [`rig::serial::DEFAULT_DEVICE`].
+#[cfg(feature = "serial")]
 const DEFAULT_RIG_DEVICE: &str = rig::serial::DEFAULT_DEVICE;
+
+/// A build with no directly-driven rig has no port to name. Empty rather than a
+/// plausible guess, because the setting is still carried through the file for
+/// the build that *can* open one, and a name invented here would overwrite
+/// theirs the first time this build saved.
+#[cfg(not(feature = "serial"))]
+const DEFAULT_RIG_DEVICE: &str = "";
+
+/// The rate the port setting starts at.
+///
+/// A KX3 leaves the factory at 38400 and every Elecraft takes it, so that is
+/// the guess. Kept here rather than taken from the rig module because the
+/// setting outlives the feature: a build with no direct rig still carries the
+/// number through the settings file untouched.
+const DEFAULT_RIG_BAUD: u32 = 38_400;
+
+/// A way of keying, as the settings offer it.
+///
+/// The tag is the word written to the settings file, so the menu and the file
+/// cannot drift apart, and it — not a position — is what identifies a choice.
+/// A build compiled without a given rig simply has no row here, and the
+/// segmented control's indices then mean whatever this build has. Adding a
+/// radio is a row and a feature rather than a renumbering of everything that
+/// reads the control.
+struct Keyer {
+    tag: &'static str,
+    label: &'static str,
+    hover: &'static str,
+}
+
+/// Everything this build can key with, in the order the settings offer it.
+///
+/// `none` and `rigctld` are always here: one is no hardware at all and the
+/// other is one daemon for every rig hamlib knows. What follows is one row per
+/// directly-driven radio, each behind its own feature.
+const KEYERS: &[Keyer] = &[
+    Keyer {
+        tag: "none",
+        label: "none",
+        hover: "nothing is keyed: the rig decides, on VOX or a straight-through interface",
+    },
+    Keyer {
+        tag: "rigctld",
+        label: "rigctld",
+        hover: "hamlib's daemon: run `rigctld -m <model> -r <device>` and give its address \
+                below. Hamlib will not key a rig it has no PTT method for — add \
+                `--set-conf=ptt_type=RIG` (or RTS, or DTR) if it refuses.",
+    },
+    #[cfg(feature = "elecraft")]
+    Keyer {
+        tag: "elecraft",
+        label: "Elecraft",
+        hover: "a KX3 or K3 on a serial cable, spoken to directly — no daemon to run. The \
+                rate is whatever the radio's menu says; a KX3 leaves the factory at 38400.",
+    },
+];
+
+/// The word for a setting, as written to the settings file.
+fn keying_tag(keying: &rig::Keying) -> &'static str {
+    match keying {
+        rig::Keying::None => "none",
+        rig::Keying::RigCtld { .. } => "rigctld",
+        #[cfg(feature = "elecraft")]
+        rig::Keying::Elecraft { .. } => "elecraft",
+    }
+}
 
 /// Where `rigctld` listens unless told otherwise — hamlib's own default.
 const DEFAULT_RIG_HOST: &str = "127.0.0.1";
@@ -943,7 +1010,7 @@ impl Default for Settings {
             rig_host: DEFAULT_RIG_HOST.to_string(),
             rig_port: DEFAULT_RIG_PORT,
             rig_device: DEFAULT_RIG_DEVICE.to_string(),
-            rig_baud: rig::elecraft::KX3_BAUD,
+            rig_baud: DEFAULT_RIG_BAUD,
             rig_more: false,
         }
     }
@@ -1682,14 +1749,22 @@ struct App {
     pw: crate::pipewire::Routing,
     pw_at: Option<std::time::Instant>,
 
-    /// Serial ports the machine says it has, as of [`App::rig_ports_at`].
-    ///
-    /// Held for the same reason as [`App::pw`]: the menu that shows them
-    /// redraws every frame, and finding them means reading a directory or the
-    /// registry. Refreshed only while that menu is open — see
-    /// [`PORT_REFRESH_S`].
-    rig_ports: Vec<rig::serial::Candidate>,
-    rig_ports_at: Option<std::time::Instant>,
+    /// The ports a rig might be on, for whichever rig panels offer a picker.
+    #[cfg(feature = "serial")]
+    rig_ports: SerialPorts,
+}
+
+/// Serial ports the machine says it has, and when they were last looked for.
+///
+/// Held rather than asked for, for the same reason as [`App::pw`]: the menu
+/// that shows them redraws every frame, and finding them means reading a
+/// directory or the registry. Refreshed only while that menu is open — see
+/// [`PORT_REFRESH_S`].
+#[cfg(feature = "serial")]
+#[derive(Default)]
+struct SerialPorts {
+    found: Vec<rig::serial::Candidate>,
+    at: Option<std::time::Instant>,
 }
 
 /// How stale the routing list may get while its menu is open.
@@ -1704,6 +1779,7 @@ const PW_REFRESH_S: f64 = 1.5;
 /// Same bargain as [`PW_REFRESH_S`], and the same reason to keep it short: the
 /// operator who finds the list empty goes and plugs the cable in, and wants to
 /// see it appear without having closed and reopened anything.
+#[cfg(feature = "serial")]
 const PORT_REFRESH_S: f64 = 1.5;
 
 /// One line for the status bar.
@@ -1864,7 +1940,7 @@ impl App {
             rig_host: DEFAULT_RIG_HOST.to_string(),
             rig_port: DEFAULT_RIG_PORT,
             rig_device: DEFAULT_RIG_DEVICE.to_string(),
-            rig_baud: rig::elecraft::KX3_BAUD,
+            rig_baud: DEFAULT_RIG_BAUD,
             cursor_hz: None,
             tuning: None,
             dial_pick: 0,
@@ -1878,8 +1954,8 @@ impl App {
             cleared_all_at: f64::NEG_INFINITY,
             pw: crate::pipewire::Routing::default(),
             pw_at: None,
-            rig_ports: Vec::new(),
-            rig_ports_at: None,
+            #[cfg(feature = "serial")]
+            rig_ports: SerialPorts::default(),
         }
     }
 
@@ -1901,11 +1977,7 @@ impl App {
             default_mode: self.default_mode.name(),
             forget_min: self.forget_min,
             fade_secs: self.fade_secs,
-            rig_keying: match self.rig {
-                rig::Keying::None => "none".to_string(),
-                rig::Keying::RigCtld { .. } => "rigctld".to_string(),
-                rig::Keying::Elecraft { .. } => "elecraft".to_string(),
-            },
+            rig_keying: keying_tag(&self.rig).to_string(),
             rig_host: self.rig_host.clone(),
             rig_port: self.rig_port,
             rig_device: self.rig_device.clone(),
@@ -1943,17 +2015,8 @@ impl App {
             self.rig_baud = s.rig_baud;
         }
         self.rig_more = s.rig_more;
-        self.set_keying(match s.rig_keying.as_str() {
-            "rigctld" => rig::Keying::RigCtld {
-                host: self.rig_host.clone(),
-                port: self.rig_port,
-            },
-            "elecraft" => rig::Keying::Elecraft {
-                device: self.rig_device.clone(),
-                baud: self.rig_baud,
-            },
-            _ => rig::Keying::None,
-        });
+        let keying = self.keying_for(&s.rig_keying);
+        self.set_keying(keying);
         // An unknown name leaves the theme at Auto rather than at whatever the
         // last build happened to write.
         self.theme = Theme::parse(&s.theme).unwrap_or_default();
@@ -2764,6 +2827,28 @@ impl App {
     /// off the air before anything else can key it. Switching to
     /// [`rig::Keying::None`] leaves no thread at all: the app is back to what it
     /// did before it could key anything.
+    /// The setting a [`Keyer`] tag names, filled in from the addresses this app
+    /// is already holding.
+    ///
+    /// A tag this build does not know is not keying at all. That covers a
+    /// settings file from a build compiled with a radio this one was not, and
+    /// the conservative answer is the one that matters: the alternative is a
+    /// build deciding for itself which rig an unrecognised word meant.
+    fn keying_for(&self, tag: &str) -> rig::Keying {
+        match tag {
+            "rigctld" => rig::Keying::RigCtld {
+                host: self.rig_host.clone(),
+                port: self.rig_port,
+            },
+            #[cfg(feature = "elecraft")]
+            "elecraft" => rig::Keying::Elecraft {
+                device: self.rig_device.clone(),
+                baud: self.rig_baud,
+            },
+            _ => rig::Keying::None,
+        }
+    }
+
     fn set_keying(&mut self, keying: rig::Keying) {
         if self.rig == keying && (self.ptt.is_some() == (keying != rig::Keying::None)) {
             return;
@@ -3947,9 +4032,12 @@ impl App {
         // Same again for the serial ports, and for the same reason: the menu
         // asks, the scan happens once afterwards rather than inside a closure
         // that runs per frame.
+        #[cfg(feature = "serial")]
         let mut want_ports = false;
+        #[cfg(feature = "serial")]
         let ports_stale = self
-            .rig_ports_at
+            .rig_ports
+            .at
             .is_none_or(|t| t.elapsed().as_secs_f64() > PORT_REFRESH_S);
         let mut chosen_output: Option<Option<String>> = None; // Some(None) = default
         let mut modes_changed = false;
@@ -4188,48 +4276,31 @@ impl App {
                     ui.separator();
                     ui.menu_button("Rig", |ui| {
                         ui.set_min_width(300.0);
-                        let mut pick = match self.rig {
-                            rig::Keying::None => 0,
-                            rig::Keying::RigCtld { .. } => 1,
-                            rig::Keying::Elecraft { .. } => 2,
-                        };
+                        // Which segment is which depends on what this build was
+                        // compiled with, so it is looked up rather than
+                        // written down — see [`KEYERS`].
+                        let here = keying_tag(&self.rig);
+                        let mut pick = KEYERS.iter().position(|k| k.tag == here).unwrap_or(0);
                         if ui
                             .add(elegance::SegmentedControl::from_segments(
                                 &mut pick,
-                                [
-                                    elegance::Segment::text("none").hover_text(
-                                        "nothing is keyed: the rig decides, on VOX or a \
-                                         straight-through interface",
-                                    ),
-                                    elegance::Segment::text("rigctld").hover_text(
-                                        "hamlib's daemon: run `rigctld -m <model> -r <device>` \
-                                         and give its address below. Hamlib will not key a rig \
-                                         it has no PTT method for — add \
-                                         `--set-conf=ptt_type=RIG` (or RTS, or DTR) if it \
-                                         refuses.",
-                                    ),
-                                    elegance::Segment::text("Elecraft").hover_text(
-                                        "a KX3 or K3 on a serial cable, spoken to directly — \
-                                         no daemon to run. The rate is whatever the radio's \
-                                         menu says; a KX3 leaves the factory at 38400.",
-                                    ),
-                                ],
+                                KEYERS
+                                    .iter()
+                                    .map(|k| elegance::Segment::text(k.label).hover_text(k.hover)),
                             ))
                             .changed()
                         {
-                            let keying = match pick {
-                                1 => rig::Keying::RigCtld {
-                                    host: self.rig_host.clone(),
-                                    port: self.rig_port,
-                                },
-                                2 => rig::Keying::Elecraft {
-                                    device: self.rig_device.clone(),
-                                    baud: self.rig_baud,
-                                },
-                                _ => rig::Keying::None,
-                            };
-                            self.set_keying(keying);
+                            // An index the list does not have changes nothing.
+                            // The control documents itself as keeping the index
+                            // in range, and if that ever stopped being true,
+                            // silently keying a rig the operator did not pick
+                            // is the one outcome worth ruling out.
+                            if let Some(k) = KEYERS.get(pick) {
+                                let keying = self.keying_for(k.tag);
+                                self.set_keying(keying);
+                            }
                         }
+                        #[cfg(feature = "elecraft")]
                         if matches!(self.rig, rig::Keying::Elecraft { .. }) {
                             let mut device = self.rig_device.clone();
                             let mut baud = self.rig_baud;
@@ -4246,10 +4317,10 @@ impl App {
                                 // else — is still one the operator can type.
                                 ui.menu_button("…", |ui| {
                                     ui.set_min_width(320.0);
-                                    if self.rig_ports.is_empty() {
+                                    if self.rig_ports.found.is_empty() {
                                         ui.weak("no serial ports found");
                                     }
-                                    for port in &self.rig_ports {
+                                    for port in &self.rig_ports.found {
                                         let on = port.path == device;
                                         if ui
                                             .selectable_label(on, &port.label)
@@ -4599,9 +4670,10 @@ impl App {
             self.pw = crate::pipewire::survey();
             self.pw_at = Some(std::time::Instant::now());
         }
+        #[cfg(feature = "serial")]
         if want_ports {
-            self.rig_ports = rig::serial::ports();
-            self.rig_ports_at = Some(std::time::Instant::now());
+            self.rig_ports.found = rig::serial::ports();
+            self.rig_ports.at = Some(std::time::Instant::now());
         }
 
         // switch input device if the user picked a different one
@@ -6410,6 +6482,7 @@ mod tests {
 
     /// A radio on a cable is remembered as one.
     #[test]
+    #[cfg(feature = "elecraft")]
     fn an_elecraft_on_a_cable_survives_a_restart() {
         let mut app = App::base((0.0, 4000.0));
         app.rig_device = "/dev/ttyUSB1".to_string();
@@ -6428,17 +6501,81 @@ mod tests {
         );
     }
 
+    /// Every row of the menu names a setting, and that setting names the row
+    /// back.
+    ///
+    /// The pair is what lets the segmented control be indexed by position and
+    /// the settings file be written by name without the two drifting. A radio
+    /// added to [`KEYERS`] and not to [`keying_tag`] would draw a segment that
+    /// selects itself, saves as something else, and comes back as the wrong
+    /// rig — so this fails the moment half the job is done.
+    #[test]
+    fn every_way_of_keying_round_trips_through_its_tag() {
+        let app = App::base((0.0, 4000.0));
+        for k in KEYERS {
+            let keying = app.keying_for(k.tag);
+            assert_eq!(keying_tag(&keying), k.tag, "{} does not name itself back", k.tag);
+        }
+        // And the tags are distinct, since a duplicate would make `position`
+        // pick the first of them however the second was selected.
+        for (i, k) in KEYERS.iter().enumerate() {
+            assert!(
+                !KEYERS[..i].iter().any(|e| e.tag == k.tag),
+                "two ways of keying both called {}",
+                k.tag
+            );
+        }
+        // Whatever else is compiled in, doing nothing is always on offer and
+        // is always what an unselected control falls back to.
+        assert_eq!(KEYERS[0].tag, "none", "the first choice is not the harmless one");
+    }
+
+    /// The rate the settings start at is the one the radio leaves the factory
+    /// at. Two constants, in two crates' worth of reasons to change
+    /// independently, and only one of them is what the operator first sees.
+    #[test]
+    #[cfg(feature = "elecraft")]
+    fn the_default_rate_is_the_one_the_radio_ships_with() {
+        assert_eq!(DEFAULT_RIG_BAUD, rig::elecraft::KX3_BAUD);
+    }
+
     /// Nothing keys a rig because a settings file said something odd.
     ///
     /// This is the one setting that reaches out and moves hardware, so an
     /// unreadable answer has to mean "no" rather than "the last thing that
-    /// happened to be in the file".
+    /// happened to be in the file". A build compiled without a given radio
+    /// meets exactly this case when it reads a file that names one.
     #[test]
     fn an_unreadable_rig_setting_leaves_the_transmitter_alone() {
         let mut app = App::base((0.0, 4000.0));
         app.apply(Settings { rig_keying: "flrig-over-carrier-pigeon".into(), ..Settings::default() });
         assert_eq!(app.rig, rig::Keying::None);
         assert!(app.ptt.is_none(), "started keying something on an unreadable setting");
+    }
+
+    /// A build that cannot offer a radio still hands back the port it was on.
+    ///
+    /// This is what a rig feature being off looks like from the settings file:
+    /// a tag with no radio behind it. The choice of rig resets — that is the
+    /// point, nothing should key over a link this build does not have — but
+    /// the port and the rate are the tedious part to retype, so they come
+    /// through untouched and the next build that *does* have the radio finds
+    /// them waiting.
+    #[test]
+    fn a_rig_this_build_lacks_still_keeps_its_port_and_rate() {
+        let mut app = App::base((0.0, 4000.0));
+        let saved = Settings {
+            rig_keying: "a-radio-this-build-was-not-compiled-with".into(),
+            rig_device: "/dev/ttyUSB7".into(),
+            rig_baud: 19200,
+            ..Settings::default()
+        };
+        app.apply(saved);
+        assert_eq!(app.rig, rig::Keying::None, "keyed a rig it has no code for");
+
+        let written = app.settings();
+        assert_eq!(written.rig_device, "/dev/ttyUSB7", "lost the port");
+        assert_eq!(written.rig_baud, 19200, "lost the rate");
     }
 
     /// Turning rig control off takes the rig off the air on the way past.

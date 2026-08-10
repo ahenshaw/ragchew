@@ -179,6 +179,22 @@ outlasts its limit, if the app exits, or if the thread doing the keying comes
 apart — the last of those by unwinding through the code that unkeys, since that
 is the only mechanism a panic cannot skip.
 
+Each directly-driven radio is its own feature, so a build carries only the
+protocols it will use. `elecraft` is on by default and is the only one so far;
+`serial` is the port underneath, turned on by whichever rig features are rather
+than chosen directly.
+
+```
+cargo build --release                                              # rigctld + Elecraft
+cargo build --release -p ragchew-gui --no-default-features \
+    --features desktop                                             # rigctld only
+```
+
+`rigctld` is always built — it is one protocol for every rig hamlib knows, so
+there is nothing to choose. A build without a given radio reads a settings file
+that names it, keys nothing, and keeps the port and rate for the next build that
+has it.
+
 Headless, without the windowing/audio stack — renders straight to PNG:
 
 ```

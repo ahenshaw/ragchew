@@ -14,7 +14,7 @@ name = "ragchew"
 path = "src/main.rs"
 
 [features]
-default = ["desktop"]
+default = ["desktop", "elecraft"]
 # The interactive eframe app + live audio. Disable (`--no-default-features`) to
 # build just the pure rendering pieces (e.g. the render_png example) without the
 # windowing/audio stack.
@@ -27,6 +27,29 @@ desktop = [
     "dep:serde_json",
     "dep:egui-elegance",
 ]
+
+# ---- rigs driven directly, over a cable, with no daemon in between ----
+#
+# One feature per radio, because they are separate protocols with nothing in
+# common above the port: an operator with a KX3 has no use for the code that
+# talks to something else. `rigctld` is not among them — it is one protocol for
+# every rig hamlib knows, so it is always built.
+#
+# Turning all of them off leaves an app that still keys, tunes and reads back
+# through hamlib. A build without a given rig reads a settings file naming it,
+# declines to key anything, and keeps the port and the rate — those are their
+# own fields and are carried through untouched, so the tedious part of the
+# configuration survives swapping builds. The choice of radio itself resets to
+# none, which is what this app already does with a theme or a mode name it does
+# not recognise, and is one click to put back.
+
+# The serial port itself, shared by every rig above. Not a rig and not meant to
+# be selected on its own — whichever rig features are on turn it on. On its own
+# it is a port with nothing to say into it.
+serial = ["dep:libc", "dep:windows-sys"]
+
+# An Elecraft KX3 or K3 on a serial cable.
+elecraft = ["serial"]
 
 [dependencies]
 ragchew = { path = ".." }
@@ -56,11 +79,11 @@ egui-elegance = { version = "0.14", optional = true }
 # on one side and `DCB` on the other is all that is wanted — see `rig/serial`
 # for why that is by hand rather than a serial-port crate.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 # Kept at the version winit resolves to, so the two unify into one build of it.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
+windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Devices_Communication",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",

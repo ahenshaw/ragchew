@@ -33,7 +33,13 @@
 //! transmitting into an empty band on somebody's bench: a key-down that outlasts
 //! its limit, an owner that goes away, and a panic anywhere in the thread.
 
+/// A KX3 or K3, spoken to directly. Behind the `elecraft` feature — see the
+/// manifest for why each directly-driven rig is its own.
+#[cfg(feature = "elecraft")]
 pub mod elecraft;
+/// The port every directly-driven rig is reached over. Behind `serial`, which
+/// the rig features turn on rather than the operator.
+#[cfg(feature = "serial")]
 pub mod serial;
 
 use std::fmt;
@@ -63,6 +69,7 @@ pub enum Keying {
     /// An Elecraft radio on a serial cable, spoken to directly — no daemon in
     /// between, which for the one radio on the bench is one thing to run
     /// instead of two.
+    #[cfg(feature = "elecraft")]
     Elecraft { device: String, baud: u32 },
 }
 
@@ -497,6 +504,7 @@ pub fn modes_for(keying: &Keying) -> &'static [&'static str] {
         Keying::RigCtld { .. } => {
             &["PKTUSB", "PKTLSB", "USB", "LSB", "CW", "CWR", "RTTY", "RTTYR", "AM", "FM"]
         }
+        #[cfg(feature = "elecraft")]
         Keying::Elecraft { .. } => elecraft::MODES,
     }
 }
@@ -508,6 +516,7 @@ pub fn open(keying: &Keying) -> Box<dyn Transmitter> {
     match keying {
         Keying::None => Box::new(Unkeyed),
         Keying::RigCtld { host, port } => Box::new(RigCtld::new(host, *port)),
+        #[cfg(feature = "elecraft")]
         Keying::Elecraft { device, baud } => match serial::Port::open(device, *baud) {
             Ok(port) => {
                 let what = port.describe().to_string();
@@ -522,8 +531,14 @@ pub fn open(keying: &Keying) -> Box<dyn Transmitter> {
 }
 
 /// A transmitter that could not be opened, and says so whenever it is asked.
+///
+/// Only a port can fail to open — `rigctld` is reached lazily, over a socket
+/// that is not touched here — so this exists exactly when the serial layer
+/// does.
+#[cfg(feature = "serial")]
 struct Unreachable(String);
 
+#[cfg(feature = "serial")]
 impl Transmitter for Unreachable {
     fn key(&mut self, _on: bool) -> Result<(), Fault> {
         Err(Fault::Link(self.0.clone()))
@@ -1717,12 +1732,15 @@ mod tests {
         assert!(modes_for(&Keying::None).is_empty(), "offered modes with no rig");
 
         // An Elecraft's list is the one its own protocol has digits for.
-        let elecraft = Keying::Elecraft { device: "x".into(), baud: 38400 };
-        for name in modes_for(&elecraft) {
-            assert!(
-                elecraft::mode_digit(name).is_some(),
-                "{name} is offered and the radio has no digit for it"
-            );
+        #[cfg(feature = "elecraft")]
+        {
+            let elecraft = Keying::Elecraft { device: "x".into(), baud: 38400 };
+            for name in modes_for(&elecraft) {
+                assert!(
+                    elecraft::mode_digit(name).is_some(),
+                    "{name} is offered and the radio has no digit for it"
+                );
+            }
         }
     }
 
