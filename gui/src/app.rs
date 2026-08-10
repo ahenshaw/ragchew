@@ -183,6 +183,36 @@ fn arrow(painter: &egui::Painter, at: egui::Rect, up: bool, colour: Color32) {
     ));
 }
 
+/// Where a rig's filter sits in the audio this app draws.
+///
+/// A receiver's filter is quoted as a width and placed about a centre, and the
+/// centre is the part no rig volunteers over CAT in any way this could rely
+/// on. Fifteen hundred hertz is the convention for data operating — it is what
+/// a K3 and a KX3 use for their data modes out of the box — so that is what
+/// this assumes, and the readout says as much rather than pretending to know.
+///
+/// An assumption is tolerable here in a way it was not for the transmit flag:
+/// wrong by a couple of hundred hertz the shading is slightly misplaced and
+/// visibly so, where a wrong transmit indicator is invisible and dangerous.
+const FILTER_CENTRE_HZ: f64 = 1500.0;
+
+/// The stretches of the band this app draws that fall outside the rig's
+/// filter, as `(low, high)` in audio hertz.
+///
+/// Empty when the width is unknown or the mode is not one where an audio
+/// passband means anything — nothing is dimmed on a guess.
+fn outside_the_filter(width_hz: Option<f64>, sideband: bool) -> Vec<(f64, f64)> {
+    let Some(width) = width_hz.filter(|w| *w > 0.0) else { return Vec::new() };
+    if !sideband {
+        return Vec::new();
+    }
+    let half = width / 2.0;
+    vec![
+        (f64::MIN, FILTER_CENTRE_HZ - half),
+        (FILTER_CENTRE_HZ + half, f64::MAX),
+    ]
+}
+
 /// Where a signal actually is on the band: the dial, plus or minus the audio
 /// offset the app hears it at.
 ///
@@ -2172,7 +2202,7 @@ impl App {
             Some(hz) => megahertz(hz),
             // Linked and silent about it, or not linked at all: either way the
             // dial is unknown, and dashes say that where a zero would lie.
-            None => "--.---.---".to_string(),
+            None => "--.---.--".to_string(),
         };
         let dim = shown.is_none();
         // Typed and not yet entered is drawn cooler than a frequency the radio
@@ -2553,7 +2583,9 @@ impl App {
                         .on_hover_text(
                             "the receiver's filter. Anything outside it is shaded on the \
                              waterfall: the app draws the band, the radio decides how much \
-                             of it you can hear.",
+                             of it you can hear. Taken as centred on 1500 Hz, which is what \
+                             a rig's data modes use — no rig reports the centre in a way \
+                             this can rely on.",
                         )
                         .changed()
                     {
@@ -2687,6 +2719,15 @@ impl App {
             self.ptt = Some(rig::Ptt::start(&self.rig, rig::Limits::default()));
             diag_info!("rig", "keying through {}", rig::open(&self.rig).describe());
         }
+    }
+
+    /// Whether the rig is in a mode where an audio passband means anything —
+    /// the same four that make an audio offset a frequency.
+    fn rig_passband_mode(&self) -> bool {
+        matches!(
+            self.ptt_state().dial_mode.as_deref(),
+            Some("USB" | "LSB" | "PKTUSB" | "PKTLSB" | "DATA" | "DATA-REV")
+        )
     }
 
     /// What the transmitter is doing, as far as anything can tell.
@@ -4742,6 +4783,30 @@ impl App {
                 Color32::WHITE,
             );
 
+            // What the radio cannot hear, dimmed.
+            //
+            // The app draws the whole band it scans; the rig decides how much
+            // of that reaches the sound card. With a narrow filter most of this
+            // panorama is a picture of nothing, and until now nothing on screen
+            // said which part. Shaded rather than cropped, because the boundary
+            // is worth seeing — a station just outside it is a station to widen
+            // the filter for, and one that vanished with the shading would not
+            // be noticed at all.
+            for band in outside_the_filter(self.ptt_state().width_hz, self.rig_passband_mode()) {
+                let (top, bottom) = (g.hz_to_y(&self.vp, band.1), g.hz_to_y(&self.vp, band.0));
+                if bottom <= 0.0 || top >= g.height {
+                    continue;
+                }
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        to_screen(g.waterfall_x0(), top.max(0.0)),
+                        to_screen(g.width, bottom.min(g.height)),
+                    ),
+                    0.0,
+                    Color32::from_black_alpha(150),
+                );
+            }
+
             if split_hot {
                 painter.rect_filled(
                     Rect::from_min_max(
@@ -6413,6 +6478,27 @@ mod tests {
         let mut restored = App::base((0.0, 4000.0));
         restored.apply(serde_json::from_str(&text).unwrap());
         assert!(restored.rig_more, "the window forgot that they were open");
+    }
+
+    /// What falls outside the rig's filter, in the audio this app draws.
+    #[test]
+    fn the_band_outside_the_filter_is_the_part_to_dim() {
+        // A wide data filter leaves almost all of the panorama audible.
+        let wide = outside_the_filter(Some(2700.0), true);
+        assert_eq!(wide.len(), 2);
+        assert_eq!(wide[0].1, 150.0, "the low edge of a 2.7 kHz filter at 1500");
+        assert_eq!(wide[1].0, 2850.0, "the high edge of a 2.7 kHz filter at 1500");
+
+        // A narrow one leaves a slot, and the rest is a picture of nothing.
+        let narrow = outside_the_filter(Some(400.0), true);
+        assert_eq!(narrow[0].1, 1300.0);
+        assert_eq!(narrow[1].0, 1700.0);
+
+        // Nothing is dimmed on a guess: no width, no filter; and a mode where
+        // an audio passband means nothing gets no shading either.
+        assert!(outside_the_filter(None, true).is_empty());
+        assert!(outside_the_filter(Some(2700.0), false).is_empty(), "shaded an FM panorama");
+        assert!(outside_the_filter(Some(0.0), true).is_empty());
     }
 
     /// An audio offset becomes a frequency on the band, with the sideband
