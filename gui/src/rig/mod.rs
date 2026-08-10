@@ -749,6 +749,20 @@ struct Session {
     next_dial: std::time::Instant,
     /// When the link may next be tried, after one has failed.
     retry_at: Option<std::time::Instant>,
+    /// Reads that have come back with nothing, in a row.
+    ///
+    /// A radio on a serial cable goes quiet for a moment when it is busy —
+    /// press Enter on a new frequency and the synthesiser and the relays have
+    /// something to do — and the poll that lands in that moment gets no answer.
+    /// That is not a broken link, and saying "the rig did not answer" over a
+    /// tune that plainly worked is worse than saying nothing. So silence has to
+    /// persist before it is reported.
+    misses: u32,
+    /// The same for the two optional readings: a rig that does not answer
+    /// `PC` or `BW` at all should be asked a few times and then left alone,
+    /// rather than costing half a second of quiet on every poll for ever.
+    power_misses: u32,
+    width_misses: u32,
 }
 
 impl Drop for Session {
@@ -779,6 +793,9 @@ impl Session {
             can_ask: true,
             can_ask_dial: true,
             next_dial: std::time::Instant::now(),
+            misses: 0,
+            power_misses: 0,
+            width_misses: 0,
             retry_at: None,
         }
     }
@@ -926,6 +943,7 @@ impl Session {
         match self.tx.keyed() {
             Ok(says) => {
                 self.retry_at = None;
+                self.heard();
                 self.can_ask = says.is_some();
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.linked = true;
@@ -944,6 +962,7 @@ impl Session {
     fn tune(&mut self, hz: f64) {
         match self.tx.tune(hz) {
             Ok(()) => {
+                self.heard();
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.linked = true;
                 st.fault = None;
@@ -959,6 +978,7 @@ impl Session {
     fn adjust(&mut self, what: impl FnOnce(&mut dyn Transmitter) -> Result<(), Fault>) {
         match what(self.tx.as_mut()) {
             Ok(()) => {
+                self.heard();
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.linked = true;
                 st.fault = None;
@@ -974,6 +994,7 @@ impl Session {
     fn set_mode(&mut self, mode: &str) {
         match self.tx.set_mode(mode) {
             Ok(()) => {
+                self.heard();
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.linked = true;
                 st.fault = None;
@@ -994,12 +1015,22 @@ impl Session {
         self.next_dial = now + Duration::from_secs_f64((self.limits.poll_s * 2.0).max(0.2));
         match self.tx.dial_hz() {
             Ok(hz) => {
+                self.heard();
                 self.can_ask_dial = hz.is_some();
                 let mode = self.tx.dial_mode().ok().flatten();
                 // Asked for on the dial's own slow beat, being settings a hand
-                // changes rather than something that moves by itself.
-                let power = self.tx.power_w().ok().flatten();
-                let width = self.tx.width_hz().ok().flatten();
+                // changes rather than something that moves by itself — and only
+                // while the rig shows signs of knowing them. A rig that answers
+                // neither would otherwise spend half a second of every poll
+                // being asked twice for nothing.
+                let power = match self.power_misses < Session::QUIET_ENOUGH {
+                    true => self.tx.power_w().inspect_err(|_| self.power_misses += 1).ok().flatten(),
+                    false => None,
+                };
+                let width = match self.width_misses < Session::QUIET_ENOUGH {
+                    true => self.tx.width_hz().inspect_err(|_| self.width_misses += 1).ok().flatten(),
+                    false => None,
+                };
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.linked = true;
                 st.dial_hz = hz;
@@ -1058,11 +1089,31 @@ impl Session {
         }
     }
 
+    /// How many times in a row a rig may say nothing before it is worth
+    /// telling the operator about. Three, at two polls a second, is under two
+    /// seconds of real silence — long enough to sit out a retune, short enough
+    /// that a cable pulled out is noticed at once.
+    const QUIET_ENOUGH: u32 = 3;
+
     fn no_link(&mut self, e: Fault) {
+        // A refusal or a nonsense answer is the rig talking, and is reported at
+        // once. Silence is only reported once it has gone on.
+        let transient = matches!(e, Fault::Timeout);
+        if transient {
+            self.misses += 1;
+            if self.misses < Session::QUIET_ENOUGH {
+                return;
+            }
+        }
         let linked = !matches!(e, Fault::Link(_) | Fault::Timeout);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.linked = linked;
         st.fault = Some(e.to_string());
+    }
+
+    /// Something came back, so whatever silence there was is over.
+    fn heard(&mut self) {
+        self.misses = 0;
     }
 
     fn fault(&mut self, what: String) {
@@ -1673,6 +1724,37 @@ mod tests {
                 "{name} is offered and the radio has no digit for it"
             );
         }
+    }
+
+    /// A radio that goes quiet for a moment is not a broken link.
+    ///
+    /// A serial rig stops answering while it is busy — press Enter on a new
+    /// frequency and the synthesiser and the relays have work to do — and the
+    /// poll that lands in that moment gets nothing. Reporting the first miss
+    /// put "the rig did not answer" on screen over a tune that had plainly
+    /// worked. Silence has to persist before it counts.
+    #[test]
+    fn a_moment_of_silence_is_not_a_fault() {
+        let rig = FakeRig::start();
+        let ptt = Ptt::with_transmitter(Box::new(rig.client()), quick());
+        assert!(wait_until(|| ptt.state().linked), "never reached the rig");
+        assert_eq!(ptt.state().fault, None);
+
+        // Stop answering, briefly.
+        rig.deaf.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(ptt.state().fault, None, "one unanswered poll was called a fault");
+
+        // Keep it up, and it is one.
+        assert!(
+            wait_until(|| ptt.state().fault.is_some()),
+            "a rig that stopped answering altogether was never reported"
+        );
+        assert!(!ptt.state().linked);
+
+        // And it clears the moment the rig speaks again.
+        rig.deaf.store(false, Ordering::SeqCst);
+        assert!(wait_until(|| ptt.state().linked), "never came back");
     }
 
     /// A daemon that is not there does not become a busy loop against it, and
