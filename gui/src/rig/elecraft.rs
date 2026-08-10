@@ -55,16 +55,37 @@ impl<L: Read + Write + Send> Elecraft<L> {
         Elecraft { link, what, greeted: false }
     }
 
-    /// Send a command and read its answer, up to and including the `;`.
+    /// Ask a question and read *its* answer.
     ///
-    /// Commands that set something answer nothing at all, so only the ones that
-    /// ask are read back — a read after `TX;` would sit until the timeout and
-    /// then report a radio that is working perfectly as one that is not
-    /// answering.
-    fn ask(&mut self, command: &str) -> Result<String, Fault> {
+    /// Records are matched to the question by their two-letter prefix rather
+    /// than taken in order, and anything else that turns up is discarded. A
+    /// radio volunteers: `AI0;` is meant to stop it, and on a KX3 being tuned
+    /// by hand it does not entirely — each change of frequency can produce an
+    /// `FA` nobody asked for. Read in order, one of those puts every answer
+    /// after it one command out of step, and what comes back is the tail of the
+    /// record before: a frequency that is somebody's previous reading, then
+    /// eventually a partial record that parses as nothing at all.
+    ///
+    /// Which is what "the rig answered nonsense" was, in the middle of tuning
+    /// from 14 MHz to 7.
+    ///
+    /// Commands that *set* something are answered by nothing at all, so they do
+    /// not come through here — a read after `TX;` would wait out the timeout
+    /// and report a radio that is working perfectly as one that is not.
+    fn ask(&mut self, query: &str) -> Result<String, Fault> {
         self.greet()?;
-        self.write(command)?;
-        self.read_answer(command)
+        self.write(query)?;
+        let want = query.trim_end_matches(';');
+        // Bounded, so a radio talking continuously cannot hold this thread:
+        // past a handful of unrelated records the link is not one this can use,
+        // and saying so beats reading for ever.
+        for _ in 0..8 {
+            let answer = self.read_answer(query)?;
+            if answer.starts_with(want) {
+                return Ok(answer);
+            }
+        }
+        Err(Fault::Protocol(format!("{query:?} was answered with records for other commands")))
     }
 
     fn tell(&mut self, command: &str) -> Result<(), Fault> {
@@ -425,9 +446,9 @@ mod tests {
         // A record of another shape is not guessed at.
         let bench = Bench::answering("IF123;");
         assert_eq!(bench.rig().keyed(), Ok(None));
-        // And something that is not an IF record at all is a fault.
+        // And a radio that only talks about other things has not answered.
         let bench = Bench::answering("MD6;");
-        assert!(matches!(bench.rig().keyed(), Err(Fault::Protocol(_))));
+        assert_eq!(bench.rig().keyed(), Err(Fault::Timeout));
     }
 
     /// Power in watts and the filter in hertz, in the units the radio wants:
@@ -455,6 +476,35 @@ mod tests {
         assert_eq!(bench.rig().width_hz(), Ok(Some(2700.0)));
     }
 
+    /// An answer is matched to its question, not taken in turn.
+    ///
+    /// A KX3 volunteers an `FA` of its own each time the frequency moves, and
+    /// while the operator is scrolling the dial those arrive among the answers
+    /// to everything else. Read in order they put the link one command out of
+    /// step: the frequency shown becomes a previous reading, and then a partial
+    /// record parses as nothing — "the rig answered nonsense", mid-tune.
+    #[test]
+    fn records_nobody_asked_for_are_stepped_over() {
+        // The radio volunteers two frequency changes, then answers the mode
+        // question that was actually asked.
+        let bench = Bench::answering("FA00014070000;FA00007070000;MD6;");
+        assert_eq!(bench.rig().dial_mode(), Ok(Some("DATA".to_string())));
+
+        // And the frequency question gets the *last* thing the radio said about
+        // frequency, not the first, because they arrive in order.
+        let bench = Bench::answering("MD2;FA00007070000;");
+        assert_eq!(bench.rig().dial_hz(), Ok(Some(7_070_000.0)));
+    }
+
+    /// A radio that will not stop talking is a link to give up on rather than
+    /// one to read for ever.
+    #[test]
+    fn a_radio_that_only_volunteers_is_given_up_on() {
+        let babble = "MD6;".repeat(20);
+        let bench = Bench::answering(&babble);
+        assert!(matches!(bench.rig().dial_hz(), Err(Fault::Protocol(_))));
+    }
+
     /// A radio that says nothing is a fault, not an empty answer.
     #[test]
     fn a_silent_radio_times_out() {
@@ -462,10 +512,21 @@ mod tests {
         assert_eq!(bench.rig().dial_hz(), Err(Fault::Timeout));
     }
 
-    /// An answer to the wrong question is reported rather than parsed.
+    /// A record for another command is stepped over; one that *is* the answer
+    /// and makes no sense is reported.
+    ///
+    /// Two different faults, and they send an operator to different places: the
+    /// first is a radio talking over itself and resolves on the next read, the
+    /// second is a radio saying something this cannot parse.
     #[test]
-    fn an_answer_that_is_not_the_one_asked_for_is_refused() {
+    fn a_wrong_answer_and_an_unreadable_one_are_different_faults() {
+        // Only records for other commands: nothing to answer with, so it is a
+        // silence rather than nonsense.
         let bench = Bench::answering("MD6;");
+        assert_eq!(bench.rig().dial_hz(), Err(Fault::Timeout));
+
+        // The right record, with something unreadable in it.
+        let bench = Bench::answering("FAnotafrequency;");
         assert!(matches!(bench.rig().dial_hz(), Err(Fault::Protocol(_))));
     }
 
