@@ -25,7 +25,10 @@
 
 use std::io::{Read, Write};
 
-use super::{Fault, Transmitter, KEYING, READING_DIAL, READING_PTT, SETTING_MODE, TUNING};
+use super::{
+    Fault, Transmitter, KEYING, READING_DIAL, READING_PTT, SETTING_MODE, SETTING_POWER,
+    SETTING_WIDTH, TUNING,
+};
 
 /// The modes an Elecraft will answer to, in the words this app shows.
 ///
@@ -244,6 +247,33 @@ impl<L: Read + Write + Send> Transmitter for Elecraft<L> {
         self.tell(&format!("MD{digit};"))
     }
 
+    fn power_w(&mut self) -> Result<Option<f64>, Fault> {
+        // `PCnnn;` — watts, three digits.
+        let answer = self.ask("PC;")?;
+        Ok(answer.strip_prefix("PC").and_then(|d| d.trim().parse::<f64>().ok()))
+    }
+
+    fn set_power_w(&mut self, watts: f64) -> Result<(), Fault> {
+        let w = watts.round().clamp(0.0, 999.0) as u32;
+        let _ = SETTING_POWER;
+        self.tell(&format!("PC{w:03};"))
+    }
+
+    fn width_hz(&mut self) -> Result<Option<f64>, Fault> {
+        // `BWnnnn;` — the filter width in tens of hertz, so 0270 is 2.70 kHz.
+        let answer = self.ask("BW;")?;
+        Ok(answer
+            .strip_prefix("BW")
+            .and_then(|d| d.trim().parse::<f64>().ok())
+            .map(|tens| tens * 10.0))
+    }
+
+    fn set_width_hz(&mut self, hz: f64) -> Result<(), Fault> {
+        let tens = (hz / 10.0).round().clamp(0.0, 9999.0) as u32;
+        let _ = SETTING_WIDTH;
+        self.tell(&format!("BW{tens:04};"))
+    }
+
     fn describe(&self) -> String {
         format!("Elecraft on {}", self.what)
     }
@@ -398,6 +428,31 @@ mod tests {
         // And something that is not an IF record at all is a fault.
         let bench = Bench::answering("MD6;");
         assert!(matches!(bench.rig().keyed(), Err(Fault::Protocol(_))));
+    }
+
+    /// Power in watts and the filter in hertz, in the units the radio wants:
+    /// `PC` counts watts and `BW` counts tens of hertz, so 2.7 kHz is 0270.
+    ///
+    /// **Unverified against a radio.** These two are read from Elecraft's
+    /// reference rather than from a record off the wire, unlike `IF` — the
+    /// shapes are simple and symmetrical, but the units are exactly the kind of
+    /// thing to check before trusting: a filter set ten times too wide is a
+    /// receiver listening to the whole band.
+    #[test]
+    fn power_and_filter_go_out_in_the_radios_own_units() {
+        let bench = Bench::default();
+        bench.rig().set_power_w(10.0).expect("could not set power");
+        assert_eq!(bench.heard(), "AI0;PC010;");
+
+        let bench = Bench::answering("PC005;");
+        assert_eq!(bench.rig().power_w(), Ok(Some(5.0)));
+
+        let bench = Bench::default();
+        bench.rig().set_width_hz(2700.0).expect("could not set the filter");
+        assert_eq!(bench.heard(), "AI0;BW0270;");
+
+        let bench = Bench::answering("BW0270;");
+        assert_eq!(bench.rig().width_hz(), Ok(Some(2700.0)));
     }
 
     /// A radio that says nothing is a fault, not an empty answer.

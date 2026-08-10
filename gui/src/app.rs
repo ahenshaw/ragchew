@@ -840,6 +840,8 @@ struct Settings {
     /// The serial port an Elecraft is on, and the rate its menu is set to.
     rig_device: String,
     rig_baud: u32,
+    /// Whether the rig's settings are expanded under the dial.
+    rig_more: bool,
 }
 
 impl Default for Settings {
@@ -870,6 +872,7 @@ impl Default for Settings {
             rig_port: DEFAULT_RIG_PORT,
             rig_device: DEFAULT_RIG_DEVICE.to_string(),
             rig_baud: rig::elecraft::KX3_BAUD,
+            rig_more: false,
         }
     }
 }
@@ -1566,6 +1569,9 @@ struct App {
     /// the keys put it there. See [`App::vfo`].
     dial_pick: usize,
     dial_by_key: Option<Pos2>,
+    /// Whether the rig's settings are on show under the dial.
+    rig_more: bool,
+
     /// Whether the list of modes is showing, which it does while the pointer is
     /// on the mode or in the list itself.
     mode_menu: bool,
@@ -1777,6 +1783,7 @@ impl App {
             dial_by_key: None,
             dial_typing: false,
             mode_menu: false,
+            rig_more: false,
             file_set: ChannelSet::new(15.0),
             fed_frames: 0,
             frames_dirty: false,
@@ -1813,6 +1820,7 @@ impl App {
             rig_port: self.rig_port,
             rig_device: self.rig_device.clone(),
             rig_baud: self.rig_baud,
+            rig_more: self.rig_more,
         }
     }
 
@@ -1844,6 +1852,7 @@ impl App {
         if s.rig_baud != 0 {
             self.rig_baud = s.rig_baud;
         }
+        self.rig_more = s.rig_more;
         self.set_keying(match s.rig_keying.as_str() {
             "rigctld" => rig::Keying::RigCtld {
                 host: self.rig_host.clone(),
@@ -2458,6 +2467,88 @@ impl App {
                 self.tuning = Some(Tuning { hz, at: wall, sent: false });
             }
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
+
+        // Power and filter under the dial, and only when the rig reports them:
+        // a station running a hundred watts into a wire wants the first at
+        // hand, and the second decides how much of this app's panorama is
+        // spectrum the radio can actually hear.
+        // The settings are behind a handle rather than always on show. They are
+        // set when a band changes and left alone for an hour after, and a
+        // panel whose top is mostly controls nobody is touching is a panel with
+        // less conversation in it.
+        let has_settings = live && (st.power_w.is_some() || st.width_hz.is_some());
+        if has_settings {
+            let handle_h = (self.text_px * 0.9).max(12.0);
+            let (strip, grip) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), handle_h),
+                egui::Sense::click(),
+            );
+            if grip.clicked() {
+                self.rig_more = !self.rig_more;
+            }
+            let lit = if grip.hovered() { 1.0 } else { 0.6 };
+            // Pointing the way the panel would grow, which is the only thing a
+            // reader needs it to say.
+            // Big enough to be a target and to be read as a direction at a
+            // glance; it is the only thing on the strip.
+            let mark = egui::Rect::from_center_size(
+                strip.center(),
+                egui::vec2(handle_h * 2.2, handle_h * 0.8),
+            );
+            arrow(&ui.painter_at(strip), mark, self.rig_more, VFO_AMBER.gamma_multiply(lit));
+            grip.on_hover_text(if self.rig_more {
+                "hide the rig's settings"
+            } else {
+                "the rig's settings: power, and the receiver's filter"
+            });
+        }
+        if has_settings && self.rig_more {
+            let mut set_power: Option<f64> = None;
+            let mut set_width: Option<f64> = None;
+            ui.horizontal(|ui| {
+                if let Some(w) = st.power_w {
+                    let mut watts = w;
+                    ui.label("W");
+                    if ui
+                        .add(egui::DragValue::new(&mut watts).speed(0.5).range(0.0..=100.0))
+                        .on_hover_text("transmit power, in watts")
+                        .changed()
+                    {
+                        set_power = Some(watts);
+                    }
+                }
+                if let Some(hz) = st.width_hz {
+                    let mut khz = hz / 1000.0;
+                    ui.separator();
+                    ui.label("filter");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut khz)
+                                .speed(0.05)
+                                .range(0.1..=4.0)
+                                .fixed_decimals(2)
+                                .suffix(" kHz"),
+                        )
+                        .on_hover_text(
+                            "the receiver's filter. Anything outside it is shaded on the \
+                             waterfall: the app draws the band, the radio decides how much \
+                             of it you can hear.",
+                        )
+                        .changed()
+                    {
+                        set_width = Some(khz * 1000.0);
+                    }
+                }
+            });
+            if let Some(link) = &self.ptt {
+                if let Some(w) = set_power {
+                    link.set_power_w(w);
+                }
+                if let Some(hz) = set_width {
+                    link.set_width_hz(hz);
+                }
+            }
         }
 
         // No tooltip while the modes are showing. It is help about the digits,
@@ -4400,7 +4491,23 @@ impl App {
             .show(ui, |ui| {
                 // The rig's own readout, above the conversations: what the
                 // station is doing, over what the people on it are saying.
-                self.vfo(ui);
+                //
+                // On its own ground, because they are two different things and
+                // a reader should not have to work that out from the contents.
+                // The radio's panel is the app's background rather than the
+                // card the conversations sit on — the same shade the window
+                // shows behind everything, so the rig reads as apparatus the
+                // panel is resting on rather than as another card.
+                if self.ptt.is_some() {
+                    let palette = elegance::Theme::current(ctx).palette;
+                    egui::Frame::new()
+                        .fill(palette.bg)
+                        .stroke(Stroke::new(1.0, palette.card))
+                        .corner_radius(5.0)
+                        .inner_margin(egui::Margin::symmetric(6, 5))
+                        .show(ui, |ui| self.vfo(ui));
+                    ui.add_space(6.0);
+                }
                 self.qso_panel(ui, t_now);
             });
         // The panel's own rect, not its contents': the contents are inset by
@@ -6224,6 +6331,51 @@ mod tests {
         assert!(app.mode_menu, "the list closed while the pointer moved into it");
     }
 
+    /// The rig's settings stay out of the way until they are asked for.
+    ///
+    /// They are set when a band changes and left alone for the hour after, and
+    /// this panel is mostly meant to hold conversation. So: a handle, and
+    /// nothing behind it until it is used.
+    #[test]
+    fn the_rigs_settings_hide_behind_a_handle() {
+        let mut app = app_with_a_dial(14_074_000.0);
+        let mut hand = Hand::new();
+        hand.hover(&mut app, Pos2::new(-50.0, -50.0));
+
+        let shown = |out: &egui::FullOutput| -> bool {
+            drawn(out).iter().any(|(s, _)| s.contains("kHz"))
+        };
+        let out = hand.hover(&mut app, Pos2::new(-50.0, -50.0));
+        assert!(!shown(&out), "the settings were on show without being asked for");
+
+        // The handle is directly under the dial and spans the panel, so it is
+        // found by walking down from the digits rather than by guessing at the
+        // spacing between them.
+        let dial = hand.digit(&mut app, 0);
+        let below = dial.y + app.text_px * VFO_SCALE / 2.0 + (app.text_px * 0.5).max(7.0) + 3.0;
+        let mut found = None;
+        for step in 0..12 {
+            let at = egui::pos2(dial.x, below + step as f32 * 2.0);
+            hand.hover(&mut app, at);
+            hand.click(&mut app);
+            if app.rig_more {
+                found = Some(at.y - below);
+                break;
+            }
+        }
+        let reach = found.expect("no handle under the dial");
+        assert!(reach < 24.0, "the handle is {reach:.0} px below the dial, which is not under it");
+
+        let out = hand.hover(&mut app, Pos2::new(-50.0, -50.0));
+        assert!(shown(&out), "opened, and the settings still are not drawn");
+
+        // And it is remembered, being a thing about how the window is laid out.
+        let text = serde_json::to_string(&app.settings()).unwrap();
+        let mut restored = App::base((0.0, 4000.0));
+        restored.apply(serde_json::from_str(&text).unwrap());
+        assert!(restored.rig_more, "the window forgot that they were open");
+    }
+
     /// A frequency reads as a frequency, in the groups an operator says out
     /// loud rather than as seven undifferentiated digits.
     #[test]
@@ -6543,6 +6695,12 @@ mod tests {
         }
         fn dial_mode(&mut self) -> Result<Option<String>, rig::Fault> {
             Ok(Some("PKTUSB".to_string()))
+        }
+        fn power_w(&mut self) -> Result<Option<f64>, rig::Fault> {
+            Ok(Some(10.0))
+        }
+        fn width_hz(&mut self) -> Result<Option<f64>, rig::Fault> {
+            Ok(Some(2700.0))
         }
         fn describe(&self) -> String {
             "a dial".to_string()

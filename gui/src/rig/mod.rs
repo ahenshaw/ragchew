@@ -138,6 +138,8 @@ pub(crate) const READING_PTT: &str = "say whether it is transmitting";
 pub(crate) const READING_DIAL: &str = "say what it is tuned to";
 pub(crate) const TUNING: &str = "tune";
 pub(crate) const SETTING_MODE: &str = "change mode";
+pub(crate) const SETTING_POWER: &str = "change power";
+pub(crate) const SETTING_WIDTH: &str = "change its filter";
 
 /// Something that can put a transmitter on the air.
 pub trait Transmitter: Send {
@@ -174,6 +176,31 @@ pub trait Transmitter: Send {
     fn set_mode(&mut self, mode: &str) -> Result<(), Fault> {
         let _ = mode;
         Err(Fault::Rejected { doing: SETTING_MODE, code: -4 })
+    }
+
+    /// Transmit power in watts, and setting it.
+    ///
+    /// Watts because that is what an operator says and what the radio's own
+    /// display shows. A transport whose rig quotes a percentage converts.
+    fn power_w(&mut self) -> Result<Option<f64>, Fault> {
+        Ok(None)
+    }
+    fn set_power_w(&mut self, watts: f64) -> Result<(), Fault> {
+        let _ = watts;
+        Err(Fault::Rejected { doing: SETTING_POWER, code: -4 })
+    }
+
+    /// The receiver's filter width in Hz, and setting it.
+    ///
+    /// It matters here more than in a logger: this app draws two and a half
+    /// kilohertz of band, and a rig filtering four hundred hertz of it is a
+    /// panorama mostly of things the radio cannot hear.
+    fn width_hz(&mut self) -> Result<Option<f64>, Fault> {
+        Ok(None)
+    }
+    fn set_width_hz(&mut self, hz: f64) -> Result<(), Fault> {
+        let _ = hz;
+        Err(Fault::Rejected { doing: SETTING_WIDTH, code: -4 })
     }
 
     /// What this is, for the log and the settings menu.
@@ -397,6 +424,52 @@ impl Transmitter for RigCtld {
         Ok(Some(first))
     }
 
+    fn power_w(&mut self) -> Result<Option<f64>, Fault> {
+        // Hamlib quotes RFPOWER as a fraction of the rig's maximum, which is
+        // not a number an operator says. `power2mW` is what converts it, and
+        // it needs the frequency and mode to do so — so this asks the daemon
+        // rather than doing arithmetic on a ratio it cannot interpret.
+        let dial = self.dial_hz()?.unwrap_or(14_074_000.0);
+        let level = self.ask("l RFPOWER")?;
+        let Ok(fraction) = level.trim().parse::<f64>() else {
+            return match RigCtld::expect_rprt(&level, SETTING_POWER) {
+                Err(Fault::Rejected { code: -4 | -11, .. }) => Ok(None),
+                Err(e) => Err(e),
+                Ok(()) => Ok(None),
+            };
+        };
+        let answer = self.ask(&format!("2 {fraction} {dial:.0} PKTUSB"))?;
+        Ok(answer.trim().parse::<f64>().ok().map(|mw| mw / 1000.0))
+    }
+
+    fn set_power_w(&mut self, watts: f64) -> Result<(), Fault> {
+        // The inverse, `mW2power`, for the same reason.
+        let dial = self.dial_hz()?.unwrap_or(14_074_000.0);
+        let mw = (watts.max(0.0) * 1000.0).round();
+        let fraction = self.ask(&format!("4 {mw:.0} {dial:.0} PKTUSB"))?;
+        let Ok(fraction) = fraction.trim().parse::<f64>() else {
+            return Err(Fault::Protocol(format!("expected a power ratio, got {fraction:?}")));
+        };
+        let answer = self.ask(&format!("L RFPOWER {fraction}"))?;
+        RigCtld::expect_rprt(&answer, SETTING_POWER)
+    }
+
+    fn width_hz(&mut self) -> Result<Option<f64>, Fault> {
+        // The passband is the second line of `m`, in Hz.
+        let answer = self.ask_lines("m", 2)?;
+        Ok(answer.get(1).and_then(|w| w.trim().parse::<f64>().ok()))
+    }
+
+    fn set_width_hz(&mut self, hz: f64) -> Result<(), Fault> {
+        // Hamlib sets a passband with the mode, so the mode has to be named
+        // again; changing one must not silently change the other.
+        let Some(mode) = self.dial_mode()? else {
+            return Err(Fault::Rejected { doing: SETTING_WIDTH, code: -11 });
+        };
+        let answer = self.ask(&format!("M {mode} {:.0}", hz.max(0.0)))?;
+        RigCtld::expect_rprt(&answer, SETTING_WIDTH)
+    }
+
     fn describe(&self) -> String {
         format!("rigctld at {}", self.addr)
     }
@@ -513,6 +586,10 @@ pub struct State {
     /// says, not as this app last asked for. Turning the knob shows up here.
     pub dial_hz: Option<f64>,
     pub dial_mode: Option<String>,
+    /// Transmit power in watts, and the receiver's filter width in Hz, as the
+    /// rig reports them.
+    pub power_w: Option<f64>,
+    pub width_hz: Option<f64>,
 }
 
 /// One stretch of time the rig should be transmitting for.
@@ -537,6 +614,10 @@ enum Cmd {
     Tune(f64),
     /// Change mode.
     Mode(String),
+    /// Transmit power, in watts.
+    Power(f64),
+    /// Receiver filter width, in Hz.
+    Width(f64),
 }
 
 /// A transmitter under supervision.
@@ -602,6 +683,16 @@ impl Ptt {
     /// from the next reading rather than from this.
     pub fn set_mode(&self, mode: &str) {
         self.tell(Cmd::Mode(mode.to_string()));
+    }
+
+    /// Set the transmit power, in watts.
+    pub fn set_power_w(&self, watts: f64) {
+        self.tell(Cmd::Power(watts));
+    }
+
+    /// Set the receiver's filter width, in Hz.
+    pub fn set_width_hz(&self, hz: f64) {
+        self.tell(Cmd::Width(hz));
     }
 
     /// Say something to the worker, or say nothing at all: a worker that has
@@ -703,6 +794,8 @@ impl Session {
                 }
                 Ok(Cmd::Span(s)) => self.queued.push(s),
                 Ok(Cmd::Mode(mode)) => self.set_mode(&mode),
+                Ok(Cmd::Power(w)) => self.adjust(|tx| tx.set_power_w(w)),
+                Ok(Cmd::Width(hz)) => self.adjust(|tx| tx.set_width_hz(hz)),
                 Ok(Cmd::Tune(hz)) => {
                     // Only the last one. A hand on a wheel outruns a CAT link
                     // at 4800 baud by a wide margin, and a queue of frequencies
@@ -759,6 +852,8 @@ impl Session {
             }
             Cmd::Tune(hz) => self.tune(hz),
             Cmd::Mode(mode) => self.set_mode(&mode),
+            Cmd::Power(w) => self.adjust(|tx| tx.set_power_w(w)),
+            Cmd::Width(hz) => self.adjust(|tx| tx.set_width_hz(hz)),
         }
     }
 
@@ -859,6 +954,21 @@ impl Session {
         }
     }
 
+    /// Do something to the rig and ask it what happened rather than assume:
+    /// a setting the rig declines must not leave the wrong number on screen.
+    fn adjust(&mut self, what: impl FnOnce(&mut dyn Transmitter) -> Result<(), Fault>) {
+        match what(self.tx.as_mut()) {
+            Ok(()) => {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.linked = true;
+                st.fault = None;
+                drop(st);
+                self.next_dial = std::time::Instant::now();
+            }
+            Err(e) => self.no_link(e),
+        }
+    }
+
     /// Change mode, and ask what it is straight afterwards rather than
     /// assuming: a rig that declines must not leave the wrong word on screen.
     fn set_mode(&mut self, mode: &str) {
@@ -886,11 +996,21 @@ impl Session {
             Ok(hz) => {
                 self.can_ask_dial = hz.is_some();
                 let mode = self.tx.dial_mode().ok().flatten();
+                // Asked for on the dial's own slow beat, being settings a hand
+                // changes rather than something that moves by itself.
+                let power = self.tx.power_w().ok().flatten();
+                let width = self.tx.width_hz().ok().flatten();
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.linked = true;
                 st.dial_hz = hz;
                 if mode.is_some() {
                     st.dial_mode = mode;
+                }
+                if power.is_some() {
+                    st.power_w = power;
+                }
+                if width.is_some() {
+                    st.width_hz = width;
                 }
             }
             Err(e) => self.no_link(e),
