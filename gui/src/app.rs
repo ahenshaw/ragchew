@@ -233,6 +233,27 @@ fn on_the_band(dial: Option<f64>, mode: Option<&str>, audio_hz: f64) -> Option<f
     Some(dial? + sign * audio_hz)
 }
 
+/// The same, in the fixed places a dial has.
+///
+/// Every decade keeps its column whatever the frequency, because on this dial a
+/// digit is a control: at 7.070.000 with the megahertz written as one digit
+/// there is no tens column to put a cursor on, so 14 MHz cannot be typed at
+/// all. A radio solves it the same way — the positions are always there and the
+/// leading zeros are blanked, which here means drawn dim.
+///
+/// Three megahertz digits rather than two, so a rig on two metres has somewhere
+/// to put its hundreds.
+fn dial_digits(hz: f64) -> String {
+    let total = hz.round().max(0.0) as u64;
+    let (mhz, rest) = (total / 1_000_000, total % 1_000_000);
+    format!("{mhz:03}.{:03}.{:03}", rest / 1000, rest % 1000)
+}
+
+/// How many leading zeros of a dial reading are blanks rather than digits.
+fn leading_blanks(reading: &str) -> usize {
+    reading.chars().take_while(|c| *c == '0').count().min(2)
+}
+
 /// A frequency the way a rig shows it: megahertz, kilohertz, hertz, in groups
 /// a reader can say out loud — 14.074.000 rather than 14074000.
 ///
@@ -2199,10 +2220,10 @@ impl App {
             _ => st.dial_hz,
         };
         let reading = match shown {
-            Some(hz) => megahertz(hz),
+            Some(hz) => dial_digits(hz),
             // Linked and silent about it, or not linked at all: either way the
             // dial is unknown, and dashes say that where a zero would lie.
-            None => "--.---.--".to_string(),
+            None => "---.---.---".to_string(),
         };
         let dim = shown.is_none();
         // Typed and not yet entered is drawn cooler than a frequency the radio
@@ -2219,7 +2240,22 @@ impl App {
         // the only honest source for where a digit sits is the galley that
         // draws it.
         let font = FontId::monospace(digit_h);
-        let galley = painter.layout_no_wrap(reading.clone(), font, amber);
+        // Leading zeros dim: they are places to tune, not figures to read, and
+        // a dial that shows 007.070.000 as brightly as the rest is one an eye
+        // has to parse rather than glance at.
+        let mut job = egui::text::LayoutJob::default();
+        let blanks = if dim { 0 } else { leading_blanks(&reading) };
+        job.append(
+            &reading[..blanks],
+            0.0,
+            egui::TextFormat { font_id: font.clone(), color: amber.gamma_multiply(0.3), ..Default::default() },
+        );
+        job.append(
+            &reading[blanks..],
+            0.0,
+            egui::TextFormat { font_id: font, color: amber, ..Default::default() },
+        );
+        let galley = painter.layout_job(job);
         let origin = egui::pos2(rect.right() - 10.0 - galley.size().x, rect.center().y - digit_h / 2.0);
         painter.galley(origin, galley.clone(), amber);
 
@@ -6435,6 +6471,37 @@ mod tests {
         assert!(app.mode_menu, "the list closed while the pointer moved into it");
     }
 
+    /// Every decade has a column, whatever the frequency.
+    ///
+    /// At 7.070.000 with the megahertz written as a single digit there is no
+    /// tens column, so 14 MHz cannot be typed or scrolled to at all — the
+    /// cursor has nowhere to stand. The places are fixed and the leading zeros
+    /// are blanked, as a radio's own dial does it.
+    #[test]
+    fn the_decades_keep_their_places_below_ten_megahertz() {
+        assert_eq!(dial_digits(7_070_000.0), "007.070.000");
+        assert_eq!(dial_digits(14_074_000.0), "014.074.000");
+        assert_eq!(dial_digits(144_200_000.0), "144.200.000");
+        // Blanked, not written: two at most, so a dial never reads as empty.
+        assert_eq!(leading_blanks("007.070.000"), 2);
+        assert_eq!(leading_blanks("014.074.000"), 1);
+        assert_eq!(leading_blanks("144.200.000"), 0);
+        assert_eq!(leading_blanks("000.000.000"), 2);
+
+        // And the column is there to be used: ten megahertz up from seven.
+        let mut app = app_with_a_dial(7_070_000.0);
+        let mut hand = Hand::new();
+        let tens_of_mhz = hand.digit(&mut app, 7);
+        hand.hover(&mut app, tens_of_mhz);
+        hand.hover(&mut app, tens_of_mhz);
+        hand.wheel(&mut app, 1.0);
+        assert_eq!(
+            app.tuning.map(|t| t.hz),
+            Some(17_070_000.0),
+            "the tens-of-megahertz column is not there to tune"
+        );
+    }
+
     /// The rig's settings stay out of the way until they are asked for.
     ///
     /// They are set when a band changes and left alone for the hour after, and
@@ -6800,7 +6867,7 @@ mod tests {
             assert!(began.elapsed() < std::time::Duration::from_secs(2), "no reading was drawn");
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
-        assert_eq!(reading, "14.074.000");
+        assert_eq!(reading, "014.074.000");
         assert!(size > app.text_px * 1.5, "drawn at {size}, no larger than the text at {}", app.text_px);
         assert_eq!(colour, VFO_AMBER, "the dial is not amber");
     }
@@ -6818,7 +6885,7 @@ mod tests {
 
         let out = lay_out(&mut app);
         assert!(
-            drawn(&out).iter().any(|(s, _)| s.starts_with("--.---")),
+            drawn(&out).iter().any(|(s, _)| s.starts_with("---")),
             "a silent dial did not say so: {:?}",
             drawn(&out).iter().map(|(s, _)| s.clone()).take(8).collect::<Vec<_>>()
         );
