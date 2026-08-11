@@ -1625,6 +1625,23 @@ mod tests {
         Limits { max_key_s: 0.3, poll_s: 0.02, retry_s: 0.05 }
     }
 
+    /// [`quick`], with room for a span wide enough to survive a slow machine.
+    ///
+    /// The two tests that schedule a span and watch it run need windows that a
+    /// loaded CI runner can still land inside. A span whose `off` has passed is
+    /// dropped rather than fired late — deliberately, since keying for audio
+    /// that already played is a bare carrier — so a window too narrow for the
+    /// machine is not a late transmission but no transmission at all, and the
+    /// test fails having tested nothing. That is what a macOS runner did to a
+    /// hundred-millisecond window opening fifty milliseconds out.
+    ///
+    /// So the windows are hundreds of milliseconds wide, and `max_key_s` has to
+    /// rise with them or the limit breaker cuts the key-down being measured.
+    /// These tests are about *one key-down per span*; the breaker has its own.
+    fn unhurried() -> Limits {
+        Limits { max_key_s: 2.0, ..quick() }
+    }
+
     fn wait_until(what: impl Fn() -> bool) -> bool {
         let began = std::time::Instant::now();
         while began.elapsed() < Duration::from_secs(2) {
@@ -1698,17 +1715,17 @@ mod tests {
     #[test]
     fn a_scheduled_span_keys_itself_and_lets_go() {
         let bench = Bench::new();
-        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), unhurried());
         let began = std::time::Instant::now();
         let at = unix_now();
-        ptt.schedule(at + 0.15, at + 0.30);
+        ptt.schedule(at + 0.30, at + 0.60);
 
         assert!(wait_until(|| bench.keyings().len() >= 2), "the span never ran");
         assert_eq!(bench.keyings(), [true, false]);
         let down = bench.at(0).duration_since(began).as_secs_f64();
         let up = bench.at(1).duration_since(began).as_secs_f64();
-        assert!((0.13..0.25).contains(&down), "keyed at {down:.3}s, wanted 0.15");
-        assert!((0.28..0.40).contains(&up), "unkeyed at {up:.3}s, wanted 0.30");
+        assert!((0.28..0.50).contains(&down), "keyed at {down:.3}s, wanted 0.30");
+        assert!((0.58..0.85).contains(&up), "unkeyed at {up:.3}s, wanted 0.60");
     }
 
     /// Frames are spans, one each, and each gets its own key-down: a message
@@ -1717,10 +1734,10 @@ mod tests {
     #[test]
     fn one_key_down_per_span_not_one_per_message() {
         let bench = Bench::new();
-        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), quick());
+        let ptt = Ptt::with_transmitter(Box::new(bench.clone()), unhurried());
         let at = unix_now();
-        ptt.schedule(at + 0.05, at + 0.15);
-        ptt.schedule(at + 0.25, at + 0.35);
+        ptt.schedule(at + 0.25, at + 0.60);
+        ptt.schedule(at + 0.90, at + 1.25);
 
         assert!(wait_until(|| bench.keyings().len() >= 4), "both spans did not run");
         assert_eq!(bench.keyings(), [true, false, true, false]);

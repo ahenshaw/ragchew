@@ -3745,6 +3745,23 @@ impl App {
     /// — no device, or one that will not take the format — arrives attached to
     /// the thing the operator just asked for instead of as a mystery at launch.
     fn send_active(&mut self, now_s: f64) {
+        // Fail closed, and first. Audio into a rig that did not key is silence
+        // at best, and on a station left on VOX it is a transmission nobody
+        // asked this app to make, out of a path the operator believed was under
+        // control.
+        //
+        // Ahead of everything else because it is the question of whether to
+        // transmit at all: settling it here means no audio device is opened and
+        // nothing is modulated for a transmission that was never going out, and
+        // it means the fault the operator is shown is the one that stopped
+        // them. Behind the audio open, a rig that is not answering reported
+        // itself as whatever the sound card had to say.
+        let keying = self.ptt.as_ref().map(|p| p.state());
+        if let Some(st) = keying.filter(|st| !st.linked && st.fault.is_some()) {
+            let why = st.fault.unwrap_or_default();
+            self.warn(format!("not transmitting: {why}"));
+            return;
+        }
         if self.tx.is_none() {
             match Tx::start(self.preferred_output.as_deref()) {
                 Ok(t) => self.tx = Some(t),
@@ -3768,16 +3785,6 @@ impl App {
         let busy_until = self.tx.as_ref().map_or(0.0, |t| unix_now() + t.busy_for());
         let at = tx::next_start_after(q.mode, busy_until);
         let (hz, mode) = (q.hz, q.mode);
-
-        // Fail closed. Audio into a rig that did not key is silence at best,
-        // and on a station left on VOX it is a transmission nobody asked this
-        // app to make, out of a path the operator believed was under control.
-        let keying = self.ptt.as_ref().map(|p| p.state());
-        if let Some(st) = keying.filter(|st| !st.linked && st.fault.is_some()) {
-            let why = st.fault.unwrap_or_default();
-            self.warn(format!("not transmitting: {why}"));
-            return;
-        }
 
         let text_for_log = text.clone();
         q.draft.clear();
