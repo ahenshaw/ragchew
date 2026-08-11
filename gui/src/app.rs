@@ -306,6 +306,49 @@ const DEFAULT_RIG_DEVICE: &str = "";
 /// number through the settings file untouched.
 const DEFAULT_RIG_BAUD: u32 = 38_400;
 
+/// The transmit-power box, and the bandwidth box.
+///
+/// Both exist as functions for one reason: `clamp_existing_to_range(false)`.
+/// egui's `DragValue` clamps the value it is *given* by default, writes the
+/// clamped number back through the borrow, and reports it as a change — so a
+/// reading from the rig that falls outside the range this app is using would be
+/// altered on the way to the screen and then sent back to the radio as a
+/// setting. A rig sitting on a 12 kHz AM filter would be narrowed to the end of
+/// a range nobody asked for.
+///
+/// Turning it off leaves the drag and the keyboard still bounded — those are
+/// clamped further down in egui, on the paths that represent the operator
+/// actually asking for something. Only the rig's own reading passes through
+/// untouched, which is the whole distinction: this app may refuse to *ask* for
+/// a value, and may never misreport one.
+fn power_box(watts: &mut f64, lo: f64, hi: f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(watts)
+        .speed(0.5)
+        .range(lo..=hi)
+        .suffix(" W")
+        .clamp_existing_to_range(false)
+}
+
+fn bandwidth_box(khz: &mut f64, lo: f64, hi: f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(khz)
+        .speed(0.05)
+        .range(lo..=hi)
+        .fixed_decimals(2)
+        .suffix(" kHz")
+        .clamp_existing_to_range(false)
+}
+
+/// What to bound a setting by when the rig has not said what it will take.
+///
+/// Not a claim about any radio — a guard against a drag running away, which is
+/// all a range can honestly be here. Wide enough that no rig's own reading is
+/// anywhere near them: an amateur station does not make ten kilowatts, and a
+/// receiver filter is not a megahertz wide. The earlier values were 100 Hz to
+/// 4 kHz, which are real numbers for a KX3 on a data mode and quietly wrong for
+/// anything on AM.
+const ANY_POWER_W: (f64, f64) = (0.0, 10_000.0);
+const ANY_BANDWIDTH_KHZ: (f64, f64) = (0.001, 1_000.0);
+
 /// A slider with no number on it, beside a value box that already has one.
 ///
 /// egui's own `Slider` carries its own value box, which is the widget that was
@@ -320,7 +363,19 @@ fn track(ui: &mut egui::Ui, v: &mut f64, lo: f64, hi: f64) -> bool {
     // can report almost nothing while it is being laid out for the first time
     // and a zero-width slider cannot be grabbed at all.
     ui.spacing_mut().slider_width = ui.available_width().max(MIN_TRACK_W);
-    ui.add(egui::Slider::new(v, lo..=hi).show_value(false)).changed()
+    ui.add(
+        egui::Slider::new(v, lo..=hi)
+            .show_value(false)
+            // `Edits`, not the default `Always`, for the reason given on
+            // [`power_box`]: the operator may not drag past the ends, and the
+            // rig's own reading is left exactly as the rig gave it. A track is
+            // only ever drawn over a range the rig stated, but even then the
+            // reading can sit outside it — a range read on one band against a
+            // rig now on another, an amplifier in line — and the reading is
+            // the fact.
+            .clamping(egui::SliderClamping::Edits),
+    )
+    .changed()
 }
 
 /// Narrowest a track may be drawn.
@@ -2754,15 +2809,10 @@ impl App {
                     // claim about the radio, which is why no track is drawn
                     // over it.
                     let known = st.power_range_w;
-                    let (lo, hi) = known.map_or((0.0, 999.0), |r| (r.lo, r.hi));
+                    let (lo, hi) = known.map_or(ANY_POWER_W, |r| (r.lo, r.hi));
                     ui.label("Power");
                     if ui
-                        .add(
-                            egui::DragValue::new(&mut watts)
-                                .speed(0.5)
-                                .range(lo..=hi)
-                                .suffix(" W"),
-                        )
+                        .add(power_box(&mut watts, lo, hi))
                         .on_hover_text(hint("transmit power", known.is_some()))
                         .changed()
                     {
@@ -2776,16 +2826,11 @@ impl App {
                 if let Some(hz) = st.width_hz {
                     let mut khz = hz / 1000.0;
                     let known = st.width_range_hz;
-                    let (lo, hi) = known.map_or((0.1, 9.99), |r| (r.lo / 1000.0, r.hi / 1000.0));
+                    let (lo, hi) =
+                        known.map_or(ANY_BANDWIDTH_KHZ, |r| (r.lo / 1000.0, r.hi / 1000.0));
                     ui.label("Bandwidth");
                     if ui
-                        .add(
-                            egui::DragValue::new(&mut khz)
-                                .speed(0.05)
-                                .range(lo..=hi)
-                                .fixed_decimals(2)
-                                .suffix(" kHz"),
-                        )
+                        .add(bandwidth_box(&mut khz, lo, hi))
                         .on_hover_text(hint(
                             "how wide the receiver's filter is. Anything outside it is shaded \
                              on the waterfall: the app draws the band, the radio decides how \
@@ -6675,6 +6720,65 @@ mod tests {
         // Whatever else is compiled in, doing nothing is always on offer and
         // is always what an unselected control falls back to.
         assert_eq!(KEYERS[0].tag, "none", "the first choice is not the harmless one");
+    }
+
+    /// A reading from the rig reaches the screen as the rig gave it.
+    ///
+    /// This is a bug that shipped. egui's `DragValue` and `Slider` both clamp
+    /// the value they are handed, write the clamped number back through the
+    /// borrow, and report it as a change — and this app sends changes to the
+    /// radio. A rig sitting on a 12 kHz AM filter was therefore narrowed to the
+    /// top of whatever range the app happened to be using, and a 50 Hz CW
+    /// filter widened to the bottom of it, without anybody asking and every
+    /// frame the panel was open.
+    ///
+    /// The distinction being pinned: this app may decline to *ask* for a value
+    /// outside a range, and may never alter one the rig reported.
+    #[test]
+    fn a_reading_outside_the_range_is_not_altered_or_sent_back() {
+        // Deliberately narrow, as the shipped ranges were.
+        let (lo, hi) = (0.1, 9.99);
+        for reading in [12.0_f64, 0.05, 30.0] {
+            let mut khz = reading;
+            let mut changed = None;
+            egui::__run_test_ui(|ui| {
+                changed = Some(ui.add(bandwidth_box(&mut khz, lo, hi)).changed());
+            });
+            assert_eq!(khz, reading, "rewrote a {reading} kHz reading");
+            assert_eq!(changed, Some(false), "reported a {reading} kHz reading as an edit");
+        }
+
+        // The same for power, and for the slider, which clamps by its own
+        // separate setting and would otherwise put the reading back.
+        let mut watts = 1500.0_f64;
+        egui::__run_test_ui(|ui| {
+            ui.add(power_box(&mut watts, 0.0, 100.0));
+        });
+        assert_eq!(watts, 1500.0, "rewrote a power reading above the rig's stated maximum");
+
+        let mut wide = 12.0_f64;
+        let mut moved = None;
+        egui::__run_test_ui(|ui| {
+            moved = Some(track(ui, &mut wide, lo, hi));
+        });
+        assert_eq!(wide, 12.0, "the slider rewrote a reading outside its track");
+        assert_eq!(moved, Some(false), "the slider reported an untouched reading as a drag");
+    }
+
+    /// The fallback bounds are a guard against a runaway drag, not a claim
+    /// about any radio, so nothing a real rig reports comes near them.
+    ///
+    /// The numbers they replace — 100 Hz to 4 kHz — were a KX3 on a data mode
+    /// written down as if it were every radio, which is how a 12 kHz AM filter
+    /// came to be narrowed.
+    #[test]
+    fn the_fallback_bounds_are_wider_than_any_radio() {
+        let (lo, hi) = ANY_BANDWIDTH_KHZ;
+        assert!(lo < 0.05, "a 50 Hz CW filter is below the floor");
+        assert!(hi > 30.0, "a 30 kHz FM filter is above the ceiling");
+        let (lo, hi) = ANY_POWER_W;
+        assert!(lo <= 0.0, "a rig turned down to nothing is below the floor");
+        assert!(hi > 1500.0, "a legal-limit station is above the ceiling");
     }
 
     /// A control with no slider says why, and one with a slider does not.
