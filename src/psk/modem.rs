@@ -104,6 +104,43 @@ pub const SCREEN_THRESHOLD: f64 = 11.2;
 /// at the 99.99th percentile of that distribution.
 pub const CONC_THRESHOLD: f64 = 0.204;
 
+/// The same statistic, as a running receiver applies it to decide the station
+/// has stopped transmitting. See [`crate::psk::rx::Rx::carrier`].
+///
+/// Higher than [`CONC_THRESHOLD`] and it has to be, which is the thing to
+/// understand before touching it. That figure is calibrated over a 256-symbol
+/// block; this one runs over twelve, so its noise distribution is far broader —
+/// a twelve-symbol mean of random phasors sits around 0.29 and reaches past 0.6
+/// often enough to print a word. Reusing 0.204 here would gate nothing at all.
+///
+/// The two are also answering different questions, and the costs are not
+/// symmetric. Stage two asks "is there a station here", where a false alarm
+/// invents one out of noise and is expensive. This asks "is the station I am
+/// already reading still there", where being slightly too eager costs a
+/// character at the end of an over and being too slow costs a line of rubbish
+/// after every one.
+///
+/// Measured — section G of `examples/psk_gate.rs`, and the number is a knee
+/// rather than a midpoint. Across both modes, noise after a transmission
+/// reaches 0.56 at its worst; text at every SNR the gate can actually find a
+/// station at reaches down to 0.51 for PSK63 at its own −6 dB floor. The two
+/// distributions therefore *touch*, and there is no threshold that is free.
+///
+/// | | text lost at the weakest usable signal | noise still printed |
+/// |---|---|---|
+/// | 0.50 | 0.0% | 0.21 / 0.28% |
+/// | **0.55** | **0.0 / 0.9%** | **0.05 / 0.03%** |
+/// | 0.60 | 0.0 / 3.1% | 0.00% |
+/// | 0.70 | 0.0 / 13.3% | 0.00% |
+///
+/// 0.55 is where the noise falls by most of an order of magnitude for under one
+/// per cent of the weakest text. Going on to 0.60 buys the last twentieth of a
+/// per cent of noise for three per cent of a weak PSK63 station, and 0.70 —
+/// which is where an eyeballed midpoint of the two distributions would have put
+/// it — costs one character in seven of it. Nothing above 0.55 is worth its
+/// price, which is not what looking at the histogram suggests.
+pub const CARRIER_THRESHOLD: f64 = 0.55;
+
 /// How much finer the demodulator's baseband is than the gate's.
 ///
 /// Zero-padding the same slice interpolates it exactly, giving 16 samples per

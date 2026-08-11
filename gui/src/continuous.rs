@@ -222,7 +222,17 @@ impl Continuous {
                 out.extend(
                     s.rx
                         .feed(&buf[s.fed_to - at..])
+                        // The station has to still be there. A receiver goes on
+                        // demodulating after an over ends — deliberately, so a
+                        // pause mid-over keeps its symbol clock — and what it
+                        // demodulates from the noise left behind is varicode
+                        // that frames and decodes and prints as words. Without
+                        // this the only thing that ever stopped it was the next
+                        // acquisition failing to confirm the station, three
+                        // scans and a dozen seconds later, and every one of
+                        // those seconds reached the screen.
                         .into_iter()
+                        .filter(|c| c.carrier >= psk::modem::CARRIER_THRESHOLD as f32)
                         .map(|c| streamed(mode, hz, q, c, rate)),
                 );
                 s.fed_to = end;

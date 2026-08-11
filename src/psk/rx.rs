@@ -66,12 +66,37 @@ const TIMING_KI: f64 = 0.0008;
 /// to be quiet, short enough to follow a drifting transmitter.
 const PHASE_TC: f64 = 48.0;
 
+/// Smoothing on the *magnitude* of the same quantity, which says whether the
+/// carrier is still there.
+///
+/// A separate constant from [`PHASE_TC`] over the identical measurement, and
+/// the reason is that the two want opposite things. The phase estimate wants a
+/// long average because it is tracking something that barely moves and every
+/// symbol of averaging makes it quieter. The carrier test wants a short one
+/// because it is watching for something to stop, and every symbol of averaging
+/// is a symbol of noise printed after it did.
+///
+/// Measured — see section G of `examples/psk_gate.rs`.
+const CARRIER_TC: f64 = 12.0;
+
 /// One character, and where in the input its last symbol fell.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Char {
     /// Sample offset into the audio stream, counted from the receiver's first.
     pub offset: usize,
     pub ch: char,
+    /// How strongly the carrier looked like PSK at the moment this character
+    /// completed — [`Rx::carrier`], read there rather than at the end of
+    /// whatever buffer the caller happened to hand over.
+    ///
+    /// **A caller that prints these must test it.** Past the end of a
+    /// transmission there is nothing on this carrier but noise, and noise read
+    /// as differential BPSK is a stream of perfectly good varicode: it frames,
+    /// it decodes, and it prints as words. The receiver goes on demodulating
+    /// because that is its job and because a station that pauses mid-over comes
+    /// back on the same clock; deciding that the over has *ended* is the
+    /// caller's, and [`super::modem::CARRIER_THRESHOLD`] is where.
+    pub carrier: f32,
 }
 
 /// A receiver locked to one carrier.
@@ -97,6 +122,10 @@ pub struct Rx {
     /// Running mean of the unit phasor of `d²`; its half-angle is the residual
     /// carrier rotation. The same quantity `modem::concentration` reports.
     rot: Complex32,
+    /// The same mean again over a shorter window — see [`CARRIER_TC`]. Its
+    /// magnitude is the concentration statistic, which is what says the station
+    /// is still transmitting.
+    carrier: Complex32,
     symbols: usize,
     bits: varicode::Stream,
     /// Input samples consumed, for stamping characters.
@@ -134,6 +163,13 @@ impl Rx {
             prev_sym: None,
             acquiring: Some(Vec::with_capacity((ACQUIRE_SYMBOLS + 2) * SPS)),
             rot: Complex32::new(1.0, 0.0),
+            // Starts asserting the carrier is there, rather than having to be
+            // convinced over the first dozen symbols. A receiver is only opened
+            // where the gate has already vouched for a station, so "present" is
+            // the true answer at symbol zero — and being wrong the other way
+            // would eat the opening characters of every transmission, which is
+            // the trap this whole area keeps setting.
+            carrier: Complex32::new(1.0, 0.0),
             symbols: 0,
             bits: varicode::Stream::new(),
             consumed: at,
@@ -158,6 +194,18 @@ impl Rx {
     /// Symbols detected since the receiver opened.
     pub fn symbols(&self) -> usize {
         self.symbols
+    }
+
+    /// How strongly this carrier still looks like PSK, from 0 to 1.
+    ///
+    /// The concentration statistic of `modem::concentration`, kept running over
+    /// [`CARRIER_TC`] symbols instead of measured over a block. Near 1 while a
+    /// station is transmitting and near 0 on noise, so it is what says an over
+    /// has ended — some seconds before the next acquisition could, which is the
+    /// whole reason it is here. Each [`Char`] carries its own reading, taken
+    /// when it completed; this is the receiver's current one.
+    pub fn carrier(&self) -> f64 {
+        self.carrier.norm() as f64
     }
 
     /// Feed contiguous audio; get back whatever characters completed inside it.
@@ -262,12 +310,23 @@ impl Rx {
                 let u = (d * d) / m; // unit phasor of d², data folded away
                 let a = (1.0 / PHASE_TC) as f32;
                 self.rot = self.rot * (1.0 - a) + u * a;
+                let b = (1.0 / CARRIER_TC) as f32;
+                self.carrier = self.carrier * (1.0 - b) + u * b;
             }
             self.symbols += 1;
             let theta = self.rot.arg() / 2.0;
             let bit = u8::from((d * Complex32::from_polar(1.0, -theta)).re > 0.0);
+            // Every character is reported, with the carrier reading taken here
+            // rather than at the end of the caller's buffer — a sound card
+            // hands over a few symbols at a time and the statistic moves within
+            // one. What to do with a character whose carrier has collapsed is
+            // the caller's; see [`Char::carrier`].
             if let Some(got) = self.bits.push(bit) {
-                out.push(Char { offset: self.last_sym_offset, ch: got.ch });
+                out.push(Char {
+                    offset: self.last_sym_offset,
+                    ch: got.ch,
+                    carrier: self.carrier.norm(),
+                });
             }
         }
         self.prev_sym = Some(now);
@@ -559,6 +618,71 @@ mod tests {
                 audio.chunks(chunk).flat_map(|b| rx.feed(b)).collect();
             assert_eq!(got, want, "chunk size {chunk} changed the result");
         }
+    }
+
+    /// The carrier reading separates the text from the noise after it.
+    ///
+    /// A receiver does not stop at the end of an over — it cannot, since a
+    /// station that pauses mid-over has to keep its symbol clock — so it goes
+    /// on turning noise into varicode, and varicode from noise frames and
+    /// decodes and prints as words. Before there was a reading to test, that
+    /// reached the screen until the next acquisition gave up on the station,
+    /// three scans and a dozen seconds later.
+    ///
+    /// What is pinned here is only that the statistic *separates*: every
+    /// character of the message is well above the threshold and everything
+    /// after the carrier stops is below it. Where exactly the threshold sits
+    /// between them is `examples/psk_gate.rs`'s to say, not this test's.
+    #[test]
+    fn the_carrier_reading_tells_the_message_from_the_noise_after_it() {
+        let text = "cq de w1aw  test test test  ";
+        let (mut audio, at) = band(text, 1500.0, PSK31, 1.0, 0.5);
+        // `band` leaves a second of noise at the end; give it eight, which is
+        // long enough for the old behaviour to fill a line.
+        let ends_at = audio.len() - SAMPLE_RATE as usize;
+        let mut seed = 0xDEADu64;
+        audio.extend((0..7 * SAMPLE_RATE as usize).map(|_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 40) as f32 / (1u32 << 24) as f32 - 0.5) * 0.02
+        }));
+
+        let mut rx = on_signal(1500.0, PSK31, at);
+        let got = rx.feed(&audio[at..]);
+        let t = crate::psk::modem::CARRIER_THRESHOLD as f32;
+
+        // The reading is a mean over [`CARRIER_TC`] symbols, so for that long
+        // after the last real symbol it is legitimately mid-fall: a character
+        // completing there was mostly modulated by signal and reads high, and
+        // counting it as noise would be asking the statistic to see backwards.
+        // That window is the irreducible tail — bounded, and the thing being
+        // bounded is the whole point.
+        let settle = (CARRIER_TC as usize + 1) * PSK31.symbol_samples();
+        let during: Vec<Char> = got.iter().copied().filter(|c| c.offset <= ends_at).collect();
+        let after: Vec<Char> =
+            got.iter().copied().filter(|c| c.offset > ends_at + settle).collect();
+        assert!(during.len() > 10, "decoded almost nothing: {during:?}");
+        assert!(!after.is_empty(), "no noise decoded at all — the tail proves nothing");
+
+        let weakest_text = during.iter().map(|c| c.carrier).fold(f32::MAX, f32::min);
+        let strongest_noise = after.iter().map(|c| c.carrier).fold(0.0, f32::max);
+        assert!(
+            weakest_text > strongest_noise,
+            "text down to {weakest_text:.3} and noise up to {strongest_noise:.3} — \
+             the reading does not separate them"
+        );
+        assert!(
+            (strongest_noise..weakest_text).contains(&t),
+            "threshold {t:.3} is outside the gap {strongest_noise:.3}..{weakest_text:.3}"
+        );
+
+        // And what an operator would actually see: the whole tail, settling
+        // window included, has to come to almost nothing. Before the reading
+        // existed this was every character the noise framed — some dozens.
+        let printed = got
+            .iter()
+            .filter(|c| c.offset > ends_at && c.carrier >= t)
+            .count();
+        assert!(printed <= 3, "{printed} characters of noise would still be printed");
     }
 }
 

@@ -12,12 +12,13 @@
 //!   D  discrimination — what the *other* modes in the band score
 //!   E  framing — stage three, on real text against everything else
 //!   F  cost — what a screening pass over the band actually costs
+//!   G  carrier loss — where a running receiver stops printing
 //!
 //! Run with `cargo run --release --example psk_gate`, optionally naming modes:
 //! `cargo run --release --example psk_gate -- psk31 psk63`.
 
 use ragchew::olivia;
-use ragchew::psk::modem::Block;
+use ragchew::psk::modem::{self, Block};
 use ragchew::psk::{self, Mode, PSK31, PSK63};
 use ragchew::{js8, SAMPLE_RATE};
 
@@ -326,4 +327,180 @@ fn run(mode: Mode) {
         t0.elapsed().as_secs_f64() * 1000.0 / reps as f64,
         t0.elapsed().as_secs_f64() * 1000.0 / reps as f64 / mode.block_secs(),
     );
+
+    carrier_loss(mode);
 }
+
+/// G: where a running receiver decides the station has stopped.
+///
+/// Stages one to three are about *finding* a station. This is about noticing
+/// that one already found has gone, which nothing above measures and which the
+/// receiver used to leave entirely to the next acquisition — three scans and a
+/// dozen seconds later, printing noise as varicode the whole way.
+///
+/// The statistic is [`Rx::carrier`], the same concentration stage two uses but
+/// kept running over `CARRIER_TC` symbols rather than measured over a block.
+/// What has to be established is that the distribution during text and the
+/// distribution on the noise after it are separable at all, and where between
+/// them a threshold costs the fewest characters both ways.
+fn carrier_loss(mode: Mode) {
+    println!("\n== G. carrier loss: where a receiver stops printing ==");
+
+    // A transmission with a known end, and noise-only audio after it. The lead
+    // matters for the same reason it does everywhere else here: a receiver
+    // placed on a band with no noise floor has nothing to be a ratio against.
+    let text = "cq cq de w1aw w1aw k the quick brown fox jumps over the lazy dog ";
+    let tail_s = 8.0;
+
+    // The percentiles say the two are separable; the extremes are what sets a
+    // threshold, since one excursion is one printed character.
+    println!("   {:>5}  {:>26}  {:>26}", "SNR", "carrier during text", "carrier after it");
+    println!("   {:>5}  {:>26}  {:>26}", "dB", "min     p01  median", "median     p99     max");
+
+    let mut during_all: Vec<f64> = Vec::new();
+    let mut after_all: Vec<f64> = Vec::new();
+    let mut per_snr: Vec<(f32, Vec<f64>)> = Vec::new();
+
+    // Down to where section B says the gate still finds a station at all.
+    // Weak text is where a threshold starts eating characters, so testing only
+    // strong signals would calibrate this on the easy half of the problem.
+    for snr in [-9.0f32, -6.0, -3.0, 0.0, 3.0, 6.0, 10.0, 20.0] {
+        let sig = psk::encode(text, 1500.0, mode);
+        let amp = scale_for_snr(&sig, snr);
+        let lead = mode.block_samples();
+        let tail = (tail_s * SAMPLE_RATE as f64) as usize;
+        let mut audio = noise(lead + sig.len() + tail, 0x6EED ^ (snr as u64));
+        for (i, s) in sig.iter().enumerate() {
+            audio[lead + i] += s * amp;
+        }
+        let ends_at = lead + sig.len();
+
+        // Opened where the app opens one: on the signal, not on the noise in
+        // front of it.
+        let mut rx = psk::rx::Rx::new(1500.0, mode, lead);
+        let mut during = Vec::new();
+        let mut after = Vec::new();
+        // One symbol at a time, so every reading is attributable to a place in
+        // the audio rather than to the end of a sound-card buffer.
+        let step = mode.symbol_samples();
+        let mut at = lead;
+        while at + step <= audio.len() {
+            rx.feed(&audio[at..at + step]);
+            at += step;
+            // Only once the clock is placed is the statistic meaningful.
+            if rx.symbols() < 4 {
+                continue;
+            }
+            // A window either side of the end is skipped: the statistic is a
+            // running mean and is legitimately mid-fall there, so counting it
+            // as either would flatter or libel whichever side it landed on.
+            let settle = (CARRIER_TC_GUESS * step as f64) as usize;
+            if at + settle < ends_at {
+                during.push(rx.carrier());
+            } else if at > ends_at + settle {
+                after.push(rx.carrier());
+            }
+        }
+
+        let d = sorted(during.clone());
+        let a = sorted(after.clone());
+        println!(
+            "   {:>5.0}  {:>8.3}{:>8.3}{:>8.3}  {:>8.3}{:>8.3}{:>8.3}",
+            snr,
+            d[0],
+            pct(&d, 0.01),
+            pct(&d, 0.50),
+            pct(&a, 0.50),
+            pct(&a, 0.99),
+            a[a.len() - 1],
+        );
+        during_all.extend(during.clone());
+        after_all.extend(after);
+        per_snr.push((snr, during));
+    }
+
+    // What a threshold costs, in characters, broken out by SNR rather than
+    // pooled. Pooling weights each SNR by however many readings it happened to
+    // contribute, which is an artifact of this harness and not of the band —
+    // and it hides the only row that decides anything, which is the weakest
+    // signal the gate would have opened a receiver on at all. Section B says
+    // where that is: about -8 dB for PSK31 and -6 for PSK63. Rows below a
+    // mode's own floor are signals it would never have been reading.
+    const TRIED: [f64; 8] = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.80];
+    println!("\n   text suppressed (%), by SNR and threshold:");
+    print!("   {:>5}", "SNR");
+    for t in TRIED {
+        print!("{t:>8.2}");
+    }
+    println!();
+    for (snr, during) in &per_snr {
+        print!("   {snr:>5.0}");
+        let d = sorted(during.clone());
+        for t in TRIED {
+            let lost = d.iter().filter(|&&x| x < t).count() as f64 / d.len() as f64;
+            print!("{:>8.2}", lost * 100.0);
+        }
+        println!();
+    }
+    let a = sorted(after_all);
+    print!("   {:>5}", "noise");
+    for t in TRIED {
+        let kept = a.iter().filter(|&&x| x >= t).count() as f64 / a.len() as f64;
+        print!("{:>8.2}", kept * 100.0);
+    }
+    println!("   <- printed after the station stopped");
+    let d = sorted(during_all);
+    println!(
+        "\n   worst text reading {:.3}, worst noise reading {:.3}. Stage two's own\n   \
+         {:.3} is far below the noise floor of a {:.0}-symbol mean and cannot be\n   \
+         reused.",
+        d[0],
+        a[a.len() - 1],
+        modem::CONC_THRESHOLD,
+        CARRIER_TC_GUESS,
+    );
+
+    // And the number the whole thing is for: what an operator sees printed
+    // after the station has stopped. The gate is in the shipping receiver, so
+    // this is measured by running it and counting; "ungated" is the same audio
+    // with the characters counted regardless of the statistic, which is what
+    // the receiver did before it had one.
+    println!("\n   characters printed after the station stopped, over {tail_s:.0} s of noise:");
+    println!("   {:>5}  {:>10}  {:>10}", "SNR", "ungated", "gated");
+    for snr in [-6.0f32, 0.0, 10.0] {
+        let sig = psk::encode(text, 1500.0, mode);
+        let amp = scale_for_snr(&sig, snr);
+        let lead = mode.block_samples();
+        let tail = (tail_s * SAMPLE_RATE as f64) as usize;
+        let mut audio = noise(lead + sig.len() + tail, 0x51DE ^ (snr as u64));
+        for (i, s) in sig.iter().enumerate() {
+            audio[lead + i] += s * amp;
+        }
+        let ends_at = lead + sig.len();
+
+        // Every character the receiver completes is reported, each carrying the
+        // carrier reading from the instant it completed, so both counts come
+        // off one pass: what a caller prints with the test, and what it printed
+        // before there was one.
+        let mut rx = psk::rx::Rx::new(1500.0, mode, lead);
+        let (mut gated, mut ungated) = (0usize, 0usize);
+        let step = mode.symbol_samples();
+        let mut at = lead;
+        while at + step <= audio.len() {
+            for c in rx.feed(&audio[at..at + step]) {
+                if c.offset > ends_at {
+                    ungated += 1;
+                    if c.carrier >= modem::CARRIER_THRESHOLD as f32 {
+                        gated += 1;
+                    }
+                }
+            }
+            at += step;
+        }
+        println!("   {snr:>5.0}  {ungated:>10}  {gated:>10}");
+    }
+}
+
+/// `rx::CARRIER_TC`, which is private. Only used here to size the settling
+/// window and to label the output; if it changes there, change it here.
+const CARRIER_TC_GUESS: f64 = 12.0;
