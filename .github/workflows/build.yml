@@ -1,0 +1,155 @@
+# Keep the three platforms compiling, and the feature combinations with them.
+#
+# This exists because two thirds of the platform code has never been run. The
+# Windows and macOS serial backends and the whole Yaesu driver are verified by
+# a compiler and a test bench and nothing else, and until now that compiler was
+# invoked by hand on a Linux desktop whenever somebody remembered. A matrix
+# turns "I cross-checked it" into something that happens on every push.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # So a run can be started against a branch without pushing to it.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace costs nothing until something panics, and when something does
+  # panic on a machine nobody can log into it is the whole of the evidence.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every platform reports, rather than the first failure hiding the other
+      # two. That matters most on the first green run of a platform that has
+      # never executed a line of this code.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # What the windowing and audio stacks want from a bare Ubuntu. `alsa` is
+      # cpal's, `gtk-3` is rfd's default file-dialog backend, and the xcb and
+      # xkbcommon pieces are winit's. macOS and Windows carry their equivalents
+      # in the SDK and need nothing here.
+      - name: system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev \
+            libgtk-3-dev \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libwayland-dev
+
+      # The runners ship a stable toolchain, so there is no toolchain action
+      # here and nothing third-party in this file at all: `checkout` and
+      # `cache` are GitHub's own. A CI file is a thing that runs with a token,
+      # and the fewer authors it has the better.
+      - name: toolchain
+        run: rustc --version && cargo --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.os }}-cargo-
+
+      - name: build
+        run: cargo build --workspace --all-targets
+
+      # Every test in this repo is headless — the interactive app is never
+      # started, and what looks like audio-device enumeration in the tests is a
+      # captured listing rather than a live one. Checked by running the suite
+      # with DISPLAY and WAYLAND_DISPLAY unset before this file was written.
+      - name: test
+        run: cargo test --workspace
+
+  features:
+    name: feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev \
+            libgtk-3-dev \
+            libxkbcommon-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libwayland-dev
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: features-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: features-cargo-
+
+      # One rig per feature means combinations that no single build covers, and
+      # they break quietly: a `cfg` arm that only exists when a radio is
+      # compiled in is invisible until somebody compiles without it. Only Linux
+      # runs these, because the feature gates are about which radio, not which
+      # operating system — the platform question is the matrix above, and the
+      # default build there already carries both rigs and the serial layer.
+      #
+      # `--tests` rather than `--all-targets`: `examples/pw_probe.rs` uses the
+      # desktop-only pipewire module without a feature gate of its own, so it
+      # cannot build without default features on any platform. Pre-existing,
+      # and not this file's to fix.
+      - name: check every combination
+        run: |
+          set -eux
+          for features in \
+            "" \
+            "desktop" \
+            "elecraft" \
+            "yaesu" \
+            "desktop,elecraft" \
+            "desktop,yaesu" \
+            "desktop,elecraft,yaesu"
+          do
+            cargo check -p ragchew-gui --no-default-features \
+              ${features:+--features "$features"} --tests
+          done
+
+      # The rig features off entirely has to still pass its tests, not merely
+      # compile: a build with no radio must read a settings file that names one
+      # and decline to key anything, and that is a test rather than a type.
+      - name: test without the radios
+        run: cargo test -p ragchew-gui --no-default-features --features desktop
+
+# Deliberately absent, both of them, so that nobody adds them back as an
+# oversight-looking gap:
+#
+# `cargo fmt --check`. This repository is not rustfmt-clean and is not meant to
+# be — the wrapping is by hand, chosen line by line, and a formatter would
+# reflow every comment in it. Running one here would be a large and unwanted
+# diff, not a tidy-up.
+#
+# `cargo clippy -D warnings`. The DSP crate carries eighteen pre-existing lints
+# (manual memcpy and index loops in `src/js8/ldpc.rs`, which is transcribed from
+# a reference implementation and reads better matching it). Gating on clippy
+# would mean either failing every build or rewriting that code to suit a linter,
+# and neither is worth it. Clippy is worth running by hand on new code.
