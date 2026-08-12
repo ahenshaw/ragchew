@@ -11,6 +11,7 @@
 //! `--release`.
 
 use ragchew::protocol::{self, Protocol};
+use ragchew::SAMPLE_RATE;
 use ragchew_gui::channels::ChannelSet;
 use ragchew_gui::demo;
 
@@ -166,6 +167,31 @@ fn the_weak_psk_station_copies_at_the_level_it_claims() {
             .filter(|r| (r.hz - st.hz).abs() < 20.0)
             .map(|r| r.text.clone())
             .collect();
+        // Nothing after the station stops, checked before the equality below
+        // because it is the same failure said usefully. This band is well
+        // shaped to catch it: the over ends around 47 seconds and the band runs
+        // for sixty, so a receiver that goes on reading has thirteen seconds of
+        // bare noise to read — and noise demodulated as differential BPSK
+        // frames and decodes and prints as words. The equality would fail on
+        // that too, but only by saying two long strings differ.
+        let sig = psk::encode(&want, st.hz, st.mode);
+        let ends_at = st.start_s + sig.len() as f64 / SAMPLE_RATE as f64;
+        let after: String = res
+            .iter()
+            .filter(|r| (r.hz - st.hz).abs() < 20.0)
+            // A symbol's slack and no more. The garbage this catches begins
+            // within a second of the last real character — it is the tail of
+            // the block that straddles the end of the over — so a generous
+            // margin here is an assertion that cannot fail.
+            .filter(|r| r.offset as f64 / SAMPLE_RATE as f64 > ends_at + 0.1)
+            .map(|r| r.text.clone())
+            .collect();
+        assert!(
+            after.is_empty(),
+            "kept printing for {:.0} s after the station stopped at {ends_at:.1} s: {after:?}",
+            60.0 - ends_at,
+        );
+
         if st.full_copy {
             assert_eq!(got, want, "PSK31 at {} Hz, {} dB should copy in full", st.hz, st.snr_db);
         } else {
@@ -196,6 +222,7 @@ fn the_weak_psk_station_copies_at_the_level_it_claims() {
         let phantoms: Vec<f64> =
             res.iter().filter(|r| (r.hz - st.hz).abs() >= 20.0).map(|r| r.hz).collect();
         assert!(phantoms.is_empty(), "invented PSK stations at {phantoms:?}");
+
     }
 }
 
