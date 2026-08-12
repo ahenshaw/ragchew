@@ -31,6 +31,7 @@ thresholds were measured on.
 ```
 cargo run -p ragchew-gui --release -- --demo          # synthetic three-protocol band
 cargo run -p ragchew-gui --release -- --weak          # Olivia under the noise floor
+cargo run -p ragchew-gui --release -- --crowded       # Olivia stacked on top of itself
 cargo run -p ragchew-gui --release -- --live          # decode the default audio input
 cargo run -p ragchew-gui --release -- recording.wav   # decode a recording
 cargo run -p ragchew-gui --release                    # the same, live: it is the default
@@ -83,6 +84,38 @@ text has already begun to come apart, with nothing underneath to put it back
 together. Every one of those numbers was measured against this band rather than
 chosen — −5 dB loses a character, −6 starts swallowing the spaces — and the
 tests hold them to it.
+
+`--crowded` is the same argument from the other end. Where `--weak` asks how far
+*under* the noise a signal can be, this asks how many can be in the same place —
+which is the more ordinary situation on a real band. Five Olivia modes, all
+comfortably above the noise and plainly visible on the waterfall, all read in
+full:
+
+```
+ 400 |=========== 32/1000 @900 ===========|
+ 450   |==== 16/500 @700 ====|
+1275              |= 8/250 @1400 =|
+1400              |========== 16/1000 @1900 ==========|
+1650                   |===== 8/500 @1900 =====|
+```
+
+Two kilohertz-wide stations meeting at 1400 Hz, one narrower station buried
+completely inside each, and an 8/250 sitting across the seam — inside *both*.
+Nothing here is hard to hear; it is hard to separate. What separates it is the
+same 64-chip Walsh coding the weak band spends on going deep: an interfering
+station's energy lands across the whole correlation window instead of in the one
+place the correlator is looking, so the neighbours largely fail to register
+rather than adding their errors together.
+
+Olivia 4/125 is the one mode absent from it, and for an honest reason. Its four
+tones fall on the same 31.25 Hz grid as a 16/500's sixteen, so a 16/500
+demodulator centred nearby reads the same station through four of its own tones
+and prints a second, garbled copy. The Olivia scan does not arbitrate between
+modes on purpose — real bands stack signals, and a scanner that assumes one
+signal per slice of spectrum drops the quieter of every such pair — so what
+normally prevents double-reporting is the correlation threshold, which covers a
+narrow mode locking onto a slice of a wide one but not this, its reverse. 4/125
+stays in `--weak`, where at −12 dB it is not strong enough to fake a wider mode.
 
 The toolbar is one line: **☰** holds the display settings, the audio input and
 output, *Reset view* and *Quit*; **Source** opens a recording or switches what

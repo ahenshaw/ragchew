@@ -92,6 +92,65 @@ pub fn psk_text(call: &str, repeats: usize) -> String {
     call.repeat(repeats)
 }
 
+/// One of the synthetic bands, as the command line and the Source menu offer it.
+///
+/// An enum rather than the pair of booleans this used to be, because there are
+/// three of them now and "which band" is one question with one answer. The menu
+/// is built by walking [`Band::ALL`], so a fourth is a variant and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Band {
+    /// Three protocols at once, twelve stations. What the app is *for*.
+    Demo,
+    /// Olivia below the noise floor, plus the one station with no FEC.
+    Weak,
+    /// Olivia on top of itself, five modes, all read.
+    Crowded,
+}
+
+impl Band {
+    /// In the order the menu offers them: the mixed band first, being the one
+    /// that shows what the app does, then the two that each make one point.
+    pub const ALL: [Band; 3] = [Band::Demo, Band::Weak, Band::Crowded];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Band::Demo => "Demo band",
+            Band::Weak => "Weak-signal band",
+            Band::Crowded => "Crowded band",
+        }
+    }
+
+    pub fn hover(self) -> &'static str {
+        match self {
+            Band::Demo => "twelve stations, all three protocols, one of them deliberately \
+                           sharing a frequency with another",
+            Band::Weak => "five Olivia stations below the noise floor — invisible on the \
+                           waterfall and read anyway — and a PSK31 station four decibels \
+                           down, which is as deep as a mode with no error correction goes",
+            Band::Crowded => "five Olivia modes stacked on each other: two kilohertz-wide \
+                              stations meeting in the middle, one buried inside each, and \
+                              one across the seam. Every character of all five is recovered",
+        }
+    }
+
+    /// What the status bar calls it once it is loaded.
+    pub fn source_name(self) -> &'static str {
+        match self {
+            Band::Demo => "demo band",
+            Band::Weak => "weak-signal demo",
+            Band::Crowded => "crowded demo",
+        }
+    }
+
+    pub fn synth(self) -> Vec<f32> {
+        match self {
+            Band::Demo => synth(),
+            Band::Weak => synth_weak(),
+            Band::Crowded => synth_crowded(),
+        }
+    }
+}
+
 /// Bandwidth (Hz) the SNR figures below are quoted in — the convention amateur
 /// weak-signal work uses, so the numbers mean what a ham expects them to.
 const SNR_REF_BW: f32 = 2500.0;
@@ -100,8 +159,13 @@ const SNR_REF_BW: f32 = 2500.0;
 /// against.
 const NOISE_RMS: f32 = 0.08;
 
-/// One station in the weak-signal band.
-pub struct WeakStation {
+/// One Olivia station in a synthetic band, at a stated level against the noise.
+///
+/// Shared by [`WEAK_STATIONS`] and [`CROWDED_STATIONS`], which demonstrate
+/// opposite things with the same parts: how far *under* the noise a signal can
+/// be and still be read, and how many signals can sit on top of each other and
+/// still be read.
+pub struct OliviaStation {
     pub hz: f64,
     pub mode: Olivia,
     pub start_s: f64,
@@ -129,22 +193,22 @@ pub struct WeakStation {
 /// spreads a character over the same 64 chips, so the slower ones spend more
 /// energy on each and hear further. Hence 4/125 copying at -12 dB while 8/500,
 /// three times faster, is already in pieces at -15.
-pub const WEAK_STATIONS: &[WeakStation] = &[
+pub const WEAK_STATIONS: &[OliviaStation] = &[
     // A wide, slow host with a narrow station inside its 1 kHz.
-    WeakStation {
+    OliviaStation {
         hz: 900.0, mode: olivia::OL_32_1000, start_s: 0.4, snr_db: -9.0, full_copy: true,
         text: "DE W1WIDE 32/1000 -9 DB ",
     },
-    WeakStation {
+    OliviaStation {
         hz: 700.0, mode: olivia::OL_8_250, start_s: 1.1, snr_db: -9.0, full_copy: true,
         text: "DE K2IN 8/250 -9 DB INSIDE THE WIDE ONE ",
     },
     // And again, deeper: the narrowest mode inside a 500 Hz one.
-    WeakStation {
+    OliviaStation {
         hz: 1750.0, mode: olivia::OL_16_500, start_s: 1.8, snr_db: -12.0, full_copy: true,
         text: "DE W4HOST 16/500 -12 DB ",
     },
-    WeakStation {
+    OliviaStation {
         hz: 1700.0, mode: olivia::OL_4_125, start_s: 2.5, snr_db: -12.0, full_copy: true,
         text: "DE N3NARO 4/125 -12 DB INSIDE TOO ",
     },
@@ -152,9 +216,78 @@ pub const WEAK_STATIONS: &[WeakStation] = &[
     // times their character rate — which is all it takes. The FEC does not
     // degrade gently: a mode copies or it does not, and the window where it
     // merely stumbles is about a decibel wide.
-    WeakStation {
+    OliviaStation {
         hz: 2350.0, mode: olivia::OL_8_500, start_s: 3.2, snr_db: -12.5, full_copy: false,
         text: "DE W6GONE 8/500 -12.5 DB SAME LEVEL BUT TOO FAST ",
+    },
+];
+
+/// The crowded band: five Olivia modes stacked on top of each other, every one
+/// of them read in full.
+///
+/// The weak band asks how far *under* the noise a signal can be. This one asks
+/// how many can be in the same place at once, which is the other half of what
+/// the mode is for and the more ordinary situation on a real band. Every
+/// station here is comfortably above the noise and plainly visible on the
+/// waterfall — the difficulty is entirely that they are on top of each other:
+///
+/// ```text
+///  400 |=========== 32/1000 @900 ===========|
+///  450   |==== 16/500 @700 ====|
+/// 1275              |= 8/250 @1400 =|
+/// 1400              |========== 16/1000 @1900 ==========|
+/// 1650                   |===== 8/500 @1900 =====|
+/// ```
+///
+/// Two wide stations meeting at 1400 Hz, each with a narrower one buried
+/// completely inside it, and an 8/250 straddling the seam where the two wide
+/// ones meet — so it is inside *both*. Five stations, three overlapping pairs,
+/// nothing hidden behind anything, and every character of all five recovered.
+///
+/// **What makes that possible** is that Olivia spreads a character over 64 chips
+/// of a Walsh function. Two signals sharing a patch of spectrum are not adding
+/// their errors together so much as failing to correlate with each other: the
+/// interferer's energy lands across the whole 64-chip window rather than in the
+/// one place the correlator is looking. It is the same coding gain the weak band
+/// spends on going deep, spent here on ignoring the neighbours.
+///
+/// All at one level, which is the condition to keep. A station 10 dB above its
+/// neighbour buries it, and a band showing that would be a demonstration of
+/// physics rather than of decoding — the weak band's note on the same point
+/// applies here twice over, because there is nothing else making it hard.
+///
+/// Olivia 4/125 is deliberately absent, and it is the one mode that could not
+/// join. Its four tones sit on the same 31.25 Hz grid as a 16/500's sixteen, so
+/// a 16/500 demodulator centred nearby reads the same station through four of
+/// its own tones and prints a second, garbled copy. `olivia::decode_all` does
+/// not arbitrate between modes on purpose — the correlation threshold is what
+/// stops one signal being reported twice, and it covers a narrow mode locking
+/// onto a slice of a wide one. This is the reverse, and it is not caught. The
+/// 4/125 stays in the weak band, where at −12 dB it is not strong enough to
+/// fake a wider mode.
+pub const CROWDED_STATIONS: &[OliviaStation] = &[
+    // The two wide ones, meeting at 1400 Hz.
+    OliviaStation {
+        hz: 900.0, mode: olivia::OL_32_1000, start_s: 0.3, snr_db: 6.0, full_copy: true,
+        text: "DE W1BIG 32/1000 A KILOHERTZ WIDE AND FULL OF OTHER PEOPLE ",
+    },
+    OliviaStation {
+        hz: 1900.0, mode: olivia::OL_16_1000, start_s: 0.9, snr_db: 6.0, full_copy: true,
+        text: "DE K2WIDE 16/1000 THE OTHER KILOHERTZ AND JUST AS BUSY ",
+    },
+    // One buried inside each of them.
+    OliviaStation {
+        hz: 700.0, mode: olivia::OL_16_500, start_s: 1.5, snr_db: 6.0, full_copy: true,
+        text: "DE W3MID 16/500 ENTIRELY INSIDE W1BIG AND READ ANYWAY ",
+    },
+    OliviaStation {
+        hz: 1900.0, mode: olivia::OL_8_500, start_s: 2.1, snr_db: 6.0, full_copy: true,
+        text: "DE N4FAST 8/500 DEAD CENTRE OF K2WIDE AT TWICE THE BAUD ",
+    },
+    // And one across the seam, inside both.
+    OliviaStation {
+        hz: 1400.0, mode: olivia::OL_8_250, start_s: 2.7, snr_db: 6.0, full_copy: true,
+        text: "DE W5EDGE 8/250 ON THE SEAM BETWEEN THE TWO WIDE ONES ",
     },
 ];
 
@@ -276,6 +409,33 @@ pub fn synth_weak() -> Vec<f32> {
     // than the Olivia stations for exactly that reason. See [`WeakPsk`].
     for st in WEAK_PSK_STATIONS {
         let sig = psk::encode(&psk_text(st.call, st.repeats), st.hz, st.mode);
+        let amp = scale_for_snr(&sig, st.snr_db);
+        let start = (st.start_s * rate as f64) as usize;
+        for (i, s) in sig.iter().enumerate() {
+            if start + i < total {
+                buf[start + i] += *s * amp;
+            }
+        }
+    }
+    buf
+}
+
+/// Synthesize the crowded band: five Olivia modes stacked on each other, all
+/// of them above the noise and all of them read in full.
+///
+/// The counterpart to [`synth_weak`], and built from the same parts to make the
+/// contrast: there the stations are invisible and readable, here they are
+/// plainly visible and on top of one another. See [`CROWDED_STATIONS`].
+pub fn synth_crowded() -> Vec<f32> {
+    let rate = SAMPLE_RATE as usize;
+    let total = 60 * rate;
+    // A different seed from the weak band's, so the two are not the same noise
+    // with different signals in it — a coincidence in one would otherwise be a
+    // coincidence in both, and the two bands are each other's control.
+    let mut buf = noise(total, NOISE_RMS, 0x0C_120D_5EED_9A31);
+
+    for st in CROWDED_STATIONS {
+        let sig = olivia::encode(st.text, st.hz, st.mode);
         let amp = scale_for_snr(&sig, st.snr_db);
         let start = (st.start_s * rate as f64) as usize;
         for (i, s) in sig.iter().enumerate() {

@@ -28,6 +28,7 @@ use ragchew::protocol::{self, ModeId, Protocol};
 use ragchew::spectrogram::WINDOW;
 use ragchew::{wav, Spectrogram, SAMPLE_RATE};
 
+use crate::demo::Band;
 use crate::channels::{Channel, ChannelSet};
 use crate::diag::{self, Health};
 use crate::layout;
@@ -587,16 +588,20 @@ struct Args {
     /// Decode live from an audio input device. This is what happens with no
     /// arguments at all, so the flag is only worth typing for the sake of
     /// saying so.
-    #[arg(long, conflicts_with_all = ["file", "demo", "weak"])]
+    #[arg(long, conflicts_with_all = ["file", "demo", "weak", "crowded"])]
     live: bool,
 
-    /// Synthetic band carrying both protocols, eleven stations.
-    #[arg(long, conflicts_with_all = ["file", "weak"])]
+    /// Synthetic band carrying all three protocols, twelve stations.
+    #[arg(long, conflicts_with_all = ["file", "weak", "crowded"])]
     demo: bool,
 
     /// Synthetic Olivia band, every station below the noise floor.
-    #[arg(long, alias = "olivia", conflicts_with = "file")]
+    #[arg(long, alias = "olivia", conflicts_with_all = ["file", "crowded"])]
     weak: bool,
+
+    /// Synthetic Olivia band with five modes stacked on top of each other.
+    #[arg(long, conflicts_with = "file")]
+    crowded: bool,
 
     /// Record the live capture to a WAV file alongside the log.
     ///
@@ -739,16 +744,22 @@ pub fn run() -> eframe::Result<()> {
     // A monitor with nothing on the command line should be monitoring: opening
     // deaf and waiting to be told to listen is a worse default than the one
     // thing the program is for. A file, a demo, or an explicit --live still win.
-    let live = args.live || (args.file.is_none() && !args.demo && !args.weak);
+    // Which synthetic band was asked for, if any. The flags conflict with each
+    // other in the parser, so at most one is set.
+    let band = match (args.demo, args.weak, args.crowded) {
+        (true, _, _) => Some(Band::Demo),
+        (_, true, _) => Some(Band::Weak),
+        (_, _, true) => Some(Band::Crowded),
+        _ => None,
+    };
+    let live = args.live || (args.file.is_none() && band.is_none());
 
-    let title = if live {
-        "ragchew — live"
-    } else if args.weak {
-        "ragchew — weak-signal demo"
-    } else if args.demo {
-        "ragchew — demo"
-    } else {
-        "ragchew"
+    let title = match () {
+        _ if live => "ragchew — live".to_string(),
+        _ => match band {
+            Some(b) => format!("ragchew — {}", b.source_name()),
+            None => "ragchew".to_string(),
+        },
     };
 
     let options = eframe::NativeOptions {
@@ -776,7 +787,7 @@ pub fn run() -> eframe::Result<()> {
     // Build the app inside the creator so a non-Send audio stream never crosses
     // a thread boundary.
     eframe::run_native(
-        title,
+        &title,
         options,
         Box::new(move |cc| {
             let mut app = App::base((0.0, 4000.0));
@@ -796,10 +807,8 @@ pub fn run() -> eframe::Result<()> {
             }
             if live {
                 app.go_live();
-            } else if args.weak {
-                app.set_source(crate::demo::synth_weak(), "weak-signal demo");
-            } else if args.demo {
-                app.set_source(crate::demo::synth(), "demo band");
+            } else if let Some(b) = band {
+                app.set_source(b.synth(), b.source_name());
             } else if let Some(path) = &args.file {
                 app.open_file(path);
             }
@@ -4192,7 +4201,7 @@ impl App {
         let mut chosen_output: Option<Option<String>> = None; // Some(None) = default
         let mut modes_changed = false;
         let mut open_file: Option<PathBuf> = None;
-        let mut demo_request: Option<bool> = None; // Some(weak?)
+        let mut demo_request: Option<Band> = None;
         let mut go_live = false;
         let mut record_toggled = false;
         // What is *actually* being recorded, not what was last asked for, so
@@ -4654,13 +4663,11 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Demo band").clicked() {
-                        demo_request = Some(false);
-                        ui.close();
-                    }
-                    if ui.button("Weak-signal band").clicked() {
-                        demo_request = Some(true);
-                        ui.close();
+                    for band in Band::ALL {
+                        if ui.button(band.label()).on_hover_text(band.hover()).clicked() {
+                            demo_request = Some(band);
+                            ui.close();
+                        }
                     }
                     if ui.button("Live input").clicked() {
                         go_live = true;
@@ -4813,9 +4820,8 @@ impl App {
         if let Some(path) = open_file {
             self.open_file(&path);
         }
-        if let Some(weak) = demo_request {
-            let samples = if weak { crate::demo::synth_weak() } else { crate::demo::synth() };
-            self.set_source(samples, if weak { "weak-signal demo" } else { "demo band" });
+        if let Some(band) = demo_request {
+            self.set_source(band.synth(), band.source_name());
         }
         if go_live && self.live.is_none() {
             self.go_live();

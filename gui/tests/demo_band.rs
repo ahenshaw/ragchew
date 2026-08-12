@@ -226,6 +226,93 @@ fn the_weak_psk_station_copies_at_the_level_it_claims() {
     }
 }
 
+/// The crowded band: five Olivia modes on top of each other, every one read in
+/// full, and nothing invented.
+///
+/// The weak band asks how far under the noise a signal can be. This asks how
+/// many can be in the same place, which is the more ordinary situation on a
+/// real band and the other half of what the coding buys. Two things have to
+/// hold at once and they pull against each other: every station copies
+/// *exactly*, and the scan does not report a station nobody transmitted.
+#[test]
+fn the_crowded_band_reads_every_station() {
+    use ragchew::olivia;
+    use ragchew_gui::demo::CROWDED_STATIONS;
+
+    let samples = demo::synth_crowded();
+    let res = olivia::decode_all(&samples, 300.0, 2600.0, &olivia::COMMON);
+
+    for st in CROWDED_STATIONS {
+        let got: String = res
+            .iter()
+            .filter(|r| r.mode == st.mode && (r.hz - st.hz).abs() < st.mode.spacing() * 2.0)
+            .map(|r| r.text())
+            .collect();
+        assert!(st.full_copy, "the crowded band is the one where everything copies");
+        assert_eq!(got, st.text, "{} at {} Hz", st.mode.name(), st.hz);
+    }
+
+    // Nothing invented. This is the assertion that keeps the band honest about
+    // what it is showing: a scan of five stacked signals has every opportunity
+    // to report a sixth that is really two of the others, and a band built to
+    // demonstrate successful decoding would be worth nothing if it did.
+    for r in &res {
+        let real = CROWDED_STATIONS
+            .iter()
+            .any(|st| r.mode == st.mode && (r.hz - st.hz).abs() < st.mode.spacing() * 2.0);
+        assert!(real, "invented a {} at {:.0} Hz: {:?}", r.mode.name(), r.hz, r.text());
+    }
+}
+
+/// The crowded band really is crowded, and really is above the noise — the two
+/// things that make it the weak band's opposite rather than its twin.
+#[test]
+fn the_crowded_band_is_stacked_and_audible() {
+    use ragchew_gui::demo::{CROWDED_STATIONS, WEAK_STATIONS};
+
+    // Above the noise, unlike every station in the weak band. The difficulty
+    // here is the neighbours, not the level, and a reader can see these on the
+    // waterfall — which is the visible contrast between the two bands.
+    for st in CROWDED_STATIONS {
+        assert!(st.snr_db > 0.0, "{} is below the noise floor", st.mode.name());
+    }
+    assert!(WEAK_STATIONS.iter().all(|st| st.snr_db < 0.0), "the weak band stopped being weak");
+
+    // Every station overlaps at least one other, and there are at least three
+    // overlapping pairs — two narrow stations buried in wide ones, and one
+    // across the seam where the wide ones meet.
+    let overlaps = |a: &ragchew_gui::demo::OliviaStation, b: &ragchew_gui::demo::OliviaStation| {
+        (a.hz - b.hz).abs() < (a.mode.bandwidth + b.mode.bandwidth) as f64 / 2.0
+    };
+    let pairs = CROWDED_STATIONS
+        .iter()
+        .enumerate()
+        .flat_map(|(i, a)| CROWDED_STATIONS[i + 1..].iter().map(move |b| (a, b)))
+        .filter(|(a, b)| overlaps(a, b))
+        .count();
+    assert!(pairs >= 3, "only {pairs} overlapping pairs — the band is not crowded");
+
+    for a in CROWDED_STATIONS {
+        let alone = !CROWDED_STATIONS
+            .iter()
+            .any(|b| !std::ptr::eq(a, b) && overlaps(a, b));
+        assert!(!alone, "{} at {} Hz overlaps nothing", a.mode.name(), a.hz);
+    }
+
+    // All at one level. A station well above its neighbour buries it, and the
+    // band would be showing physics rather than decoding.
+    let (lo, hi) = CROWDED_STATIONS
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), st| (lo.min(st.snr_db), hi.max(st.snr_db)));
+    assert!(hi - lo <= 3.0, "levels span {:.1} dB — the loud ones are burying the quiet", hi - lo);
+
+    // Five distinct modes, which is the other half of the point.
+    let mut modes: Vec<String> = CROWDED_STATIONS.iter().map(|st| st.mode.name()).collect();
+    modes.sort();
+    modes.dedup();
+    assert_eq!(modes.len(), CROWDED_STATIONS.len(), "two stations share a mode: {modes:?}");
+}
+
 /// Stations really are stacked on top of each other, and really are under the
 /// noise — the two things the band exists to demonstrate.
 #[test]
