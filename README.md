@@ -50,9 +50,9 @@ on the way in, so a settings file from another build — or one edited by hand �
 cannot reopen the app zoomed into 50 Hz of nothing. Conversations are not saved:
 a log is a record, and writing one is a logging program's job.
 
-`--weak` is the one that shows what Olivia is *for*: five stations across four
-modes, every one of them **below the noise floor**, and several stacked inside
-each other's bandwidth.
+`--weak` is the one that shows what Olivia is *for*: six stations, every one of
+them **below the noise floor**, several stacked inside each other's bandwidth,
+and one of them carrying no error correction at all.
 
 | station | mode | SNR (2.5 kHz) | placement | copy |
 |---------|------|--------------:|-----------|------|
@@ -61,6 +61,7 @@ each other's bandwidth.
 | W4HOST | 16/500  | −12 dB | host | full |
 | N3NARO | 4/125   | −12 dB | inside W4HOST's 500 Hz | full |
 | W6GONE | 8/500   | −12.5 dB | in the clear | **fragments** |
+| N0FEC  | PSK31   |  −4 dB | in the clear | full |
 
 Every one of those puts less power into the band than the noise does, leaves no
 trace an eye can find on the waterfall, and is read anyway — including where two
@@ -73,6 +74,15 @@ over the same 64 chips, so a slower mode spends more energy on each and hears
 further: 4/125 at a leisurely 0.98 char/s copies at −12 dB while 8/500, three
 times faster, is already breaking up. The FEC does not degrade gently either —
 the window between clean copy and nothing at all is about a decibel wide.
+
+The last row makes the opposite point, and is the reason it is there. N0FEC is
+the loudest station in the band by five decibels and the only one with no error
+correction, and those two facts are the same fact. The detector still finds it
+four decibels further down, at about −8; what it finds there is a station whose
+text has already begun to come apart, with nothing underneath to put it back
+together. Every one of those numbers was measured against this band rather than
+chosen — −5 dB loses a character, −6 starts swallowing the spaces — and the
+tests hold them to it.
 
 The toolbar is one line: **☰** holds the display settings, the audio input and
 output, *Reset view* and *Quit*; **Source** opens a recording or switches what

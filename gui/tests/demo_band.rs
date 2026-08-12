@@ -144,6 +144,61 @@ fn weak_signal_demo_copies_what_it_claims() {
     }
 }
 
+/// The weak band's PSK31 station copies in full at the level it claims, and
+/// claims a level well above every Olivia station around it.
+///
+/// That gap is the point of having it there. Olivia spreads each character over
+/// 64 chips and reads perfectly nine to twelve decibels below the noise; PSK31
+/// has no error correction at all and needs four. If a change ever closes that
+/// gap, either the demo has stopped being honest or something has gone very
+/// right, and both are worth stopping for.
+#[test]
+fn the_weak_psk_station_copies_at_the_level_it_claims() {
+    use ragchew::psk;
+    use ragchew_gui::demo::{WEAK_PSK_STATIONS, WEAK_STATIONS};
+
+    let samples = demo::synth_weak();
+    for st in WEAK_PSK_STATIONS {
+        let want = demo::psk_text(st.call, st.repeats);
+        let res = psk::decode_all(&samples, 300.0, 2600.0, &[st.mode]);
+        let got: String = res
+            .iter()
+            .filter(|r| (r.hz - st.hz).abs() < 20.0)
+            .map(|r| r.text.clone())
+            .collect();
+        if st.full_copy {
+            assert_eq!(got, want, "PSK31 at {} Hz, {} dB should copy in full", st.hz, st.snr_db);
+        } else {
+            assert!(!got.is_empty(), "the PSK31 station vanished entirely");
+            assert_ne!(got, want, "it copied in full — recalibrate the demo");
+        }
+
+        // Its own text states its level, as every station's here does.
+        assert!(
+            st.call.contains(&format!("{:.0} db", st.snr_db)),
+            "{:?} does not say it is at {} dB",
+            st.call,
+            st.snr_db
+        );
+
+        // Below the noise floor, like everything else in this band...
+        assert!(st.snr_db < 0.0, "the weak band's PSK station is above the noise");
+        // ...but not nearly as far below, which is the demonstration.
+        let deepest_olivia = WEAK_STATIONS.iter().map(|o| o.snr_db).fold(f32::MAX, f32::min);
+        assert!(
+            st.snr_db > deepest_olivia + 4.0,
+            "PSK31 at {} dB is within 4 dB of Olivia's {deepest_olivia} — the band no longer \
+             shows what coding gain buys",
+            st.snr_db
+        );
+
+        // And nothing invented elsewhere in the band by the PSK scan.
+        let phantoms: Vec<f64> =
+            res.iter().filter(|r| (r.hz - st.hz).abs() >= 20.0).map(|r| r.hz).collect();
+        assert!(phantoms.is_empty(), "invented PSK stations at {phantoms:?}");
+    }
+}
+
 /// Stations really are stacked on top of each other, and really are under the
 /// noise — the two things the band exists to demonstrate.
 #[test]

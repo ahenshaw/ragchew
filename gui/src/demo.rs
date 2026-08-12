@@ -158,6 +158,58 @@ pub const WEAK_STATIONS: &[WeakStation] = &[
     },
 ];
 
+/// The PSK31 station in the weak band, kept apart from the Olivia ones because
+/// it is a different demonstration and a different shape of station.
+///
+/// **What it is here to show**: coding gain, by its absence. Every Olivia
+/// station above spreads each character over 64 chips and reads perfectly at
+/// nine or twelve decibels *below* the noise. PSK31 has no error correction at
+/// all — an error is a wrong letter, with nothing to catch it — and it needs
+/// six decibels below instead of twelve. That gap is the whole argument for
+/// FEC, standing in one band where it can be seen rather than argued.
+///
+/// It is also a different shape: continuous rather than framed, so it repeats
+/// its call the way a station calling CQ does, and it has to be on the air for
+/// most of an 8.2-second analysis block before the detector will believe in it
+/// at all. And lower case on purpose — varicode gives its shortest codes to
+/// lower-case letters, and PSK31 operators type accordingly.
+pub struct WeakPsk {
+    pub hz: f64,
+    pub mode: psk::Mode,
+    pub start_s: f64,
+    pub snr_db: f32,
+    pub full_copy: bool,
+    /// One call, repeated [`WeakPsk::repeats`] times.
+    pub call: &'static str,
+    pub repeats: usize,
+}
+
+/// Measured against this band, not chosen, and it is the *exact copy* that was
+/// measured rather than a detection: −4 dB is where all 222 characters come
+/// through unaltered. −5 has every callsign but is a character short, −6 starts
+/// swallowing the spaces, −8 loses two calls in twelve, and −12 is mush.
+///
+/// Section B of `examples/psk_gate.rs` puts the detector's own floor near −8 dB,
+/// so the four decibels between that and this are precisely what having no FEC
+/// costs: the gate goes on finding a station whose text has already begun to
+/// come apart, and there is nothing underneath to put it back together. Every
+/// Olivia station here reads perfectly five to eight decibels *further* down.
+///
+/// At 1450 Hz it is in the clear, in the hundred-hertz gap between the wide
+/// 32/1000 at 900 and the 16/500 at 1750. PSK31 is some 62 Hz across and would
+/// fit inside either of them, but it is the one mode in this band with no error
+/// correction to absorb a collision — the overlap demonstration is the Olivia
+/// stations', which can afford it.
+pub const WEAK_PSK_STATIONS: &[WeakPsk] = &[WeakPsk {
+    hz: 1450.0,
+    mode: PSK31,
+    start_s: 0.5,
+    snr_db: -4.0,
+    full_copy: true,
+    call: "cq cq de n0fec n0fec -4 db no fec k  ",
+    repeats: 6,
+}];
+
 fn rms(x: &[f32]) -> f32 {
     (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
 }
@@ -211,6 +263,19 @@ pub fn synth_weak() -> Vec<f32> {
 
     for st in WEAK_STATIONS {
         let sig = olivia::encode(st.text, st.hz, st.mode);
+        let amp = scale_for_snr(&sig, st.snr_db);
+        let start = (st.start_s * rate as f64) as usize;
+        for (i, s) in sig.iter().enumerate() {
+            if start + i < total {
+                buf[start + i] += *s * amp;
+            }
+        }
+    }
+
+    // And the one station with no error correction, six decibels shallower
+    // than the Olivia stations for exactly that reason. See [`WeakPsk`].
+    for st in WEAK_PSK_STATIONS {
+        let sig = psk::encode(&psk_text(st.call, st.repeats), st.hz, st.mode);
         let amp = scale_for_snr(&sig, st.snr_db);
         let start = (st.start_s * rate as f64) as usize;
         for (i, s) in sig.iter().enumerate() {
