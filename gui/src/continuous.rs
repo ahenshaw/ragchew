@@ -486,6 +486,12 @@ impl Continuous {
                 caught
                     .into_iter()
                     .filter(|c| c.offset >= covered_from)
+                    // The same test the live path applies, and needed here for
+                    // the mirror-image reason: a scan locates a station to
+                    // within a block, so a receiver opened at the start of one
+                    // begins on however much of the band came before the
+                    // station keyed up — and reads that as varicode too.
+                    .filter(|c| c.carrier >= psk::modem::CARRIER_THRESHOLD as f32)
                     .map(|c| streamed(mode, hz, quality, c, rate)),
             );
 

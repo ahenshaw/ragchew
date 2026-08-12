@@ -29,6 +29,7 @@
 use rustfft::num_complex::Complex32;
 
 use super::mode::Mode;
+use super::modem::CARRIER_TC;
 use super::varicode;
 use crate::{dsp, SAMPLE_RATE};
 
@@ -66,19 +67,6 @@ const TIMING_KI: f64 = 0.0008;
 /// to be quiet, short enough to follow a drifting transmitter.
 const PHASE_TC: f64 = 48.0;
 
-/// Smoothing on the *magnitude* of the same quantity, which says whether the
-/// carrier is still there.
-///
-/// A separate constant from [`PHASE_TC`] over the identical measurement, and
-/// the reason is that the two want opposite things. The phase estimate wants a
-/// long average because it is tracking something that barely moves and every
-/// symbol of averaging makes it quieter. The carrier test wants a short one
-/// because it is watching for something to stop, and every symbol of averaging
-/// is a symbol of noise printed after it did.
-///
-/// Measured — see section G of `examples/psk_gate.rs`.
-const CARRIER_TC: f64 = 12.0;
-
 /// One character, and where in the input its last symbol fell.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Char {
@@ -95,7 +83,7 @@ pub struct Char {
     /// it decodes, and it prints as words. The receiver goes on demodulating
     /// because that is its job and because a station that pauses mid-over comes
     /// back on the same clock; deciding that the over has *ended* is the
-    /// caller's, and [`super::modem::CARRIER_THRESHOLD`] is where.
+    /// caller's, and `modem::CARRIER_THRESHOLD` is where.
     pub carrier: f32,
 }
 
@@ -122,7 +110,9 @@ pub struct Rx {
     /// Running mean of the unit phasor of `d²`; its half-angle is the residual
     /// carrier rotation. The same quantity `modem::concentration` reports.
     rot: Complex32,
-    /// The same mean again over a shorter window — see [`CARRIER_TC`]. Its
+    /// The same mean again over the shorter [`CARRIER_TC`] window, which
+    /// the block decoder keeps the identical statistic over — the threshold is
+    /// meaningless unless both average across the same number of symbols. Its
     /// magnitude is the concentration statistic, which is what says the station
     /// is still transmitting.
     carrier: Complex32,

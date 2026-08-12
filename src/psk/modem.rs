@@ -104,10 +104,25 @@ pub const SCREEN_THRESHOLD: f64 = 11.2;
 /// at the 99.99th percentile of that distribution.
 pub const CONC_THRESHOLD: f64 = 0.204;
 
-/// The same statistic, as a running receiver applies it to decide the station
-/// has stopped transmitting. See [`crate::psk::rx::Rx::carrier`].
+/// Symbols the carrier statistic is averaged over, wherever it is computed.
 ///
-/// Higher than [`CONC_THRESHOLD`] and it has to be, which is the thing to
+/// Here rather than beside either user, because the block decoder and the
+/// streaming receiver both keep it, and a threshold measured over one window is
+/// meaningless against another. The two must average over the same number of
+/// symbols or [`CARRIER_THRESHOLD`] means two different things.
+///
+/// Short on purpose, and separate from the phase estimate's own smoothing: that
+/// is tracking something which barely moves and wants a long average, while
+/// this is watching for something to stop, where every symbol of averaging is a
+/// symbol of noise printed after it did.
+pub const CARRIER_TC: f64 = 12.0;
+
+/// The same statistic as [`CONC_THRESHOLD`], applied to decide that a station
+/// being read has stopped transmitting rather than that one is there at all.
+/// Tested per character, in both the block decoder and
+/// [`crate::psk::rx::Rx::carrier`].
+///
+/// Higher than `CONC_THRESHOLD` and it has to be, which is the thing to
 /// understand before touching it. That figure is calibrated over a 256-symbol
 /// block; this one runs over twelve, so its noise distribution is far broader —
 /// a twelve-symbol mean of random phasors sits around 0.29 and reaches past 0.6
@@ -376,6 +391,9 @@ struct Demod {
     conc: f64,
     offset: usize,
     framing: varicode::Framing,
+    /// The running carrier statistic after each bit's symbol, indexed as
+    /// `bits` is. See [`Block::demod`].
+    carrier: Vec<f32>,
 }
 
 impl Block {
@@ -458,15 +476,38 @@ impl Block {
 
         let syms = symbols_at(&bb, off, SLOTS_PER_SYMBOL_DEMOD);
         let rot = Complex32::from_polar(1.0, -theta as f32);
+        // The block's own concentration is a single figure over all 256
+        // symbols, which is what stage two wants and is no use for saying
+        // *when* within the block the station was transmitting. A block is 8.2
+        // seconds of PSK31 and an over rarely starts or ends on its boundary,
+        // so the same statistic is kept running alongside — see
+        // [`CARRIER_TC`] — and the characters outside the transmission are
+        // dropped by it in [`decode_all`].
+        //
+        // Unlike the receiver's, this starts at zero rather than at one. An
+        // `Rx` is opened where the gate has already vouched for a station, so
+        // "present" is true at its first symbol; a block has no such warrant
+        // and begins wherever it begins. The cost of making it earn the first
+        // dozen symbols is nothing, because blocks overlap by half and a
+        // character suppressed at one block's edge sits in the middle of its
+        // neighbour.
+        let b = (1.0 / CARRIER_TC) as f32;
+        let mut running = Complex32::new(0.0, 0.0);
+        let mut carrier: Vec<f32> = Vec::with_capacity(syms.len());
         let bits: Vec<u8> = (1..syms.len())
             .map(|k| {
                 let d = syms[k] * syms[k - 1].conj() * rot;
+                let m = d.norm_sqr();
+                if m > 0.0 {
+                    running = running * (1.0 - b) + (d * d) / m * b;
+                }
+                carrier.push(running.norm());
                 u8::from(d.re > 0.0)
             })
             .collect();
 
         let (chars, framing) = varicode::decode_framed(&bits);
-        Demod { chars, conc, offset: off, framing }
+        Demod { chars, conc, offset: off, framing, carrier }
     }
 }
 
@@ -576,7 +617,16 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[Mode]) -> Ve
                     continue;
                 }
                 let (conc, off) = (d.conc, d.offset);
+                let carrier = d.carrier;
                 for d in d.chars {
+                    // Where in the block the station actually was. A block
+                    // spans 8.2 seconds of PSK31 and an over rarely fills it,
+                    // so the symbols before it keyed up and after it stopped
+                    // are noise — and noise read as differential BPSK frames
+                    // and decodes and prints as words.
+                    if carrier.get(d.bit).is_none_or(|&c| c < CARRIER_THRESHOLD as f32) {
+                        continue;
+                    }
                     // Bit k came from symbol k+1 of the interpolated baseband,
                     // which maps back to the input by the same ratio the slice
                     // decimated it.
