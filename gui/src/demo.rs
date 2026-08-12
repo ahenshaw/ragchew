@@ -128,8 +128,9 @@ impl Band {
                            waterfall and read anyway — and a PSK31 station four decibels \
                            down, which is as deep as a mode with no error correction goes",
             Band::Crowded => "five Olivia modes stacked on each other: two kilohertz-wide \
-                              stations meeting in the middle, one buried inside each, and \
-                              one across the seam. Every character of all five is recovered",
+                              stations meeting in the middle, one buried inside the first, \
+                              and two more piled across the seam. Every character of all \
+                              five is recovered, on five separate threads",
         }
     }
 
@@ -235,14 +236,26 @@ pub const WEAK_STATIONS: &[OliviaStation] = &[
 ///  400 |=========== 32/1000 @900 ===========|
 ///  450   |==== 16/500 @700 ====|
 /// 1275              |= 8/250 @1400 =|
+/// 1350             |===== 8/500 @1600 =====|
 /// 1400              |========== 16/1000 @1900 ==========|
-/// 1650                   |===== 8/500 @1900 =====|
 /// ```
 ///
-/// Two wide stations meeting at 1400 Hz, each with a narrower one buried
-/// completely inside it, and an 8/250 straddling the seam where the two wide
-/// ones meet — so it is inside *both*. Five stations, three overlapping pairs,
-/// nothing hidden behind anything, and every character of all five recovered.
+/// Two wide stations meeting at 1400 Hz, one narrow station buried completely
+/// inside the first, and two more piled across the seam where they meet: an
+/// 8/250 inside *both* wide ones, and an 8/500 lying across that 8/250 and
+/// running most of the way into the second. Five stations, four overlapping
+/// pairs, and every character of all five recovered.
+///
+/// **Why nothing sits exactly on top of anything.** Two stations may share a
+/// patch of spectrum but not a centre frequency, and that is a constraint of
+/// the channel tracker rather than of the decoder. `ChannelSet::add` matches a
+/// decode to a thread by protocol and frequency — not by mode — within the
+/// mode's own association tolerance, which for a kilohertz-wide Olivia signal
+/// is 250 Hz. Two Olivia stations closer than that become one thread with both
+/// texts woven into it, character by character. The decoder reads them both
+/// perfectly; there is simply nowhere to put the second one. An earlier
+/// arrangement here had the 8/500 dead centre of the 16/1000 and showed exactly
+/// that: four threads, one of them gibberish.
 ///
 /// **What makes that possible** is that Olivia spreads a character over 64 chips
 /// of a Walsh function. Two signals sharing a patch of spectrum are not adding
@@ -281,8 +294,8 @@ pub const CROWDED_STATIONS: &[OliviaStation] = &[
         text: "DE W3MID 16/500 ENTIRELY INSIDE W1BIG AND READ ANYWAY ",
     },
     OliviaStation {
-        hz: 1900.0, mode: olivia::OL_8_500, start_s: 2.1, snr_db: 6.0, full_copy: true,
-        text: "DE N4FAST 8/500 DEAD CENTRE OF K2WIDE AT TWICE THE BAUD ",
+        hz: 1600.0, mode: olivia::OL_8_500, start_s: 2.1, snr_db: 6.0, full_copy: true,
+        text: "DE N4FAST 8/500 MOSTLY INSIDE K2WIDE AND ACROSS W5EDGE TOO ",
     },
     // And one across the seam, inside both.
     OliviaStation {

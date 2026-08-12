@@ -68,15 +68,15 @@ Every one of those puts less power into the band than the noise does, leaves no
 trace an eye can find on the waterfall, and is read anyway — including where two
 of them are sitting on top of each other.
 
-The last row is the interesting one. It is in the clear, half a decibel below
-stations that copy perfectly, and it still falls apart — because sensitivity
+W6GONE is the interesting one among the Olivia stations. It is in the clear,
+half a decibel below stations that copy perfectly, and it still falls apart — because sensitivity
 tracks *characters per second*, not bandwidth. Every mode spreads a character
 over the same 64 chips, so a slower mode spends more energy on each and hears
 further: 4/125 at a leisurely 0.98 char/s copies at −12 dB while 8/500, three
 times faster, is already breaking up. The FEC does not degrade gently either —
 the window between clean copy and nothing at all is about a decibel wide.
 
-The last row makes the opposite point, and is the reason it is there. N0FEC is
+N0FEC makes the opposite point, and is the reason it is there. It is
 the loudest station in the band by five decibels and the only one with no error
 correction, and those two facts are the same fact. The detector still finds it
 four decibels further down, at about −8; what it finds there is a station whose
@@ -95,17 +95,28 @@ full:
  400 |=========== 32/1000 @900 ===========|
  450   |==== 16/500 @700 ====|
 1275              |= 8/250 @1400 =|
+1350             |===== 8/500 @1600 =====|
 1400              |========== 16/1000 @1900 ==========|
-1650                   |===== 8/500 @1900 =====|
 ```
 
-Two kilohertz-wide stations meeting at 1400 Hz, one narrower station buried
-completely inside each, and an 8/250 sitting across the seam — inside *both*.
-Nothing here is hard to hear; it is hard to separate. What separates it is the
+Two kilohertz-wide stations meeting at 1400 Hz, one narrower buried completely
+inside the first, and two more piled across the seam where they meet — an 8/250
+inside *both* wide ones, and an 8/500 lying across that 8/250 and running most
+of the way into the second. Nothing here is hard to hear; it is hard to
+separate. What separates it is the
 same 64-chip Walsh coding the weak band spends on going deep: an interfering
 station's energy lands across the whole correlation window instead of in the one
 place the correlator is looking, so the neighbours largely fail to register
 rather than adding their errors together.
+
+Two stations may share a patch of spectrum but not a centre frequency, and that
+is a limit of the display rather than of the decoder. Threads are grouped by
+protocol and frequency, not by mode, so two Olivia stations closer than the
+wider one's association tolerance — 250 Hz for a kilohertz-wide signal — arrive
+on one row with both texts woven into it. The decoder reads them both perfectly;
+there is simply nowhere to put the second. An earlier version of this band had
+the 8/500 dead centre of the 16/1000 and showed exactly that: four threads, one
+of them gibberish.
 
 Olivia 4/125 is the one mode absent from it, and for an honest reason. Its four
 tones fall on the same 31.25 Hz grid as a 16/500's sixteen, so a 16/500

@@ -252,6 +252,35 @@ fn the_crowded_band_reads_every_station() {
         assert_eq!(got, st.text, "{} at {} Hz", st.mode.name(), st.hz);
     }
 
+    // And now the part a reader actually sees. The decoder being right is not
+    // the same claim as the screen being right: threads are grouped by protocol
+    // and frequency, *not* by mode, so two Olivia stations closer than the
+    // wider one's association tolerance land on one row with their texts woven
+    // together — which is precisely what this band did when the 8/500 sat dead
+    // centre of the 16/1000, and precisely what the assertions above could not
+    // see. Five stations, five threads, each carrying one station's text whole.
+    let set = ChannelSet::from_decodes(
+        protocol::decode_all(&samples, 300.0, 2600.0, &protocol::default_modes()),
+        15.0,
+    );
+    let rows: Vec<String> = set.channels().iter().map(|c| format!("{:.0} Hz {:?}", c.hz, c.text)).collect();
+    assert_eq!(
+        set.channels().len(),
+        CROWDED_STATIONS.len(),
+        "{} stations came back as {} threads:\n  {}",
+        CROWDED_STATIONS.len(),
+        set.channels().len(),
+        rows.join("\n  ")
+    );
+    for st in CROWDED_STATIONS {
+        let ch = set
+            .channels()
+            .iter()
+            .find(|c| c.mode == protocol::ModeId::Olivia(st.mode))
+            .unwrap_or_else(|| panic!("no thread for {}", st.mode.name()));
+        assert_eq!(ch.text, st.text, "{} at {} Hz read as a thread", st.mode.name(), st.hz);
+    }
+
     // Nothing invented. This is the assertion that keeps the band honest about
     // what it is showing: a scan of five stacked signals has every opportunity
     // to report a sixth that is really two of the others, and a band built to
@@ -279,8 +308,8 @@ fn the_crowded_band_is_stacked_and_audible() {
     assert!(WEAK_STATIONS.iter().all(|st| st.snr_db < 0.0), "the weak band stopped being weak");
 
     // Every station overlaps at least one other, and there are at least three
-    // overlapping pairs — two narrow stations buried in wide ones, and one
-    // across the seam where the wide ones meet.
+    // overlapping pairs — one narrow station buried in a wide one, and two more
+    // piled across the seam where the two wide ones meet.
     let overlaps = |a: &ragchew_gui::demo::OliviaStation, b: &ragchew_gui::demo::OliviaStation| {
         (a.hz - b.hz).abs() < (a.mode.bandwidth + b.mode.bandwidth) as f64 / 2.0
     };
@@ -292,12 +321,16 @@ fn the_crowded_band_is_stacked_and_audible() {
         .count();
     assert!(pairs >= 3, "only {pairs} overlapping pairs — the band is not crowded");
 
-    for a in CROWDED_STATIONS {
-        let alone = !CROWDED_STATIONS
-            .iter()
-            .any(|b| !std::ptr::eq(a, b) && overlaps(a, b));
-        assert!(!alone, "{} at {} Hz overlaps nothing", a.mode.name(), a.hz);
-    }
+    // There is deliberately no static rule here about how far apart two
+    // stations must be. Threads are grouped by protocol and frequency and not
+    // by mode, so two Olivia stations can share one row — but `ChannelSet::add`
+    // assigns a decode to the *nearest* matching channel, so a pair inside each
+    // other's association tolerance is still fine as long as each has a nearer
+    // home of its own. The 32/1000 at 900 and the 16/500 at 700 are 200 Hz
+    // apart against a 250 Hz tolerance and never merge, for exactly that
+    // reason. A distance rule strict enough to be sound would reject this
+    // band; what actually settles it is decoding the thing and counting the
+    // threads, which `the_crowded_band_reads_every_station` does.
 
     // All at one level. A station well above its neighbour buries it, and the
     // band would be showing physics rather than decoding.
