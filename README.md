@@ -458,6 +458,11 @@ fldigi uses):
 - `examples/psk_gate.rs` — the sensitivity and false-alarm harness the gate's
   thresholds were measured on, running on the shipping code rather than a copy
   of it. 0 of 55,320 noise candidates clear the first two stages.
+- `examples/sensitivity.rs` — every mode's speed and reach on one yardstick,
+  measured through the same `protocol::decode_all` the application runs, at two
+  criteria: where every over of eight copies exactly, and where half do. Where
+  the `--signals` band's numbers come from; name modes on the command line to
+  re-measure a few while calibrating one.
 
 ```
 cargo test --release
