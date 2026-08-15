@@ -4657,6 +4657,31 @@ impl App {
                 // this listening to" — a recording, a synthetic band, the sound
                 // card — and only one of the three is a file.
                 ui.menu_button("Source", |ui| {
+                    // In the order they are worth reaching for. Live input is
+                    // what the program is for and the default with no arguments
+                    // at all, so it is the first thing under the menu that
+                    // switches sources; a recording is the rarest of the three
+                    // and goes last, behind a dialog.
+                    if ui.button("Live input").clicked() {
+                        go_live = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    // One item rather than four. They are all the same answer
+                    // to "what is this listening to" — a band that isn't there
+                    // — and listing them flat put four of the five entries in
+                    // this menu on the one source nobody uses in earnest.
+                    ui.menu_button("Demo bands", |ui| {
+                        for band in Band::ALL {
+                            if ui.button(band.label()).on_hover_text(band.hover()).clicked() {
+                                demo_request = Some(band);
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("synthetic bands, each built to show one thing");
+                    ui.separator();
                     if ui.button("Open audio file…").clicked() {
                         // Blocks the UI thread while the dialog is up, which is
                         // what you want: there is nothing to interact with
@@ -4666,17 +4691,6 @@ impl App {
                             .add_filter("audio", &["wav"])
                             .set_title("Open a 12 kHz mono WAV")
                             .pick_file();
-                        ui.close();
-                    }
-                    ui.separator();
-                    for band in Band::ALL {
-                        if ui.button(band.label()).on_hover_text(band.hover()).clicked() {
-                            demo_request = Some(band);
-                            ui.close();
-                        }
-                    }
-                    if ui.button("Live input").clicked() {
-                        go_live = true;
                         ui.close();
                     }
                 });

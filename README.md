@@ -40,8 +40,8 @@ cargo run -p ragchew-gui --release                    # the same, live: it is th
 
 Run it with no arguments and it starts listening to the default audio input —
 monitoring is what it is for. Everything else is reachable from the **Source**
-menu: *Open audio file…* for a native file picker, or straight to the demo
-bands. `--help` lists the lot.
+menu, in the order it offers them: *Live input*, *Demo bands* for the four
+below, and *Open audio file…* for a native file picker. `--help` lists the lot.
 
 Window size and position, the panel splits, text size, playback and waterfall
 settings, how long text stays on a row, the modes being scanned, the chosen
