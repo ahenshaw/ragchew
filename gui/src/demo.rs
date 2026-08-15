@@ -1,8 +1,16 @@
 //! Synthetic bands for the app's demo modes and the headless scene validator.
 //!
-//! [`synth`] builds the mixed-protocol band behind `--demo`; [`synth_weak`]
-//! builds the Olivia weak-signal band behind `--weak`, where the whole point is
-//! how far under the noise a signal can be and still be read.
+//! Four of them, each built to show one thing, and [`Band`] is the list:
+//!
+//! - [`synth`] — the mixed-protocol band behind `--demo`, described below.
+//! - [`synth_weak`] — `--weak`: how far under the noise a signal can be and
+//!   still be read.
+//! - [`synth_crowded`] — `--crowded`: how many can be in the same place at
+//!   once, which is the same coding gain spent the other way.
+//! - [`synth_signals`] — `--signals`: three QSOs side by side, one on each
+//!   protocol, each over saying what its mode costs in speed and in watts.
+//!
+//! The rest of this note is about the first.
 //!
 //! Twelve stations across all three protocols: all four JS8 submodes on their
 //! own cycles, three Olivia stations rag-chewing continuously, and a PSK31
@@ -38,12 +46,14 @@
 //! tone bins for a whole frame. That asymmetry is real, not a defect in the
 //! demo: it is what QRM costs each mode.
 
+use crate::channels;
 use ragchew::js8::message::{self, IType};
 use ragchew::js8::modem;
 use ragchew::js8::submode::{self, Submode};
 use ragchew::olivia::{self, Mode as Olivia};
+use ragchew::protocol::ModeId;
 use ragchew::psk::{self, PSK31};
-use ragchew::SAMPLE_RATE;
+use ragchew::{js8, SAMPLE_RATE};
 
 /// (carrier Hz, submode, per-cycle frame texts). Each station keeps its carrier
 /// and transmits one frame per cycle of its mode. Carriers are chosen so the
@@ -95,8 +105,8 @@ pub fn psk_text(call: &str, repeats: usize) -> String {
 /// One of the synthetic bands, as the command line and the Source menu offer it.
 ///
 /// An enum rather than the pair of booleans this used to be, because there are
-/// three of them now and "which band" is one question with one answer. The menu
-/// is built by walking [`Band::ALL`], so a fourth is a variant and nothing else.
+/// four of them now and "which band" is one question with one answer. The menu
+/// is built by walking [`Band::ALL`], so a fifth is a variant and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Band {
     /// Three protocols at once, twelve stations. What the app is *for*.
@@ -105,19 +115,44 @@ pub enum Band {
     Weak,
     /// Olivia on top of itself, five modes, all read.
     Crowded,
+    /// Three QSOs, one path: what each mode costs in watts to hold.
+    Signals,
 }
 
 impl Band {
     /// In the order the menu offers them: the mixed band first, being the one
-    /// that shows what the app does, then the two that each make one point.
-    pub const ALL: [Band; 3] = [Band::Demo, Band::Weak, Band::Crowded];
+    /// that shows what the app does, then the three that each make one point.
+    pub const ALL: [Band; 4] = [Band::Demo, Band::Weak, Band::Crowded, Band::Signals];
 
     pub fn label(self) -> &'static str {
         match self {
             Band::Demo => "Demo band",
             Band::Weak => "Weak-signal band",
             Band::Crowded => "Crowded band",
+            Band::Signals => "Know-your-signals band",
         }
+    }
+
+    /// What this band is called on a command line, without its dashes.
+    ///
+    /// The application's own flags are a clap struct and cannot read this — a
+    /// derive needs one field per flag — but everything else that has to name a
+    /// band does, `gui/examples/scene_png.rs` above all. A headless render is
+    /// how a band gets looked at without a display, and one that could only
+    /// render the first of four was the reason this exists.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Band::Demo => "demo",
+            Band::Weak => "weak",
+            Band::Crowded => "crowded",
+            Band::Signals => "signals",
+        }
+    }
+
+    /// The band a [`flag`](Self::flag) names.
+    pub fn from_flag(s: &str) -> Option<Band> {
+        let s = s.trim().trim_start_matches('-');
+        Band::ALL.into_iter().find(|b| b.flag() == s)
     }
 
     pub fn hover(self) -> &'static str {
@@ -131,6 +166,11 @@ impl Band {
                               stations meeting in the middle, one buried inside the first, \
                               and two more piled across the seam. Every character of all \
                               five is recovered, on five separate threads",
+            Band::Signals => "three QSOs side by side, one on each protocol, every over \
+                              saying its own speed and how deep it hears. Each is a \
+                              hundred-watt station worked by a quiet one, and the quiet \
+                              one runs 20 W on PSK31, 5 W on Olivia and 2 W on JS8 — same \
+                              path, same margin, the price of the mode",
         }
     }
 
@@ -140,6 +180,7 @@ impl Band {
             Band::Demo => "demo band",
             Band::Weak => "weak-signal demo",
             Band::Crowded => "crowded demo",
+            Band::Signals => "know-your-signals demo",
         }
     }
 
@@ -148,6 +189,7 @@ impl Band {
             Band::Demo => synth(),
             Band::Weak => synth_weak(),
             Band::Crowded => synth_crowded(),
+            Band::Signals => synth_signals(),
         }
     }
 }
@@ -356,6 +398,228 @@ pub const WEAK_PSK_STATIONS: &[WeakPsk] = &[WeakPsk {
     repeats: 6,
 }];
 
+// ---- the "know-your-signals" band ----
+
+/// Where a 100 W station in the "know-your-signals" band arrives, in dB against
+/// the noise in [`SNR_REF_BW`].
+///
+/// One number for the whole band, and that is the entire point of it. Three
+/// conversations, one ionosphere, one receiver: a hundred watts is a hundred
+/// watts whichever mode it is keyed in, so every loud station here lands at the
+/// same level, and the only thing that differs between the three threads is how
+/// little power their quiet partners can get away with.
+const SIGNALS_REF_SNR_DB: f32 = 6.0;
+
+/// The power [`SIGNALS_REF_SNR_DB`] is quoted for.
+const SIGNALS_REF_WATTS: f32 = 100.0;
+
+/// How far above its mode's floor each quiet station is put.
+///
+/// The same margin in every thread, so the three are comparable: whatever the
+/// QRP stations differ by is the modes differing, not the band plan. Four
+/// decibels because the floors below are whole decibels and a mode falls apart
+/// within about one of its own — see [`WEAK_STATIONS`] on how sharp that edge
+/// is — so three would be inside the rounding and five would waste the point.
+pub const SIGNALS_MARGIN_DB: f32 = 4.0;
+
+/// The turnaround between one over and the next, in a mode.
+///
+/// Long enough that the application notices it, which is the whole of the
+/// requirement. [`channels::over_gap_s`] is the silence after which what a
+/// station sends next is a new over — 8.2 seconds for Olivia, five for PSK31 —
+/// and the first draft of this band left a second and a half between overs,
+/// which is under both. The result was two threads that read as one unbroken
+/// paragraph with both operators' overs run together, and a QSO log with one
+/// entry where there should have been six.
+///
+/// That was a fault in the band and not in the tracker. A second and a half is
+/// not a turnaround anybody has ever taken: the other station has to hear you
+/// stop, finish decoding your tail, and key up. Olivia is the mode that makes
+/// this obvious — a block is two seconds long, so a pause of two or three of
+/// them is a typist thinking rather than an over ending, and the rule is right
+/// to wait for four.
+///
+/// Derived from the rule rather than written down beside it, so the two cannot
+/// drift apart. JS8 does not use it: its overs sit on the cycle grid and end
+/// with the flag the station sets on its last frame, which the tracker reads
+/// directly.
+fn signals_gap_s(mode: ModeId) -> f64 {
+    channels::over_gap_s(mode) + 1.5
+}
+
+/// Length of the band in seconds.
+///
+/// Nearly three times the other three, because the thing on show takes that
+/// long to happen: a QSO is several overs each way, the slowest mode here
+/// spends fifteen seconds of a JS8 cycle saying thirteen characters, which is
+/// ten words a minute, and every turnaround has to be a real one — see
+/// [`signals_gap_s`], which is where a third of this goes. Cutting it to a
+/// minute would show three stations calling CQ, which is not an exchange.
+pub const SIGNALS_SECS: usize = 165;
+
+/// One of the two operators working each other in a thread.
+pub struct Op {
+    pub call: &'static str,
+    /// Transmitter power in watts. What the band is about: it is the only thing
+    /// the two operators in a thread do differently.
+    pub watts: f32,
+}
+
+impl Op {
+    /// Where this station's signal arrives, in dB against the noise in
+    /// [`SNR_REF_BW`].
+    ///
+    /// Straight from the power, because that is how it works. Both stations are
+    /// heard over the same path and the path does not care which direction it
+    /// is worked in, so a station running a tenth of another's power arrives
+    /// exactly 10 dB down — no other difference between the two is modelled
+    /// here, and none is needed.
+    pub fn snr_db(&self) -> f32 {
+        SIGNALS_REF_SNR_DB + 10.0 * (self.watts / SIGNALS_REF_WATTS).log10()
+    }
+}
+
+/// The modes this band puts on the air, with the two numbers its texts quote:
+/// speed in words per minute, and the level at which it copies.
+///
+/// Both are measured by `examples/sensitivity.rs` and neither is taken from a
+/// published table, because neither would mean the same thing if it were.
+///
+/// **Speed** is five characters to a word including its space, counted over
+/// ordinary English prose in the case that mode's operators type it in — upper
+/// for JS8 and Olivia, lower for PSK31, whose varicode charges a third of its
+/// throughput for capitals. Only Olivia has a fixed rate; the other two carry
+/// whatever their varicode makes of the text, so a single figure for them is a
+/// claim about the prose as much as about the mode. The same PSK31 station
+/// types at 47 wpm sending English and 37 sending callsigns.
+///
+/// **The floor** is the lowest whole decibel at which a whole over comes back
+/// character for character, every time, through the same `protocol::decode_all`
+/// the application runs. That is a stricter test than the published figures for
+/// these modes, which state the level at which about *half* of single
+/// transmissions decode — JS8 Normal is quoted at −24 dB on that convention and
+/// reaches −15 on this one. A band that has to be watched rather than
+/// summarised needs the strict number: a station placed at the half-copy level
+/// spends the demo in pieces.
+pub const SIGNALS_MODES: &[(ModeId, f64, f32)] = &[
+    (ModeId::Psk(PSK31), 47.0, -5.0),
+    (ModeId::Js8(js8::Mode::Normal), 10.0, -15.0),
+    (ModeId::Olivia(olivia::OL_8_250), 18.0, -13.0),
+    (ModeId::Olivia(olivia::OL_16_500), 23.0, -12.0),
+    (ModeId::Olivia(olivia::OL_32_1000), 29.0, -11.0),
+];
+
+/// The floor [`SIGNALS_MODES`] states for a mode.
+pub fn signals_floor_db(mode: ModeId) -> f32 {
+    SIGNALS_MODES
+        .iter()
+        .find(|(m, _, _)| *m == mode)
+        .map(|(_, _, floor)| *floor)
+        .unwrap_or_else(|| panic!("{} is not one of this band's modes", mode.name()))
+}
+
+/// The PSK31 thread: 1000 Hz, and the most expensive contact in the band.
+///
+/// Twenty watts to hold a QSO that Olivia holds on five and JS8 on two, and the
+/// reason is one line long: PSK31 has no error correction. Every other mode
+/// here spends bandwidth or time on redundancy and gets it back as reach; this
+/// one spends nothing and gets nothing, and an error is simply a wrong letter.
+///
+/// The overs are long, and open with the callsigns three times over, which is
+/// how PSK31 is really operated and is also insurance against the one thing
+/// this decoder cannot help. There is no frame to synchronise on, so the gate
+/// will not believe in a station until it has been on the air for most of an
+/// 8.2-second analysis block, and an over carrying its only copy of the
+/// callsign in that opening could lose it — which is what the `--demo` band's
+/// PSK31 station does, and what happens when you tune across a real one. It
+/// does not happen at the levels here, and it should not have to not happen: an
+/// over that repeats its call cannot be robbed of it.
+pub const SIGNALS_PSK_HZ: f64 = 1000.0;
+pub const SIGNALS_PSK_OPS: [Op; 2] =
+    [Op { call: "W1PSK", watts: 100.0 }, Op { call: "K2QRP", watts: 20.0 }];
+
+/// `(which operator, what they send)`, in order, back to back.
+///
+/// Lower case throughout, as PSK31 has been since the day it was written.
+///
+/// **Two characters of junk trail each over but the last**, and they are left
+/// here rather than tuned away, because they are worth knowing about. They land
+/// 0.3 to 0.5 s after the carrier drops — `"pse k  fo"`, `"btu  ne"` — from the
+/// analysis block that straddles the drop: it is nearly all signal, so it
+/// clears the gate, and the tail of it is demodulated as though the station
+/// were still there.
+///
+/// The weak band's PSK station does not do this and its test says so, which is
+/// why the check there did not see this: that station is at −4 dB and has one
+/// over, while these are at −1 and +6 dB and turn round twice. A stronger
+/// carrier carries the straddling block over the gate more easily, so the leak
+/// is worst exactly where a demo is most likely to be watched. Two characters
+/// per turnaround is a small fault and a real one; `--signals` is now the band
+/// that shows it.
+pub const SIGNALS_PSK_OVERS: &[(usize, &str)] = &[
+    (0, "cq cq cq de w1psk w1psk w1psk psk31 47 wpm and copies at -5 db pse k  "),
+    (1, "w1psk de k2qrp k2qrp k2qrp ur 599 om running 20 w here es no fec at all btu  "),
+    (0, "k2qrp de w1psk r r fb 100 w my end so 20 w is the price of psk31 tu 73 sk  "),
+];
+
+/// The JS8 thread: 700 Hz, Normal, and the cheapest contact in the band.
+///
+/// Two watts, because the LDPC and the fifteen-second cycle between them buy
+/// ten decibels over PSK31 — paid for in speed, at a fifth of PSK31's words a
+/// minute. That trade, stated twice in one band by two stations who can hear
+/// each other, is the whole of what there is to know.
+///
+/// Overs run to whatever number of frames the text needs, laid end to end on
+/// the cycle grid with the last frame of each marked as ending the over — which
+/// is why the thread reads with a `<>` where each operator stopped talking, the
+/// same mark JS8Call shows.
+pub const SIGNALS_JS8_HZ: f64 = 700.0;
+pub const SIGNALS_JS8_OPS: [Op; 2] =
+    [Op { call: "W1JS8", watts: 100.0 }, Op { call: "K2LOW", watts: 2.0 }];
+
+/// `(which operator, what they send)`, in order, on consecutive cycles.
+pub const SIGNALS_JS8_OVERS: &[(usize, &str)] = &[
+    (0, "CQ DE W1JS8 JS8 NORMAL"),
+    (1, "W1JS8 DE K2LOW 2W ONLY"),
+    (0, "10 WPM SOLID -15 DB"),
+    (1, "R TU 73 SK"),
+];
+
+/// The Olivia thread: 1800 Hz, and a QSO that speeds up as it goes.
+///
+/// Three modes in one exchange — 8/250, then 16/500, then 32/1000 — because
+/// Olivia is the one protocol here whose operators change gear mid-QSO, and
+/// because the three make the trade visible inside a single conversation: 18,
+/// 23 and 29 words a minute against floors of −13, −12 and −11 dB. Two decibels
+/// buys sixty per cent more speed, which is a better bargain than it sounds and
+/// the reason 32/1000 is the classic ragchew mode.
+///
+/// **All three on one centre frequency**, which is both what operators do — you
+/// QSY the mode, not the dial — and what puts the whole exchange on one thread.
+/// `ChannelSet::add` groups decodes by protocol and frequency and *not* by mode,
+/// so the three modes arrive on the row they started on and the row's mode
+/// label follows the station. The crowded band leans on the same rule from the
+/// other side; see [`CROWDED_STATIONS`] for what it costs there.
+///
+/// The quiet operator runs 5 W, which is four decibels above the *fastest*
+/// mode's floor and therefore above all three. That is deliberate: the point of
+/// the thread is that they can speed up, and a station that fell out of the
+/// conversation at the last QSY would be making the opposite point in a band
+/// that already has two others for it.
+pub const SIGNALS_OLIVIA_HZ: f64 = 1800.0;
+pub const SIGNALS_OLIVIA_OPS: [Op; 2] =
+    [Op { call: "W1SLO", watts: 100.0 }, Op { call: "K2OLV", watts: 5.0 }];
+
+/// `(which operator, in what mode, what they send)`, in order, back to back.
+pub const SIGNALS_OLIVIA_OVERS: &[(usize, Olivia, &str)] = &[
+    (0, olivia::OL_8_250, "CQ DE W1SLO 8/250 18 WPM -13 DB K "),
+    (1, olivia::OL_8_250, "W1SLO DE K2OLV 5W ONLY FB K "),
+    (0, olivia::OL_16_500, "QSY 16/500 23 WPM -12 DB K "),
+    (1, olivia::OL_16_500, "R FASTER ES STILL 5W K "),
+    (0, olivia::OL_32_1000, "NOW 32/1000 29 WPM -11 DB TU 73 "),
+    (1, olivia::OL_32_1000, "R 73 SK "),
+];
+
 fn rms(x: &[f32]) -> f32 {
     (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
 }
@@ -457,6 +721,98 @@ pub fn synth_crowded() -> Vec<f32> {
             }
         }
     }
+    buf
+}
+
+/// Synthesize the "know-your-signals" band: three QSOs side by side, one on
+/// each protocol, every over stating its mode's speed and reach.
+///
+/// The other three bands are laid out by hand, station by station, because what
+/// they demonstrate *is* the layout. This one is laid out by the clock: overs
+/// are stacked end to end in the order they are spoken, so the tables above say
+/// who talks and what they say and nothing about when. Nothing here can be
+/// mistimed into an accidental collision, which matters more than usual —
+/// interference is what the other bands are for, and any of it here would be a
+/// second lesson taught over the top of the first.
+pub fn synth_signals() -> Vec<f32> {
+    let rate = SAMPLE_RATE as usize;
+    let total = SIGNALS_SECS * rate;
+    // Its own seed, as each band has: the four are each other's control, and a
+    // fluke shared between them would be invisible in all four.
+    let mut buf = noise(total, NOISE_RMS, 0x5169_4A15_0DEF_2B77);
+
+    let mut mix = |start: usize, sig: &[f32], snr_db: f32| {
+        let amp = scale_for_snr(sig, snr_db);
+        for (i, s) in sig.iter().enumerate() {
+            if start + i < total {
+                buf[start + i] += *s * amp;
+            }
+        }
+    };
+
+    // The two continuous protocols: an over is one encode, and the next one
+    // starts a turnaround after this one stops.
+    let gap = signals_gap_s(ModeId::Psk(PSK31));
+    let mut psk_ends = gap;
+    for (op, text) in SIGNALS_PSK_OVERS {
+        let sig = psk::encode(text, SIGNALS_PSK_HZ, PSK31);
+        mix((psk_ends * rate as f64) as usize, &sig, SIGNALS_PSK_OPS[*op].snr_db());
+        psk_ends += sig.len() as f64 / rate as f64 + gap;
+    }
+
+    // The Olivia turnaround is the same in all three of its modes — they share
+    // a block length, so they share an over gap — but it is asked for per over
+    // rather than once, because a mode that did not would be a silent bug the
+    // day this QSO gains a gear.
+    let mut olivia_ends = signals_gap_s(ModeId::Olivia(SIGNALS_OLIVIA_OVERS[0].1));
+    for (op, mode, text) in SIGNALS_OLIVIA_OVERS {
+        let sig = olivia::encode(text, SIGNALS_OLIVIA_HZ, *mode);
+        mix((olivia_ends * rate as f64) as usize, &sig, SIGNALS_OLIVIA_OPS[*op].snr_db());
+        olivia_ends +=
+            sig.len() as f64 / rate as f64 + signals_gap_s(ModeId::Olivia(*mode));
+    }
+
+    // JS8 keeps time by the UTC grid instead: one frame per cycle, keyed half a
+    // second in, and an over is however many cycles its text needs. The last
+    // frame of each over carries the flag that ends it, so the thread reads with
+    // the `<>` JS8Call shows where a station stopped talking — and so that a
+    // reply landing on the same frequency starts a paragraph of its own.
+    let sm = submode::NORMAL;
+    let mut cyc = 0usize;
+    for (op, text) in SIGNALS_JS8_OVERS {
+        let snr = SIGNALS_JS8_OPS[*op].snr_db();
+        let mut rest: &str = text;
+        while !rest.is_empty() {
+            // What is left after this frame decides whether this frame is the
+            // last one, so the text has to be packed before the flag is known.
+            let (_, used) = message::freetext(rest, IType::None);
+            let last = used >= rest.chars().count();
+            let (a87, _) = message::freetext(rest, if last { IType::Last } else { IType::None });
+            let sig = modem::encode_audio_sm(&a87, SIGNALS_JS8_HZ, &sm);
+            mix(cyc * sm.period_s as usize * rate + rate / 2, &sig, snr);
+            rest = &rest[rest.char_indices().nth(used).map_or(rest.len(), |(i, _)| i)..];
+            cyc += 1;
+        }
+    }
+
+    // Nothing may be cut off by the end of the band. Overs are stacked by the
+    // clock, so lengthening one — a longer text, a slower mode, one more
+    // exchange — pushes everything after it along, and an over that ran past
+    // the end would be truncated in silence and read as a station that stopped
+    // mid-word. Here is the only place the schedule exists, so here is where it
+    // is checked.
+    for (what, ends) in [
+        ("PSK31", psk_ends),
+        ("Olivia", olivia_ends),
+        ("JS8", (cyc * sm.period_s as usize) as f64),
+    ] {
+        assert!(
+            ends <= SIGNALS_SECS as f64,
+            "the {what} thread runs {:.0} s past the end of a {SIGNALS_SECS} s band",
+            ends - SIGNALS_SECS as f64
+        );
+    }
+
     buf
 }
 

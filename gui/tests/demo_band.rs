@@ -500,6 +500,279 @@ fn the_reported_snr_matches_the_band_it_was_built_with() {
     }
 }
 
+/// The "know-your-signals" band: three QSOs, three threads, every over read.
+///
+/// This is the band's whole claim — that a reader watching it sees three
+/// conversations and not a heap of decodes — so it is asserted through
+/// `ChannelSet` rather than off the decoder. The Olivia thread is the one that
+/// could fail quietly: it changes mode twice mid-QSO, and it stays one thread
+/// only because channels are grouped by protocol and frequency and not by mode.
+#[test]
+fn the_signals_band_holds_three_conversations() {
+    use ragchew_gui::demo::{
+        SIGNALS_JS8_HZ, SIGNALS_JS8_OVERS, SIGNALS_OLIVIA_HZ, SIGNALS_OLIVIA_OVERS,
+        SIGNALS_PSK_HZ, SIGNALS_PSK_OVERS,
+    };
+
+    let samples = demo::synth_signals();
+    let set = ChannelSet::from_decodes(
+        protocol::decode_all(&samples, 300.0, 2600.0, &protocol::default_modes()),
+        15.0,
+    );
+    let rows: Vec<String> =
+        set.channels().iter().map(|c| format!("{:.0} Hz {:?}", c.hz, c.text)).collect();
+    assert_eq!(set.channels().len(), 3, "three QSOs came back as:\n  {}", rows.join("\n  "));
+
+    // Olivia: three modes, one thread, every character of the exchange in the
+    // order it was spoken.
+    let want: String = SIGNALS_OLIVIA_OVERS.iter().map(|(_, _, t)| *t).collect();
+    assert_eq!(
+        text_near(&set, SIGNALS_OLIVIA_HZ, Protocol::Olivia),
+        want,
+        "the Olivia thread did not read as one conversation"
+    );
+
+    // JS8: the frames of each over, in order, with the mark that ends it.
+    let want: String =
+        SIGNALS_JS8_OVERS.iter().map(|(_, t)| format!("{t}<>")).collect::<Vec<_>>().concat();
+    assert_eq!(text_near(&set, SIGNALS_JS8_HZ, Protocol::Js8), want, "the JS8 thread");
+
+    // PSK31 loses the opening of every over at any level whatever — the gate
+    // wants a station on the air for most of an 8.2-second block before it will
+    // believe in one — so what is asserted is that the informative half of each
+    // over arrives. The overs open with the callsigns twice over for exactly
+    // this reason; see `SIGNALS_PSK_OVERS`.
+    let got = text_near(&set, SIGNALS_PSK_HZ, Protocol::Psk);
+    for (_, over) in SIGNALS_PSK_OVERS {
+        let tail: String = over.chars().skip(over.chars().count() / 2).collect();
+        assert!(got.contains(tail.trim()), "PSK31 lost {tail:?} of its over: {got:?}");
+    }
+}
+
+/// Every over in the band arrives as its own over, on all three protocols.
+///
+/// A thread is a frequency, not a speaker: both operators in a QSO transmit on
+/// the same one, so what separates their overs is `Channel::breaks` — which is
+/// where the text panel draws a gap and where the QSO log starts a new entry.
+/// The three protocols reach it by different routes, and only one of them is
+/// free. JS8 sets a flag on the last frame of an over and the tracker reads it.
+/// Olivia and PSK31 carry no such thing and no callsign the tracker can parse
+/// either, so the *only* cue they leave is the turnaround, which has to be
+/// longer than `channels::over_gap_s` — 8.2 s for Olivia, 5 for PSK31.
+///
+/// This band left 1.5 s between overs to begin with, and the two conversational
+/// threads arrived as one unbroken paragraph apiece with both operators run
+/// together. See `demo::signals_gap_s`. The Olivia thread is the one to watch:
+/// its three mode changes are mid-QSO, and each has to land on a line of its
+/// own rather than in the middle of the previous operator's sentence.
+#[test]
+fn every_over_in_the_signals_band_is_its_own_over() {
+    use ragchew_gui::demo::{
+        SIGNALS_JS8_HZ, SIGNALS_JS8_OVERS, SIGNALS_OLIVIA_HZ, SIGNALS_OLIVIA_OVERS,
+        SIGNALS_PSK_HZ, SIGNALS_PSK_OVERS,
+    };
+
+    let samples = demo::synth_signals();
+    let set = ChannelSet::from_decodes(
+        protocol::decode_all(&samples, 300.0, 2600.0, &protocol::default_modes()),
+        15.0,
+    );
+
+    let cases = [
+        ("JS8", SIGNALS_JS8_HZ, Protocol::Js8, SIGNALS_JS8_OVERS.len()),
+        ("PSK31", SIGNALS_PSK_HZ, Protocol::Psk, SIGNALS_PSK_OVERS.len()),
+        ("Olivia", SIGNALS_OLIVIA_HZ, Protocol::Olivia, SIGNALS_OLIVIA_OVERS.len()),
+    ];
+    for (what, hz, proto, overs) in cases {
+        let ch = set
+            .channels()
+            .iter()
+            .filter(|c| c.mode.protocol() == proto)
+            .min_by(|a, b| (a.hz - hz).abs().partial_cmp(&(b.hz - hz).abs()).unwrap())
+            .unwrap_or_else(|| panic!("no {what} thread"));
+        // One break between each pair of overs, and none before the first.
+        let segments: Vec<String> = {
+            let chars: Vec<char> = ch.text.chars().collect();
+            let mut bounds: Vec<usize> = ch.breaks.iter().map(|&(i, _)| i).collect();
+            bounds.push(chars.len());
+            let mut from = 0;
+            bounds
+                .into_iter()
+                .map(|to| {
+                    let s: String = chars[from..to].iter().collect();
+                    from = to;
+                    s
+                })
+                .collect()
+        };
+        assert_eq!(
+            segments.len(),
+            overs,
+            "the {what} thread's {overs} overs read as {} :\n  {}",
+            segments.len(),
+            segments.join("\n  ")
+        );
+    }
+
+    // And the Olivia thread through the log, which is the thing a reader keeps.
+    // The channel's breaks are where a new entry starts, so six overs — three
+    // of them in a mode the one before was not — have to be six lines.
+    use ragchew_gui::qso::QsoSet;
+    // Distinct modes: the thread QSYs twice and comes back to nothing, so the
+    // overs name three modes between six of them. Handing `decode_all` the list
+    // with its repeats scans each mode twice and lands two copies of every
+    // block on one channel, which reads exactly as badly as it sounds —
+    // "CQ CQ DE DE W1SW1SLO LO 8/28/250".
+    let mut modes: Vec<protocol::ModeId> =
+        SIGNALS_OLIVIA_OVERS.iter().map(|(_, m, _)| protocol::ModeId::Olivia(*m)).collect();
+    modes.dedup();
+    let decodes = protocol::decode_all(
+        &samples,
+        SIGNALS_OLIVIA_HZ - 600.0,
+        SIGNALS_OLIVIA_HZ + 600.0,
+        &modes,
+    );
+    let mut set = ChannelSet::new(15.0);
+    let mut qsos = QsoSet::new();
+    for d in decodes {
+        set.add(d);
+        if qsos.qsos().is_empty() {
+            qsos.open_for_channel(&set.channels()[0], 0.0);
+        }
+        qsos.absorb(&set);
+    }
+    let q = &qsos.qsos()[0];
+    let lines: Vec<&str> = q.log.iter().map(|e| e.text.as_str()).collect();
+    assert_eq!(
+        q.log.len(),
+        SIGNALS_OLIVIA_OVERS.len(),
+        "the Olivia QSO logged {} lines for {} overs:\n  {}",
+        q.log.len(),
+        SIGNALS_OLIVIA_OVERS.len(),
+        lines.join("\n  ")
+    );
+    for ((_, _, sent), got) in SIGNALS_OLIVIA_OVERS.iter().zip(&lines) {
+        assert_eq!(got.trim(), sent.trim(), "logged the wrong over");
+    }
+}
+
+/// Every number the band prints is one the code can still stand behind.
+///
+/// The point of the band is the two figures in each over — words per minute and
+/// the level the mode copies at — and a demo that states them is a demo that
+/// can be caught stating them wrongly. `SIGNALS_MODES` is where they are
+/// measured to; this is what keeps the texts agreeing with it.
+#[test]
+fn the_signals_band_quotes_the_numbers_it_was_measured_at() {
+    use ragchew::protocol::ModeId;
+    use ragchew_gui::demo::{
+        signals_floor_db, Op, SIGNALS_JS8_OPS, SIGNALS_JS8_OVERS, SIGNALS_MARGIN_DB,
+        SIGNALS_MODES, SIGNALS_OLIVIA_OPS, SIGNALS_OLIVIA_OVERS, SIGNALS_PSK_OPS,
+        SIGNALS_PSK_OVERS,
+    };
+    use ragchew::psk::PSK31;
+
+    // Each thread's text, and the modes it claims to be speaking in.
+    let js8: String = SIGNALS_JS8_OVERS.iter().map(|(_, t)| *t).collect();
+    let psk: String = SIGNALS_PSK_OVERS.iter().map(|(_, t)| *t).collect();
+    let olivia: String = SIGNALS_OLIVIA_OVERS.iter().map(|(_, _, t)| *t).collect();
+    // Upper-cased for the comparison only: PSK31 is typed in lower case, and
+    // what is under test is the numbers rather than the shift key.
+    let threads = [
+        (ModeId::Psk(PSK31), psk.to_uppercase()),
+        (ModeId::Js8(ragchew::js8::Mode::Normal), js8.clone()),
+    ];
+
+    for (mode, text) in &threads {
+        let (_, wpm, floor) = SIGNALS_MODES.iter().find(|(m, _, _)| m == mode).unwrap();
+        assert!(text.contains(&format!("{wpm:.0} WPM")), "{} never says its speed", mode.name());
+        assert!(
+            text.contains(&format!("{floor:.0} DB")),
+            "{} never says it copies at {floor} dB",
+            mode.name()
+        );
+    }
+    // The Olivia thread says all three, one per mode it QSYs to.
+    for (op, mode, _) in SIGNALS_OLIVIA_OVERS {
+        if *op != 0 {
+            continue; // the loud station announces each QSY; its partner agrees
+        }
+        let id = ModeId::Olivia(*mode);
+        let (_, wpm, floor) = SIGNALS_MODES.iter().find(|(m, _, _)| *m == id).unwrap();
+        assert!(
+            olivia.contains(&format!("{} {wpm:.0} WPM {floor:.0} DB", mode.short_name())),
+            "{} never states its speed and reach: {olivia:?}",
+            id.name()
+        );
+    }
+
+    // And the powers. Every loud station runs the same hundred watts, and every
+    // quiet one is the same margin above the floor of the hardest mode its
+    // thread uses — which is what makes the three threads comparable at all. If
+    // this drifts, the band stops being about the modes and starts being about
+    // whichever station happens to be loudest.
+    let worst =
+        |modes: &[ModeId]| modes.iter().map(|m| signals_floor_db(*m)).fold(f32::MIN, f32::max);
+    // The Olivia modes come from the overs rather than a list written out here:
+    // adding a fourth gear to that QSO must move its operator's power, and a
+    // list of its own would let the two drift apart quietly.
+    let olivia: Vec<ModeId> =
+        SIGNALS_OLIVIA_OVERS.iter().map(|(_, m, _)| ModeId::Olivia(*m)).collect();
+    let cases: [(&[ModeId], &[Op; 2]); 3] = [
+        (&[ModeId::Psk(PSK31)], &SIGNALS_PSK_OPS),
+        (&[ModeId::Js8(ragchew::js8::Mode::Normal)], &SIGNALS_JS8_OPS),
+        (&olivia, &SIGNALS_OLIVIA_OPS),
+    ];
+    for (modes, ops) in cases {
+        assert_eq!(ops[0].watts, 100.0, "{} is not the band's reference station", ops[0].call);
+        let margin = ops[1].snr_db() - worst(modes);
+        assert!(
+            (margin - SIGNALS_MARGIN_DB).abs() < 0.5,
+            "{} at {} W arrives {:.1} dB above its floor, not {SIGNALS_MARGIN_DB}",
+            ops[1].call,
+            ops[1].watts,
+            margin
+        );
+    }
+}
+
+/// The three threads keep out of each other's way.
+///
+/// Deliberately unlike the other bands: interference is what those are for, and
+/// a collision here would teach a second lesson over the top of the first. The
+/// Olivia thread is the one to watch — it grows to a kilohertz wide when it
+/// QSYs to 32/1000, and it is the last mode change that would land on a
+/// neighbour if one were too close.
+#[test]
+fn the_signals_band_threads_stay_clear_of_each_other() {
+    use ragchew::protocol::ModeId;
+    use ragchew::psk::PSK31;
+    use ragchew_gui::demo::{
+        SIGNALS_JS8_HZ, SIGNALS_OLIVIA_HZ, SIGNALS_OLIVIA_OVERS, SIGNALS_PSK_HZ,
+    };
+
+    let mut spans = vec![
+        (SIGNALS_PSK_HZ, ModeId::Psk(PSK31).bandwidth_hz(), "PSK31"),
+        (SIGNALS_JS8_HZ, ModeId::Js8(ragchew::js8::Mode::Normal).bandwidth_hz(), "JS8 Normal"),
+    ];
+    for (_, mode, _) in SIGNALS_OLIVIA_OVERS {
+        spans.push((SIGNALS_OLIVIA_HZ, mode.bandwidth as f64, "Olivia"));
+    }
+    for (i, a) in spans.iter().enumerate() {
+        for b in &spans[i + 1..] {
+            if a.2 == b.2 {
+                continue; // the Olivia modes share a centre frequency on purpose
+            }
+            let gap = (a.0 - b.0).abs() - (a.1 + b.1) / 2.0;
+            assert!(gap > 0.0, "{} and {} overlap by {:.0} Hz", a.2, b.2, -gap);
+        }
+    }
+    // And inside the band the app scans.
+    for (hz, bw, what) in &spans {
+        assert!(hz - bw / 2.0 >= 300.0 && hz + bw / 2.0 <= 2600.0, "{what} runs off the band");
+    }
+}
+
 /// Opening a QSO on a JS8 station fills the report it would send.
 ///
 /// The unit tests in `qso.rs` place the SNR by hand, so they cannot tell

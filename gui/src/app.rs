@@ -588,20 +588,25 @@ struct Args {
     /// Decode live from an audio input device. This is what happens with no
     /// arguments at all, so the flag is only worth typing for the sake of
     /// saying so.
-    #[arg(long, conflicts_with_all = ["file", "demo", "weak", "crowded"])]
+    #[arg(long, conflicts_with_all = ["file", "demo", "weak", "crowded", "signals"])]
     live: bool,
 
     /// Synthetic band carrying all three protocols, twelve stations.
-    #[arg(long, conflicts_with_all = ["file", "weak", "crowded"])]
+    #[arg(long, conflicts_with_all = ["file", "weak", "crowded", "signals"])]
     demo: bool,
 
     /// Synthetic Olivia band, every station below the noise floor.
-    #[arg(long, alias = "olivia", conflicts_with_all = ["file", "crowded"])]
+    #[arg(long, alias = "olivia", conflicts_with_all = ["file", "crowded", "signals"])]
     weak: bool,
 
     /// Synthetic Olivia band with five modes stacked on top of each other.
-    #[arg(long, conflicts_with = "file")]
+    #[arg(long, conflicts_with_all = ["file", "signals"])]
     crowded: bool,
+
+    /// Synthetic band of three QSOs, one per protocol, each over stating its
+    /// mode's speed and how deep it hears.
+    #[arg(long, conflicts_with = "file")]
+    signals: bool,
 
     /// Record the live capture to a WAV file alongside the log.
     ///
@@ -746,10 +751,11 @@ pub fn run() -> eframe::Result<()> {
     // thing the program is for. A file, a demo, or an explicit --live still win.
     // Which synthetic band was asked for, if any. The flags conflict with each
     // other in the parser, so at most one is set.
-    let band = match (args.demo, args.weak, args.crowded) {
-        (true, _, _) => Some(Band::Demo),
-        (_, true, _) => Some(Band::Weak),
-        (_, _, true) => Some(Band::Crowded),
+    let band = match (args.demo, args.weak, args.crowded, args.signals) {
+        (true, _, _, _) => Some(Band::Demo),
+        (_, true, _, _) => Some(Band::Weak),
+        (_, _, true, _) => Some(Band::Crowded),
+        (_, _, _, true) => Some(Band::Signals),
         _ => None,
     };
     let live = args.live || (args.file.is_none() && band.is_none());

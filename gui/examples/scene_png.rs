@@ -2,7 +2,11 @@
 //! (with close pairs to force row nudging), track channels, lay out text rows,
 //! and composite waterfall + connector strip + leader lines + text bars to PNG.
 //!
-//!   cargo run -p ragchew-gui --no-default-features --example scene_png -- out.png
+//!   cargo run -p ragchew-gui --no-default-features --example scene_png -- \
+//!       out.png [t_now_secs] [band]
+//!
+//! `band` is a demo band's command-line name — `demo`, `weak`, `crowded`,
+//! `signals` — and defaults to `demo`.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -17,11 +21,19 @@ use ragchew_gui::waterfall::{self, Viewport};
 
 
 fn main() {
-    // args: [out.png] [t_now_secs]. With t_now, render the streaming state at
-    // that playback time (windowed waterfall + only-revealed channels).
+    // args: [out.png] [t_now_secs] [band]. With t_now, render the streaming
+    // state at that playback time (windowed waterfall + only-revealed
+    // channels).
     let out = std::env::args().nth(1).unwrap_or_else(|| "scene.png".to_string());
     let t_now: Option<f64> = std::env::args().nth(2).and_then(|s| s.parse().ok());
-    let samples = ragchew_gui::demo::synth();
+    let band = match std::env::args().nth(3) {
+        Some(s) => ragchew_gui::demo::Band::from_flag(&s).unwrap_or_else(|| {
+            panic!("no such demo band: {s:?}");
+        }),
+        None => ragchew_gui::demo::Band::Demo,
+    };
+    eprintln!("{}", band.label());
+    let samples = band.synth();
 
     // decode every mode; reveal decodes whose audio has finished by t_now
     let modes = protocol::default_modes();

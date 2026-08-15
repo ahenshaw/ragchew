@@ -32,6 +32,7 @@ thresholds were measured on.
 cargo run -p ragchew-gui --release -- --demo          # synthetic three-protocol band
 cargo run -p ragchew-gui --release -- --weak          # Olivia under the noise floor
 cargo run -p ragchew-gui --release -- --crowded       # Olivia stacked on top of itself
+cargo run -p ragchew-gui --release -- --signals       # three QSOs: what each mode costs
 cargo run -p ragchew-gui --release -- --live          # decode the default audio input
 cargo run -p ragchew-gui --release -- recording.wav   # decode a recording
 cargo run -p ragchew-gui --release                    # the same, live: it is the default
@@ -127,6 +128,57 @@ signal per slice of spectrum drops the quieter of every such pair — so what
 normally prevents double-reporting is the correlation threshold, which covers a
 narrow mode locking onto a slice of a wide one but not this, its reverse. 4/125
 stays in `--weak`, where at −12 dB it is not strong enough to fake a wider mode.
+
+`--signals` is the one to start with if the question is *which mode should I be
+using*. Three QSOs run side by side for under three minutes, one per protocol, and
+every over states its own speed and how deep its mode hears:
+
+| thread | mode | speed | copies at | loud op | quiet op |
+|--------|------|------:|----------:|--------:|---------:|
+| 700 Hz  | JS8 Normal | 10 wpm | −15 dB | 100 W | **2 W** |
+| 1000 Hz | PSK31      | 47 wpm |  −5 dB | 100 W | **20 W** |
+| 1800 Hz | Olivia 8/250 → 16/500 → 32/1000 | 18 → 29 wpm | −13 → −11 dB | 100 W | **5 W** |
+
+Every station in the band is heard over one path, so a hundred watts is a
+hundred watts whichever mode it is keyed in and all three loud operators arrive
+at the same +6 dB. What differs is what their partners can get away with: each
+quiet station is placed exactly four decibels above its own mode's floor, and
+the power that takes is 20 W on PSK31, 5 W on Olivia and 2 W on JS8. Ten
+decibels between the ends of that, which is the amount of transmitter a mode
+with no error correction costs you — and JS8 charges it back at a fifth of
+PSK31's typing speed.
+
+The Olivia thread is the one that moves. The two operators start on 8/250, agree
+to speed up twice, and finish on 32/1000 — 18, 23 then 29 words a minute against
+floors of −13, −12 and −11 dB, so two decibels of reach buys sixty per cent more
+speed. All three modes are sent on the same centre frequency, which is both what
+operators do (you QSY the mode, not the dial) and what keeps the exchange on one
+row: threads are grouped by protocol and frequency and not by mode, so the row's
+label simply follows the station up through the gears.
+
+Every over is a separate over, on all three threads, and the three protocols get
+there by different routes. JS8 sets a flag on the last frame of an over and the
+tracker reads it — that is the `<>` in the text. Olivia and PSK31 carry no such
+flag, and no callsign the tracker parses either, so the only cue they leave is
+the turnaround, which has to be longer than the silence that ends an over: 8.2
+seconds for Olivia, five for PSK31. This band leaves a real one, which is a third
+of its length and the reason it runs as long as it does. Its first draft left a
+second and a half — no time at all for the other operator to hear you stop and
+key up — and both conversational threads arrived as a single unbroken paragraph
+with the two operators run together, and one QSO log entry apiece.
+
+Both numbers in that table are measured rather than quoted, by
+`examples/sensitivity.rs`, and the demo's tests hold the on-air text to them.
+Neither will match a published mode table, for two reasons worth knowing. Speed
+is five characters to a word over ordinary prose, and only Olivia has a fixed
+rate — the same PSK31 station types at 47 wpm sending English and 37 sending
+callsigns, and a JS8 frame swallows 13 characters of prose but 27 of a string
+built to suit its varicode. And the floor here is the
+level at which a *whole over* comes back character for character, every time,
+which is a stricter test than the half-of-all-transmissions convention the
+published figures use: JS8 Normal is quoted at −24 dB on that convention and
+reaches −15 on this one. A band that gets watched rather than summarised needs
+the strict number.
 
 The toolbar is one line: **☰** holds the display settings, the audio input and
 output, *Reset view* and *Quit*; **Source** opens a recording or switches what
