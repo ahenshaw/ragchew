@@ -42,6 +42,10 @@ use crate::sparkline;
 use crate::tx::{self, Tx};
 use crate::waterfall::{self, Viewport};
 
+/// What this build calls itself, taken from the manifest rather than written
+/// out here — a version in two places is a version that disagrees with itself.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const HIGHLIGHT_SECS: f64 = 2.5;
 
 /// How far one row still has to travel before the newest character it holds
@@ -741,7 +745,7 @@ pub fn run() -> eframe::Result<()> {
     diag_info!(
         "start",
         "ragchew {} on {} — args: {:?}",
-        env!("CARGO_PKG_VERSION"),
+        VERSION,
         std::env::consts::OS,
         std::env::args().skip(1).collect::<Vec<_>>()
     );
@@ -4802,6 +4806,19 @@ impl App {
                     if ui.button("Quit").clicked() {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                    // Which build this is, under everything else, in the weight
+                    // of a caption. Nobody looks for it until something has gone
+                    // wrong and they have to say what they are running — so it
+                    // wants to be findable rather than visible, and the foot of
+                    // the one panel already about this installation rather than
+                    // about the band is where a version number is looked for.
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("ragchew {VERSION}"))
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .on_hover_text("the version of this build");
                 })
                 .on_hover_text("Settings");
                 // "Source", not "File": every item under it answers "what is
@@ -6023,6 +6040,20 @@ mod tests {
             )
         }
 
+        /// The middle of a drawn piece of text, for clicking the widget it
+        /// labels. Laid out twice for the same reason [`Hand::digit`] is.
+        fn text_at(&mut self, app: &mut App, want: &str) -> Option<Pos2> {
+            let at = self.at;
+            self.frame(app, vec![egui::Event::PointerMoved(at)]);
+            let out = self.frame(app, vec![egui::Event::PointerMoved(at)]);
+            out.shapes.iter().find_map(|cs| match &cs.shape {
+                egui::Shape::Text(t) if t.galley.text() == want => {
+                    Some(t.pos + t.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+        }
+
         fn press(&mut self, app: &mut App, key: egui::Key) {
             self.frame(
                 app,
@@ -7219,6 +7250,51 @@ mod tests {
         let mut restored = App::base((0.0, 4000.0));
         restored.apply(serde_json::from_str(&text).unwrap());
         assert!(restored.rig_more, "the window forgot that they were open");
+    }
+
+    /// The build's version is in the settings, and only in the settings.
+    ///
+    /// It is the thing an operator is asked for when they report something odd,
+    /// so it has to be somewhere they can find without being told where — and
+    /// the foot of the settings panel is where a version number is looked for.
+    /// Equally it is of no use while working a station, so it does not get a
+    /// place on the bar.
+    ///
+    /// The string is checked against the manifest rather than against a
+    /// literal: a test that spelled the number out would have to be edited on
+    /// every release, and one that is edited on every release stops being read.
+    #[test]
+    fn the_version_is_at_the_foot_of_the_settings() {
+        let mut app = App::base((0.0, 4000.0));
+        let mut hand = Hand::new();
+        let want = format!("ragchew {}", env!("CARGO_PKG_VERSION"));
+
+        let out = hand.hover(&mut app, Pos2::new(-50.0, -50.0));
+        assert!(
+            !drawn(&out).iter().any(|(s, _)| s == &want),
+            "the version was on the bar without the settings being opened"
+        );
+
+        let menu = hand.text_at(&mut app, "☰").expect("the settings button was not drawn");
+        hand.hover(&mut app, menu);
+        hand.click(&mut app);
+
+        let out = hand.hover(&mut app, menu);
+        let shown = drawn(&out);
+        let at = |what: &str| {
+            shown
+                .iter()
+                .find(|(s, _)| s == what)
+                .unwrap_or_else(|| panic!("no {what:?} in the settings; they hold {shown:?}"))
+                .1
+        };
+        // At the foot of it: below the last of the commands, which is Quit.
+        assert!(
+            at(&want) > at("Quit"),
+            "the version at {} is above Quit at {}",
+            at(&want),
+            at("Quit")
+        );
     }
 
     /// What falls outside the rig's filter, in the audio this app draws.
