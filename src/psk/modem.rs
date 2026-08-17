@@ -171,7 +171,10 @@ const SLOTS_PER_SYMBOL_DEMOD: usize = SLOTS_PER_SYMBOL * DEMOD_OVERSAMPLE;
 /// Idle is an unbroken run of reversals — the strongest envelope line the mode
 /// can produce — so it is both what operators send between overs and what gives
 /// a receiver the best chance of finding the signal before there is any text.
-const IDLE_SYMBOLS: usize = 32;
+///
+/// Public because it is the offset of the first character in the burst, which
+/// is what anyone timing a transmission against its text has to start from.
+pub const IDLE_SYMBOLS: usize = 32;
 
 // ---- modulation ----
 

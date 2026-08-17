@@ -60,6 +60,22 @@ pub struct Entry {
     /// anything copied out of the panel stay what the station said. This is how
     /// it was *carried*, which is the interface's business alone.
     pub marks: Vec<(usize, f64)>,
+    /// The queued transmissions this line is made of, for one of ours: each
+    /// burst's id and the character of `text` it starts at. Empty on
+    /// everything received, and on ours once the audio queue has forgotten it.
+    ///
+    /// A line is several bursts because a JS8 over is several frames, one per
+    /// cycle, each carrying a known slice of the text — so an over stopped
+    /// after two of its four frames can be trimmed to exactly the two that
+    /// went. The log is written when a message is *queued*, a cycle or more
+    /// before the first frame leaves, and until this existed there was no way
+    /// back from a transmission taken off the queue to the line claiming it
+    /// was sent.
+    pub bursts: Vec<(u64, usize)>,
+    /// The transmission was stopped part-way. Some of this text went out and
+    /// some did not, and where the cut fell is not known well enough to say:
+    /// for a JS8 message the characters are not sent in order at all.
+    pub cut: bool,
 }
 
 /// How many (time, SNR) samples a QSO keeps.
@@ -117,6 +133,15 @@ fn settled_text(text: &str, mode: ModeId) -> &str {
     }
 }
 
+/// The byte offset of character `n`, or the end of the string if it is shorter.
+///
+/// Every count that crosses between text and audio in here is in characters,
+/// because that is what the modes carry and what an operator reads; every index
+/// into a `String` is in bytes. This is the one place the two meet.
+fn char_boundary(text: &str, n: usize) -> usize {
+    text.char_indices().nth(n).map_or(text.len(), |(i, _)| i)
+}
+
 /// Text on the air.
 ///
 /// It stays in the composer while it goes out, struck through as far as it has
@@ -130,6 +155,18 @@ pub struct Outgoing {
     /// struck through yet, which is itself worth seeing.
     pub start_unix: f64,
     pub end_unix: f64,
+    /// What the audio queue knows this burst by, so one of them can be taken
+    /// back without disturbing the others.
+    pub burst: u64,
+    /// The mode it is going out in — kept here rather than read off the QSO,
+    /// which the operator may have changed since, because how much of the text
+    /// a stopped burst delivered is a question about the waveform that was
+    /// actually modulated.
+    pub mode: ModeId,
+    /// When the key is down for it, as handed to the rig. Kept because a rig
+    /// cancels its whole schedule or none of it: dropping one transmission's
+    /// spans means dropping every span and putting these back.
+    pub keys: Vec<(f64, f64)>,
 }
 
 impl Outgoing {
@@ -243,15 +280,104 @@ impl Qso {
         (now_s - self.started_s).max(0.0)
     }
 
-    /// Add something we sent (or queued to send).
-    pub fn push_tx(&mut self, text: &str, at_s: f64) {
+    /// Add something we sent — or, more often, queued to send: `burst` names
+    /// the transmission in the audio queue, so that a message taken back off
+    /// that queue can be taken out of the log it was written into.
+    /// `bursts` are offsets into `text` as it was *sent*; the log keeps it
+    /// trimmed, so a draft with a leading space would put every offset one
+    /// character out. They are rebased here, where both versions are in hand.
+    pub fn push_tx(&mut self, text: &str, at_s: f64, bursts: Vec<(u64, usize)>) {
+        let lead = text.chars().count() - text.trim_start().chars().count();
         self.log.push(Entry {
             at_s,
             dir: Dir::Tx,
             text: text.trim().to_string(),
             marks: Vec::new(),
+            bursts: bursts.into_iter().map(|(b, at)| (b, at.saturating_sub(lead))).collect(),
+            cut: false,
         });
         self.last_s = at_s.max(self.last_s);
+    }
+
+    /// Trim this QSO back to what actually went on the air, and return the text
+    /// that did not.
+    ///
+    /// `stopped` names each transmission that was taken off the queue and says
+    /// how many of *its own* characters had certainly been delivered first —
+    /// zero for one that never began, and for a burst caught mid-flight
+    /// whatever [`crate::tx::delivered_chars`] could vouch for. Everything past
+    /// that point is removed from the log and the outgoing pane and handed
+    /// back.
+    ///
+    /// The log line is the half that is easy to forget. It is written when the
+    /// message is *queued*, which for JS8 is a cycle or more before a sample
+    /// leaves, so a line trimmed here is not history being rewritten — it is a
+    /// claim being withdrawn before it was ever true.
+    pub fn take_back(&mut self, stopped: &[(u64, usize)]) -> String {
+        // In the order they were to be sent, so what comes back reads the way
+        // it was typed. Ordered before anything is removed, since removing
+        // shifts the positions this is looking up.
+        let mut stopped: Vec<(u64, usize)> = stopped.to_vec();
+        stopped.sort_by_key(|&(burst, _)| {
+            self.outgoing.iter().position(|o| o.burst == burst).unwrap_or(usize::MAX)
+        });
+
+        let mut recovered = String::new();
+        for &(burst, delivered) in &stopped {
+            let Some(i) = self.outgoing.iter().position(|o| o.burst == burst) else {
+                continue;
+            };
+            let out = self.outgoing.remove(i);
+            recovered.push_str(&out.text[char_boundary(&out.text, delivered)..]);
+
+            // The line this burst belongs to, cut back to what went out. A
+            // burst missing from every line has already been trimmed past by an
+            // earlier one of the same message, and there is nothing left to do.
+            let Some(e) = self.log.iter_mut().find(|e| e.bursts.iter().any(|&(b, _)| b == burst))
+            else {
+                continue;
+            };
+            let at = e.bursts.iter().find(|&&(b, _)| b == burst).map(|&(_, o)| o).unwrap_or(0);
+            let keep = char_boundary(&e.text, at + delivered);
+            if keep < e.text.len() {
+                e.text.truncate(keep);
+                // Trailing space is what separates one transmission from the
+                // next on the air, not something the log shows — [`push_tx`]
+                // trims it off the whole message and a trimmed line is no
+                // different. Only the end is trimmed, so no burst offset moves.
+                e.text.truncate(e.text.trim_end().len());
+                // Only a line with something left on it can be "cut short": one
+                // trimmed to nothing is dropped below, never sent at all.
+                e.cut = !e.text.is_empty();
+            }
+            // This burst survives only if part of it went; everything after it
+            // is gone with it.
+            e.bursts.retain(|&(b, o)| o < at || (b == burst && delivered > 0));
+        }
+        // A line trimmed to nothing was never on the air, so it is not a log
+        // entry. Received lines are never touched by any of this.
+        self.log.retain(|e| e.dir != Dir::Tx || !e.text.is_empty());
+        recovered
+    }
+
+    /// Put recovered text back in the composer, ahead of anything typed since
+    /// — it was meant to go first — and take the keyboard back with it.
+    ///
+    /// A space goes in between when neither side brought one. In a character
+    /// stream that space is not tidiness: it is the whole of what keeps two
+    /// messages from running into each other on the air.
+    pub fn put_back(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.draft.is_empty()
+            && !text.ends_with(' ')
+            && !self.draft.starts_with(' ')
+        {
+            self.draft.insert(0, ' ');
+        }
+        self.draft.insert_str(0, text);
+        self.want_focus = true;
     }
 
     /// Add received characters: onto the entry already open, or as an entry of
@@ -293,6 +419,8 @@ impl Qso {
                     dir: Dir::Rx,
                     text,
                     marks: Vec::new(),
+                    bursts: Vec::new(),
+                    cut: false,
                 });
                 self.log.len() - 1
             }
@@ -447,7 +575,6 @@ impl QsoSet {
         &self.qsos
     }
 
-    #[cfg(test)]
     pub fn qsos_mut(&mut self) -> &mut [Qso] {
         &mut self.qsos
     }
@@ -674,6 +801,23 @@ mod tests {
     use crate::channels::MIN_OVER_GAP_S;
     use ragchew::protocol::Decode;
     use ragchew::{js8, olivia};
+
+    /// An outgoing message with a burst id nothing in these tests looks at.
+    fn outgoing(text: &str, start_unix: f64, end_unix: f64) -> Outgoing {
+        burst(0, text, start_unix, end_unix)
+    }
+
+    /// One queued burst, identified.
+    fn burst(id: u64, text: &str, start_unix: f64, end_unix: f64) -> Outgoing {
+        Outgoing {
+            text: text.to_string(),
+            start_unix,
+            end_unix,
+            burst: id,
+            mode: ModeId::Js8(js8::Mode::Normal),
+            keys: Vec::new(),
+        }
+    }
 
     fn js8_decode(hz: f64, t: f64, text: &str) -> Decode {
         Decode {
@@ -1065,7 +1209,7 @@ mod tests {
         qsos.open_for_channel(&set.channels()[0], 0.0);
         let end = psk_over(&mut set, &mut qsos, 0.3, " de w1aw ");
 
-        qsos.qsos_mut()[0].push_tx("r r ur 599", end);
+        qsos.qsos_mut()[0].push_tx("r r ur 599", end, Vec::new());
         // Straight back to us, well inside the gap that would otherwise join.
         psk_over(&mut set, &mut qsos, end + 0.5, "tnx 73 ");
 
@@ -1286,11 +1430,7 @@ mod tests {
     /// waiting for its cycle boundary, all of it once the burst has ended.
     #[test]
     fn outgoing_text_is_struck_through_as_it_is_sent() {
-        let out = Outgoing {
-            text: "CQ CQ DE K2N".to_string(), // 12 characters
-            start_unix: 1000.0,
-            end_unix: 1012.0,
-        };
+        let out = outgoing("CQ CQ DE K2N", 1000.0, 1012.0); // 12 characters
         // Queued but not started — a JS8 send waits out most of its cycle here.
         assert_eq!(out.sent_chars(900.0), 0);
         assert_eq!(out.sent_chars(1000.0), 0);
@@ -1303,9 +1443,164 @@ mod tests {
         assert!(out.finished(1012.0));
 
         // A zero-length burst is finished, not divided by.
-        let instant = Outgoing { text: "73".to_string(), start_unix: 5.0, end_unix: 5.0 };
+        let instant = outgoing("73", 5.0, 5.0);
         assert_eq!(instant.sent_chars(5.0), 2);
         assert!(instant.finished(5.0));
+    }
+
+    /// A message taken back off the queue comes back to the box, and takes its
+    /// log line with it.
+    ///
+    /// The log line is the half that is easy to forget. The log is written when
+    /// a message is *queued* — a cycle or more before a JS8 frame leaves — so a
+    /// transmission cancelled in that window had already been recorded as sent.
+    /// A log that keeps it is a log that lies about what went on the air, which
+    /// is the one thing a log may not do.
+    #[test]
+    fn a_transmission_taken_back_leaves_the_log_as_well_as_the_air() {
+        let set = ChannelSet::from_decodes([js8_decode(1000.0, 0.0, "CQ ")], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let q = &mut qsos.qsos_mut()[0];
+
+        q.push_tx("DE W1AW QRV", 1.0, vec![(7, 0)]);
+        q.outgoing.push(burst(7, "DE W1AW QRV", 1000.0, 1015.0));
+        assert_eq!(q.log.iter().filter(|e| e.dir == Dir::Tx).count(), 1);
+
+        assert_eq!(q.take_back(&[(7, 0)]), "DE W1AW QRV");
+        assert!(q.outgoing.is_empty(), "still shown as going out");
+        assert!(
+            q.log.iter().all(|e| e.dir != Dir::Tx),
+            "the log still claims a transmission that never left the queue"
+        );
+        // And a burst nobody is holding is not a panic.
+        assert_eq!(q.take_back(&[(7, 0)]), "");
+    }
+
+    /// An over stopped part-way through keeps the frames that went and gives
+    /// back the frames that did not — split exactly where the modem split it.
+    ///
+    /// This is the whole of why a JS8 message is queued as one burst per frame.
+    /// The four frames here carry known slices of the text; stopping after two
+    /// of them has one right answer, and both halves of it are checked: the log
+    /// keeps the two that were on the air, the operator gets the two that were
+    /// not, and neither gains or loses a character.
+    #[test]
+    fn an_over_stopped_between_frames_is_split_where_the_frames_are() {
+        let set = ChannelSet::from_decodes([js8_decode(1000.0, 0.0, "CQ ")], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let q = &mut qsos.qsos_mut()[0];
+
+        // "CQ DE W1AW " / "FN31 PSE K " / "TNX FER THE " / "CALL 73"
+        let text = "CQ DE W1AW FN31 PSE K TNX FER THE CALL 73";
+        let parts = ["CQ DE W1AW ", "FN31 PSE K ", "TNX FER THE ", "CALL 73"];
+        let mut at = 0;
+        let mut marks = Vec::new();
+        for (i, part) in parts.iter().enumerate() {
+            marks.push((10 + i as u64, at));
+            q.outgoing.push(burst(
+                10 + i as u64,
+                part,
+                1000.0 + i as f64 * 15.0,
+                1013.0 + i as f64 * 15.0,
+            ));
+            at += part.chars().count();
+        }
+        q.push_tx(text, 1.0, marks);
+
+        // Frames three and four never began; frames one and two had gone.
+        let back = q.take_back(&[(12, 0), (13, 0)]);
+        assert_eq!(back, "TNX FER THE CALL 73", "gave back the wrong text");
+
+        let sent: Vec<&Entry> = q.log.iter().filter(|e| e.dir == Dir::Tx).collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].text, "CQ DE W1AW FN31 PSE K", "the log kept a frame that never went");
+        assert!(sent[0].cut, "the log does not say the over was stopped");
+        // Nothing is lost between the two halves: put them back together, with
+        // the separator space the log trims off its line, and it is the message.
+        assert_eq!(format!("{} {}", sent[0].text, back), text, "a character fell between them");
+        // The frames that went are still the ones the line is made of.
+        assert_eq!(sent[0].bursts, vec![(10, 0), (11, 11)]);
+        assert_eq!(q.outgoing.len(), 2, "the frames that went are still queued for display");
+    }
+
+    /// A burst caught mid-flight keeps only what it had certainly delivered.
+    ///
+    /// The count comes from the modem — see `tx::delivered_chars` — and lands
+    /// here as a character index. What it means for the log is the same either
+    /// way: the line is cut at that character, not at the end of the message.
+    #[test]
+    fn a_burst_caught_mid_flight_is_split_at_what_it_delivered() {
+        let set = ChannelSet::from_decodes([js8_decode(1000.0, 0.0, "CQ ")], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let q = &mut qsos.qsos_mut()[0];
+
+        q.push_tx("CQ DE W1AW K", 1.0, vec![(4, 0)]);
+        q.outgoing.push(burst(4, "CQ DE W1AW K", 1000.0, 1060.0));
+
+        // Six characters were on the air when the key came up.
+        assert_eq!(q.take_back(&[(4, 6)]), "W1AW K");
+        let sent: Vec<&Entry> = q.log.iter().filter(|e| e.dir == Dir::Tx).collect();
+        assert_eq!(sent[0].text, "CQ DE", "the log kept text that did not go out");
+        assert!(!sent[0].text.ends_with(' '), "a separator space was left on the log line");
+        assert!(sent[0].cut);
+        // The burst is still part of the line: some of it was sent.
+        assert_eq!(sent[0].bursts, vec![(4, 0)]);
+    }
+
+    /// The recovered text lands ahead of whatever was typed while it waited,
+    /// with a space to keep the two apart.
+    ///
+    /// Typing on while a message goes out is the point of the outgoing pane, so
+    /// the box is rarely empty when the text comes back. It goes first because
+    /// it was written first; the space goes in because in a character-stream
+    /// mode a missing space is two words run together on the air.
+    #[test]
+    fn recovered_text_goes_ahead_of_what_was_typed_after_it() {
+        let set = ChannelSet::from_decodes([js8_decode(1000.0, 0.0, "CQ ")], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let q = &mut qsos.qsos_mut()[0];
+
+        q.draft = "AND 73".to_string();
+        q.put_back("DE W1AW");
+        assert_eq!(q.draft, "DE W1AW AND 73");
+        assert!(q.want_focus, "the composer should take the keyboard back");
+
+        // A space already on one side or the other is not doubled.
+        q.draft = "AND 73".to_string();
+        q.put_back("DE W1AW ");
+        assert_eq!(q.draft, "DE W1AW AND 73");
+        q.draft = " AND 73".to_string();
+        q.put_back("DE W1AW");
+        assert_eq!(q.draft, "DE W1AW AND 73");
+
+        // Nothing typed since, nothing added.
+        q.draft.clear();
+        q.put_back("DE W1AW");
+        assert_eq!(q.draft, "DE W1AW");
+    }
+
+    /// A message stopped before a single character of it went is not a log
+    /// entry at all — and the log's received lines are never touched.
+    #[test]
+    fn a_transmission_that_delivered_nothing_leaves_no_trace() {
+        let set = ChannelSet::from_decodes([js8_decode(1000.0, 0.0, "CQ ")], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let q = &mut qsos.qsos_mut()[0];
+        let heard = q.log.len();
+        assert!(heard > 0, "the QSO should have opened with what was decoded");
+
+        q.push_tx("DE W1AW QRV", 1.0, vec![(3, 0)]);
+        q.outgoing.push(burst(3, "DE W1AW QRV", 1000.0, 1015.0));
+
+        assert_eq!(q.take_back(&[(3, 0)]), "DE W1AW QRV");
+        assert!(q.outgoing.is_empty(), "still shown as going out");
+        assert_eq!(q.log.len(), heard, "the log kept a line that never went on the air");
+        assert!(q.log.iter().all(|e| !e.cut), "flagged a line that was never sent at all");
     }
 
     /// A finished transmission clears the composer of every QSO holding one,
@@ -1317,8 +1612,7 @@ mod tests {
         qsos.open_for_channel(&set.channels()[0], 0.0);
         qsos.open_blank(1500.0, ModeId::Js8(ragchew::js8::Mode::Normal), 0.0);
         for q in qsos.qsos_mut() {
-            q.outgoing
-                .push(Outgoing { text: "TEST".to_string(), start_unix: 0.0, end_unix: 10.0 });
+            q.outgoing.push(outgoing("TEST", 0.0, 10.0));
         }
         qsos.set_active(0);
 
@@ -1338,9 +1632,7 @@ mod tests {
         let set = ChannelSet::from_decodes([js8_decode(1000.0, 0.0, "CQ ")], 15.0);
         let mut qsos = QsoSet::new();
         qsos.open_for_channel(&set.channels()[0], 0.0);
-        qsos.qsos_mut()[0]
-            .outgoing
-            .push(Outgoing { text: "TEST".to_string(), start_unix: 0.0, end_unix: 10.0 });
+        qsos.qsos_mut()[0].outgoing.push(outgoing("TEST", 0.0, 10.0));
 
         qsos.retire_sent(9.0);
         assert!(!qsos.qsos()[0].want_focus, "asked for focus mid-burst");
@@ -1356,8 +1648,8 @@ mod tests {
         let mut qsos = QsoSet::new();
         qsos.open_for_channel(&set.channels()[0], 0.0);
         let q = &mut qsos.qsos_mut()[0];
-        q.outgoing.push(Outgoing { text: "FIRST ".into(), start_unix: 0.0, end_unix: 10.0 });
-        q.outgoing.push(Outgoing { text: "SECOND".into(), start_unix: 15.0, end_unix: 25.0 });
+        q.outgoing.push(outgoing("FIRST ", 0.0, 10.0));
+        q.outgoing.push(outgoing("SECOND", 15.0, 25.0));
 
         // The first has gone, the second has not started: all of the first is
         // struck through, none of the second.

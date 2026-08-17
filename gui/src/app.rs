@@ -3327,15 +3327,7 @@ impl App {
             .inner;
 
         if abort {
-            if let Some(t) = self.tx.as_mut() {
-                t.abort();
-            }
-            // The burst is gone, so the composer should not go on striking
-            // through text that is no longer being sent.
-            if let Some(q) = self.qsos.active_qso_mut() {
-                q.outgoing.clear();
-                q.want_focus = true;
-            }
+            self.abort_active();
         }
         if send {
             self.send_active(now_s);
@@ -3503,6 +3495,14 @@ impl App {
             from = cut;
         }
         job.append(e.text.get(from..).unwrap_or(""), 0.0, body.clone());
+        // An aborted transmission stays in the log, because part of it was on
+        // the air, but the log must not go on claiming the whole line was sent.
+        // The marker goes into the galley rather than into `e.text`, for the
+        // same reason the seams do: what is copied out of this panel is the
+        // message, not the interface's notes about it.
+        if e.cut {
+            job.append("  — cut short", 0.0, seam.clone());
+        }
 
         // `.wrap()` as well as the job's own width: a label in a horizontal
         // layout extends by default, and that default overrides the width set
@@ -3642,12 +3642,33 @@ impl App {
                     ui.add(elegance::Indicator::new(elegance::IndicatorState::Connecting));
                     let c = legible(ui.visuals().dark_mode, Color32::from_rgb(255, 190, 120));
                     ui.colored_label(c, format!("TX {busy:.0} s"));
+                }
+                // The button follows *this* QSO's traffic rather than the card
+                // being busy. They are not the same thing with two
+                // conversations open: the app can be transmitting for the other
+                // tab, and an Abort offered here would have taken back a
+                // message this operator was not looking at.
+                if !q.outgoing.is_empty() {
+                    let waiting = q.outgoing.iter().any(|o| o.start_unix > unix_now());
                     abort = ui
                         .add(
                             elegance::Button::new("Abort")
                                 .accent(elegance::Accent::Red)
                                 .size(elegance::ButtonSize::Small),
                         )
+                        // Two presses rather than one, and deliberately: taking
+                        // the queue back leaves the burst on the air to finish,
+                        // which is what an operator fixing a typo wants and is
+                        // not what an operator who needs the transmitter to
+                        // stop wants. The second press is the second thing.
+                        .on_hover_text(if waiting {
+                            "take back what has not gone out yet — it returns to the box, \
+                             to edit and send again. Press again to stop the burst that \
+                             is on the air."
+                        } else {
+                            "stop transmitting: the burst on the air is cut short, and \
+                             the log keeps only what a receiving station copied"
+                        })
                         .clicked();
                 }
             });
@@ -3840,40 +3861,170 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
-        let (samples, spans) = tx::modulate_spans(&text, q.hz, q.mode);
+        let (hz, mode) = (q.hz, q.mode);
+        // One burst per frame rather than one buffer with the silence between
+        // frames baked into it. A JS8 over is several frames a cycle apart, and
+        // queueing them separately is what makes the tail of an over abortable
+        // — each frame can be taken off the queue on its own, and each knows
+        // which characters it was carrying.
+        let frames = tx::modulate_frames(&text, hz, mode);
         // Behind anything already going out, on that mode's next boundary.
         let busy_until = self.tx.as_ref().map_or(0.0, |t| unix_now() + t.busy_for());
-        let at = tx::next_start_after(q.mode, busy_until);
-        let (hz, mode) = (q.hz, q.mode);
+        let at = tx::next_start_after(mode, busy_until);
 
-        let text_for_log = text.clone();
-        q.draft.clear();
-        q.push_tx(&text, now_s);
-        let mut queued = None;
-        if let Some(t) = self.tx.as_mut() {
-            queued = Some(t.send(samples, at));
-        }
-        if let Some(end) = queued {
-            // The outgoing pane keeps it until the whole queue has gone,
-            // striking it through as it leaves.
-            if let Some(q) = self.qsos.active_qso_mut() {
-                q.outgoing.push(crate::qso::Outgoing {
-                    text: text_for_log,
-                    start_unix: at,
+        let Some(t) = self.tx.as_mut() else { return };
+        // The queue first, so the log line and the outgoing pane can both be
+        // written knowing which transmissions they are about. Taking a message
+        // back later is a matter of finding all three by those ids.
+        let mut queued: Vec<(crate::qso::Outgoing, usize)> = Vec::new();
+        let mut from = 0usize;
+        for f in frames {
+            let begins = at + f.at_s;
+            let secs = f.secs();
+            let text = f.text;
+            let (burst, end) = t.send(f.samples, begins);
+            let starts_at = from;
+            from += text.chars().count();
+            queued.push((
+                crate::qso::Outgoing {
+                    start_unix: begins,
                     end_unix: end,
-                });
-            }
-            // One key-down per burst, never one across the whole message: the
-            // silence between JS8 frames is seconds long and a key held across
-            // it is a bare carrier for as long as the frames either side.
-            if let Some(link) = &self.ptt {
-                for (on, off) in tx::key_spans(at, &spans, tx::KEY_LEAD_S, tx::KEY_TAIL_S) {
+                    burst,
+                    mode,
+                    // One key-down per burst, never one across the whole
+                    // message: the silence between JS8 frames is seconds long
+                    // and a key held across it is a bare carrier for as long as
+                    // the frames either side.
+                    keys: vec![(
+                        begins - tx::KEY_LEAD_S,
+                        begins + secs + tx::KEY_TAIL_S,
+                    )],
+                    text,
+                },
+                starts_at,
+            ));
+        }
+
+        if let Some(link) = &self.ptt {
+            for (o, _) in &queued {
+                for &(on, off) in &o.keys {
                     link.schedule(on, off);
                 }
             }
-            let _ = (hz, mode);
+        }
+        if let Some(q) = self.qsos.active_qso_mut() {
+            q.draft.clear();
+            // The log line is the whole message, and knows which of its
+            // characters each frame carries — so an over stopped part-way is
+            // trimmed to exactly the frames that went.
+            q.push_tx(&text, now_s, queued.iter().map(|(o, at)| (o.burst, *at)).collect());
+            // The outgoing pane keeps them until the whole queue has gone,
+            // striking each through as it leaves.
+            q.outgoing.extend(queued.into_iter().map(|(o, _)| o));
         }
         self.status = None;
+    }
+
+    /// Take back what has not gone out, or stop what has.
+    ///
+    /// Two things on one button, and which one an operator means is never in
+    /// doubt: while there is text still waiting for its cycle, "abort" means
+    /// give it back — a message sent a word too early is the whole reason this
+    /// button was asked for, and on JS8 the wait before a frame leaves is most
+    /// of a cycle, which is plenty of time to notice. Only when there is
+    /// nothing left to take back does it mean the other thing, which is stop
+    /// transmitting, now.
+    ///
+    /// The first is surgical: this QSO's queued transmissions and nothing else.
+    /// The second cannot be — there is one rig and one queue, so stopping the
+    /// burst on the air while leaving another tab's message to fire behind it
+    /// would be an emergency stop that did not stop the emergency.
+    fn abort_active(&mut self) {
+        let now = unix_now();
+        let waiting: Vec<u64> = self
+            .qsos
+            .active_qso_mut()
+            .map(|q| {
+                q.outgoing.iter().filter(|o| o.start_unix > now).map(|o| o.burst).collect()
+            })
+            .unwrap_or_default();
+
+        if waiting.is_empty() {
+            self.stop_transmitting();
+        } else {
+            self.take_back(&waiting);
+        }
+        self.rekey();
+    }
+
+    /// Drop this QSO's queued transmissions that have not begun, and put their
+    /// text back in the box.
+    fn take_back(&mut self, ids: &[u64]) {
+        let Some(t) = self.tx.as_mut() else { return };
+        // Nothing of these went out, so nothing of them is kept back.
+        let stopped: Vec<(u64, usize)> =
+            t.cancel_pending(ids).into_iter().map(|id| (id, 0)).collect();
+        let Some(q) = self.qsos.active_qso_mut() else { return };
+        let back = q.take_back(&stopped);
+        q.put_back(&back);
+    }
+
+    /// Stop the lot: the queue, and the burst already going out.
+    ///
+    /// Nothing is dropped silently, and nothing is claimed that did not happen.
+    /// A transmission that never began goes back whole to the box of the QSO
+    /// that wrote it — that tab, not whichever one is on top. The one that was
+    /// on the air is divided: what [`tx::delivered_chars`] can vouch for stays
+    /// in the log, flagged as cut short, and the rest goes back too.
+    fn stop_transmitting(&mut self) {
+        let Some(t) = self.tx.as_mut() else { return };
+        let caught = t.abort();
+        for q in self.qsos.qsos_mut() {
+            let stopped: Vec<(u64, usize)> = q
+                .outgoing
+                .iter()
+                .filter_map(|o| {
+                    if caught.never_began.contains(&o.burst) {
+                        return Some((o.burst, 0));
+                    }
+                    // A burst neither queued nor on the air has finished, and a
+                    // finished transmission is not something to take back.
+                    let (id, played) = caught.in_flight?;
+                    (id == o.burst)
+                        .then(|| (o.burst, tx::delivered_chars(&o.text, o.mode, played)))
+                })
+                .collect();
+            let back = q.take_back(&stopped);
+            q.put_back(&back);
+        }
+    }
+
+    /// Put the key schedule back in step with what is actually still going out.
+    ///
+    /// [`rig::Ptt`] cancels all of its schedule or none of it, so dropping one
+    /// transmission's spans means dropping every span and re-scheduling the
+    /// ones still owed. Until this existed, nothing cancelled a key span at
+    /// all: an aborted message left its key-down behind it and the rig held a
+    /// bare carrier for the length of a transmission that was no longer being
+    /// made — which is worse on the air than the message would have been.
+    ///
+    /// A span covering this instant is re-scheduled along with the rest, so a
+    /// rig transmitting for another QSO takes a few milliseconds of unkey
+    /// between the cancel and the schedule catching up. That is the price of an
+    /// all-or-nothing cancel, and it is only paid on an abort.
+    fn rekey(&mut self) {
+        let Some(link) = &self.ptt else { return };
+        link.cancel();
+        let now = unix_now();
+        for q in self.qsos.qsos() {
+            for o in &q.outgoing {
+                for &(on, off) in &o.keys {
+                    if off > now {
+                        link.schedule(on, off);
+                    }
+                }
+            }
+        }
     }
 
     /// The channels as they stand at [`App::t_now`], accumulated rather than
@@ -6289,6 +6440,8 @@ mod tests {
             dir: Dir::Rx,
             text: long,
             marks,
+            bursts: Vec::new(),
+            cut: false,
         };
         let out = lay_out(&mut app);
         let widest = out
