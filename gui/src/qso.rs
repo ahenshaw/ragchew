@@ -120,9 +120,12 @@ pub fn suggested_report(mode: ModeId, snr_db: f32) -> Option<String> {
 /// and a QSO that grabbed it would carry the wrong call into the log. So
 /// everything past the last space is left until the next character settles it.
 ///
-/// A frame from a cycle-aligned mode arrives whole and is returned whole; its
-/// last token is finished by definition, and trimming it would lose the call in
-/// a frame that ends on one.
+/// A frame from a cycle-aligned mode arrives whole and is returned whole. Its
+/// last token is *not* finished by definition — JS8 packs thirteen characters
+/// to a frame and splits whatever word that reaches — but trimming it would
+/// lose the call in every frame that ends on one, which is most of them. So the
+/// whole frame is returned and [`Qso::absorb`] reads the call again as the rest
+/// of the over lands.
 fn settled_text(text: &str, mode: ModeId) -> &str {
     if mode.period_s().is_some() {
         return text;
@@ -198,6 +201,13 @@ pub struct Qso {
     /// [`callsign_in`] — and editable, because a heuristic over decoded text
     /// gets it wrong sometimes and the operator is the authority.
     pub call: String,
+    /// Whether `call` is still this crate's to correct.
+    ///
+    /// Set false the moment the operator types in the field and never set back,
+    /// the same as [`Qso::rst_sent_auto`]: a call they typed is theirs. Until
+    /// then the reading is revised as more of the over lands — see
+    /// [`Qso::absorb`], which only ever lengthens it.
+    pub call_auto: bool,
     pub name: String,
     pub qth: String,
     pub grid: String,
@@ -537,14 +547,38 @@ impl Qso {
         }
         self.push_rx(&new[from..], began, ch.last_heard_s, &frames, seen + from);
 
-        // Looked for in the whole entry rather than in what just arrived: on a
-        // continuous mode what just arrived is one character, and a call sign
-        // spread over twenty of them would never be seen. Rescanning costs
-        // nothing worth counting, and only happens while the call is unknown.
-        if self.call.trim().is_empty() {
-            let entry = self.log.last().expect("an entry was just written");
-            if let Some(c) = callsign_in(settled_text(&entry.text, ch.mode)) {
-                self.call = c;
+        // Who this is, read again on every decode rather than once and kept.
+        //
+        // Once was wrong because a call arrives in pieces. JS8 packs about
+        // thirteen characters of prose into a frame and an over is several of
+        // them, so the packing cuts whatever word it reaches: the demo band's
+        // own "W1JS8 DE K2LOW 2W ONLY" goes out as "W1JS8 DE K2L" and
+        // "OW 2W ONLY" — and the front of a call is a call, K2L passing every
+        // test K2LOW does. The tab, the Call field and the log all said K2L.
+        // A continuous mode has the same problem a character at a time, which
+        // is what `settled_text` is for.
+        //
+        // Two rules keep re-reading from doing harm:
+        //
+        // The text is the over the channel says is landing, not the log entry
+        // it went into. Queueing a reply writes a TX line, which cuts the over
+        // in the log — the other station is still talking, and the rest of what
+        // they say opens a fresh entry behind ours. There was no such break on
+        // the air, and the call is on the air.
+        //
+        // And a reading may only *lengthen* the call, never replace it. Both
+        // sides of a QSO sit on one frequency and take turns, so the next over
+        // usually holds the other operator's call; a thread that renamed itself
+        // every time the exchange turned round would be unusable. Lengthening
+        // is exactly the shape a half-read call has, and nothing else is.
+        if self.call_auto {
+            let from = ch.breaks.iter().map(|&(i, _)| i).filter(|&i| i <= have).max().unwrap_or(0);
+            let over: String =
+                ch.text.chars().skip(from.saturating_sub(ch.text_dropped)).collect();
+            if let Some(c) = callsign_in(settled_text(&over, ch.mode)) {
+                if self.call.is_empty() || c.starts_with(&self.call) && c.len() > self.call.len() {
+                    self.call = c;
+                }
             }
         }
     }
@@ -614,6 +648,7 @@ impl QsoSet {
             rst_sent_auto: true,
             id,
             call: String::new(),
+            call_auto: true,
             name: String::new(),
             qth: String::new(),
             grid: String::new(),
@@ -657,6 +692,7 @@ impl QsoSet {
             rst_sent_auto: true,
             id,
             call: String::new(),
+            call_auto: true,
             name: String::new(),
             qth: String::new(),
             grid: String::new(),
@@ -1056,6 +1092,117 @@ mod tests {
         for (text, want) in cases {
             assert_eq!(callsign_in(text).as_deref(), Some(want), "in {text:?}");
         }
+    }
+
+    /// A call cut in half by JS8's frame packing is put back together by the
+    /// frame that finishes it.
+    ///
+    /// This is the demo band's own traffic. "W1JS8 DE K2LOW 2W ONLY" is
+    /// twenty-two characters and a Normal frame carries about thirteen, so it
+    /// goes out as "W1JS8 DE K2L" and "OW 2W ONLY" — and K2L is a call sign by
+    /// every rule there is. The tab, the Call field and the log all carried
+    /// K2L until this test existed.
+    #[test]
+    fn a_call_split_across_two_frames_is_read_whole() {
+        let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
+        let mut set = ChannelSet::new(15.0);
+        set.add(js8_decode(700.0, 0.0, "W1JS8 DE K2L"));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        assert_eq!(qsos.qsos()[0].call, "K2L", "the first frame reads as far as it can");
+
+        set.add(js8_decode(700.0, period, "OW 2W ONLY "));
+        qsos.absorb(&set);
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.log.len(), 1, "one over came out as {} entries", q.log.len());
+        assert_eq!(q.call, "K2LOW", "the second frame did not finish the call");
+        assert_eq!(q.label(), "K2LOW", "the tab kept the half call");
+    }
+
+    /// Reading the call again stops at the end of the entry it came from.
+    ///
+    /// Both sides of a JS8 QSO sit on one frequency and take turns, so the next
+    /// over is usually the other station. A rule that re-read the call wherever
+    /// it looked would rename the tab every time the exchange turned round.
+    #[test]
+    fn the_other_station_does_not_take_over_the_tab() {
+        let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
+        let mut first = js8_decode(700.0, 0.0, "CQ DE W1AW JS8 NORMAL ");
+        first.ends_over = true;
+        let mut set = ChannelSet::from_decodes([first], 15.0);
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        assert_eq!(qsos.qsos()[0].call, "W1AW");
+
+        // The answer, in its own entry: a whole call this time, and ignored.
+        set.add(js8_decode(700.0, period, "W1AW DE K2LOW 2W ONLY "));
+        qsos.absorb(&set);
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.log.len(), 2, "the answer joined the call it was answering");
+        assert_eq!(q.call, "W1AW", "the thread was renamed after the station that answered");
+    }
+
+    /// Answering in the middle of the other station's over does not leave the
+    /// call half read.
+    ///
+    /// Queueing a message writes a TX line, which ends the RX entry the call
+    /// was read out of — so the rest of the over lands in a new entry, and a
+    /// rule that only looked inside one entry would never finish the call.
+    /// What finishes it is that a reading may lengthen the call from anywhere:
+    /// this is why the rule is about the call rather than about the entry.
+    #[test]
+    fn transmitting_mid_over_does_not_strand_a_half_call() {
+        let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
+        let mut set = ChannelSet::new(15.0);
+        set.add(js8_decode(700.0, 0.0, "W1AW DE K2L"));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        assert_eq!(qsos.qsos()[0].call, "K2L");
+
+        // We answer before they have finished, which is what the composer is
+        // for, and the log gets our line in the middle of their over.
+        qsos.active_qso_mut().expect("open").push_tx("K2L DE W1AW R", period, Vec::new());
+
+        set.add(js8_decode(700.0, period, "OW 2W ONLY "));
+        qsos.absorb(&set);
+        let q = &qsos.qsos()[0];
+        assert_eq!(q.log.len(), 3, "the over should be split by our own line");
+        assert_eq!(q.call, "K2LOW", "the call was stranded at {:?}", q.call);
+    }
+
+    /// A call the operator typed is theirs, and the next frame of the over
+    /// leaves it alone.
+    #[test]
+    fn a_typed_call_survives_the_rest_of_the_over() {
+        let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
+        let mut set = ChannelSet::new(15.0);
+        set.add(js8_decode(700.0, 0.0, "W1JS8 DE K2L"));
+        let mut qsos = QsoSet::new();
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+
+        // What the panel does when the field is edited.
+        let q = qsos.active_qso_mut().expect("the QSO just opened");
+        q.call = "K2LOW/M".to_string();
+        q.call_auto = false;
+
+        set.add(js8_decode(700.0, period, "OW 2W ONLY "));
+        qsos.absorb(&set);
+        assert_eq!(qsos.qsos()[0].call, "K2LOW/M", "the heuristic overwrote a typed call");
+    }
+
+    /// A call that arrives a character at a time is not read until the token
+    /// that holds it is finished — the continuous-mode half of the same
+    /// problem, and the one [`settled_text`] already solves.
+    #[test]
+    fn a_psk_call_is_not_read_until_the_word_ends() {
+        let mut set = ChannelSet::new(15.0);
+        let mut qsos = QsoSet::new();
+        set.add(psk_decode(620.0, 0.0, 'c'));
+        qsos.open_for_channel(&set.channels()[0], 0.0);
+        let t = psk_over(&mut set, &mut qsos, ModeId::Psk(ragchew::psk::PSK31).chunk_secs(), "q de kb9psk");
+        assert_eq!(qsos.qsos()[0].call, "", "a half-sent call was taken as the whole of one");
+        psk_over(&mut set, &mut qsos, t, " k ");
+        assert_eq!(qsos.qsos()[0].call, "KB9PSK");
     }
 
     /// Amateur text is full of tokens that a "has a digit in it" test would

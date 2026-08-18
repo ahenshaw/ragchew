@@ -3679,12 +3679,24 @@ impl App {
         });
 
         egui::Grid::new("qso_info").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-            let field = |ui: &mut egui::Ui, label: &str, v: &mut String| {
+            let field = |ui: &mut egui::Ui, label: &str, v: &mut String| -> egui::Response {
                 ui.label(label);
-                ui.add(egui::TextEdit::singleline(v).desired_width(f32::INFINITY));
+                let r = ui.add(egui::TextEdit::singleline(v).desired_width(f32::INFINITY));
                 ui.end_row();
+                r
             };
-            field(ui, "Call", &mut q.call);
+            // Typing a call takes it off the heuristic for good, the same way
+            // typing a report does: what goes in the log is the operator's
+            // answer, and a later frame of the over must not overwrite it.
+            if field(ui, "Call", &mut q.call)
+                .on_hover_text(
+                    "read out of the text after DE, and corrected as the rest of an over \
+                     arrives; type here and it is yours from then on",
+                )
+                .changed()
+            {
+                q.call_auto = false;
+            }
             field(ui, "Name", &mut q.name);
             field(ui, "QTH", &mut q.qth);
             field(ui, "Grid", &mut q.grid);

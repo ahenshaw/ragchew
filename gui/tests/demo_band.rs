@@ -549,6 +549,46 @@ fn the_signals_band_holds_three_conversations() {
     }
 }
 
+/// The call the QSO panel shows for the signals band's JS8 station is the whole
+/// of it.
+///
+/// The station is K2LOW, and "W1JS8 DE K2LOW 2W ONLY" is longer than a Normal
+/// frame carries — so it goes on the air as "W1JS8 DE K2L" and "OW 2W ONLY",
+/// and the first of those names a station that does not exist. It is decoded
+/// audio that exposes this and nothing else does: every unit test that fed the
+/// tracker whole sentences was green while the tab said K2L.
+#[test]
+fn a_call_broken_over_two_js8_frames_reaches_the_panel_whole() {
+    use ragchew::protocol::ModeId;
+    use ragchew_gui::demo::SIGNALS_JS8_HZ;
+    use ragchew_gui::qso::QsoSet;
+
+    // The submode the band sends this thread in; see `demo::synth_signals`.
+    let mode = ModeId::Js8(ragchew::js8::submode::NORMAL.mode);
+    let decodes = protocol::decode_all(
+        &demo::synth_signals(),
+        SIGNALS_JS8_HZ - 100.0,
+        SIGNALS_JS8_HZ + 100.0,
+        &[mode],
+    );
+    assert!(!decodes.is_empty(), "the JS8 thread did not decode");
+
+    // As the app does it: each decode as it lands, the QSO opened on the first.
+    let mut set = ChannelSet::new(15.0);
+    let mut qsos = QsoSet::new();
+    for d in decodes {
+        set.add(d);
+        if qsos.qsos().is_empty() {
+            qsos.open_for_channel(&set.channels()[0], 0.0);
+        }
+        qsos.absorb(&set);
+    }
+
+    let q = &qsos.qsos()[0];
+    assert_eq!(q.call, "K2LOW", "the panel named the station {:?}", q.call);
+    assert_eq!(q.label(), "K2LOW", "the tab is labelled {:?}", q.label());
+}
+
 /// Every over in the band arrives as its own over, on all three protocols.
 ///
 /// A thread is a frequency, not a speaker: both operators in a QSO transmit on
