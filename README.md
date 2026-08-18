@@ -224,7 +224,7 @@ stops the transmitter, which is the other thing entirely.
 
 The rig's frequency reads out above the conversations, amber on black.
 
-![The frequency readout, mode, and TX button](docs/images/readout.png)
+![The frequency readout with the transmitter keyed](docs/images/readout.png)
 
 Every digit is its own control: scroll over one and it steps its own decade,
 from single hertz at the right to tens of megahertz at the left, with small
@@ -266,7 +266,7 @@ Nothing keys unless you configure it. The default is no keying at all.
 
 ### Setting a rig up
 
-![Rig control settings](docs/images/rig.png)
+![The rig panel, set to an Elecraft on a serial cable](docs/images/rig.png)
 
 An **Elecraft** KX3 or K3 needs no daemon: **☰ ▸ Rig ▸ Elecraft**, the serial
 port the cable is on, and the rate the radio's menu is set to (38400 from the
@@ -330,7 +330,7 @@ ragchew --signals       # three QSOs: what each mode costs
 them below the noise floor, several sitting inside each other's bandwidth, one
 of them carrying no error correction at all — and the text comes out anyway.
 
-![The weak-signal band: nothing visible on the waterfall, read in full](docs/images/weak.png)
+![The weak-signal band: six stations under the noise, every one of them read](docs/images/weak.png)
 
 `--signals` is the one to start with if the question is *which mode should I be
 using*: three QSOs side by side, one per protocol, each a hundred-watt station
