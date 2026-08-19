@@ -48,6 +48,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const HIGHLIGHT_SECS: f64 = 2.5;
 
+/// What the composer says when it is empty.
+///
+/// Named because `the_composer_sits_at_the_head_of_the_qso_panel` finds the box
+/// on screen by the words in it — there is nothing else to recognize an empty
+/// text area by — and a hint reworded in one place and matched in the other is
+/// a red build for a change to a prompt.
+const COMPOSER_HINT: &str = "enter text here…";
+
 /// How far one row still has to travel before the newest character it holds
 /// sits where the newest character belongs.
 ///
@@ -3603,7 +3611,7 @@ impl App {
                 elegance::TextArea::new(&mut q.draft)
                     .rows(2)
                     .desired_width(f32::INFINITY)
-                    .hint("enter text here…"),
+                    .hint(COMPOSER_HINT),
             );
             if q.want_focus {
                 resp.request_focus();
@@ -6340,15 +6348,12 @@ mod tests {
             if let egui::Shape::Text(t) = &cs.shape {
                 match t.galley.text() {
                     "Send" => send_y = Some(t.pos.y),
-                    "reply…" => reply_y = Some(t.pos.y),
+                    s if s == COMPOSER_HINT => reply_y = Some(t.pos.y),
                     // The tab strip is the ceiling: the composer belongs under
                     // the tabs, not over them.
                     // The new-QSO button, which is the top of the tab strip.
                     s if s.trim() == "+" => tab_y = Some(t.pos.y),
                     // A log line by its offset stamp — "+  0:05" — which
-                    // nothing else in the panel draws. Matching the station's
-                    // call would find the tab it labels, at the very top.
-                    // A log line by its offset stamp — "+  0:00" — which
                     // nothing else in the panel draws. Matching the station's
                     // call would find the tab it labels, at the very top.
                     s if s.trim_start().starts_with('+') && s.contains(':') => {
