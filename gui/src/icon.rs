@@ -137,6 +137,29 @@ fn inside_tile(px: f32, py: f32) -> bool {
 mod tests {
     use super::*;
 
+    /// The `.ico` in the repository is still the icon this code draws.
+    ///
+    /// It has to be a file: `build.rs` compiles it into the executable and
+    /// cannot call into the crate it is building to make one. So the one
+    /// binary this repository does carry is checked against the code that
+    /// produced it, which is the arrangement the rest of the module exists to
+    /// avoid needing — regenerate it with the `icon_ico` example when this
+    /// fails, and look at what changed before you do.
+    #[test]
+    fn the_committed_ico_is_the_icon_we_draw() {
+        let want = ico();
+        let have: &[u8] = include_bytes!("../assets/ragchew.ico");
+        assert_eq!(
+            have.len(),
+            want.len(),
+            "gui/assets/ragchew.ico is {} bytes and the drawing makes {};              regenerate it: cargo run -p ragchew-gui --no-default-features \
+             --example icon_ico -- gui/assets/ragchew.ico",
+            have.len(),
+            want.len()
+        );
+        assert!(have == want, "gui/assets/ragchew.ico no longer matches icon::ico()");
+    }
+
     fn at(px: &[u8], size: usize, x: usize, y: usize) -> [u8; 4] {
         let i = (y * size + x) * 4;
         [px[i], px[i + 1], px[i + 2], px[i + 3]]
@@ -203,4 +226,92 @@ mod tests {
             assert_eq!(at(&px, size, size / 2, size / 2)[3], 255, "{size} has no middle");
         }
     }
+}
+
+/// The sizes a Windows `.ico` carries.
+///
+/// The four Windows actually asks for are 16, 32, 48 and 256 — the rest are
+/// there because scaling happens anyway on a display that is not at 100%, and
+/// an icon drawn at the size it is shown at beats one resampled from a
+/// neighbor. Same set as [`crate::desktop::SIZES`], for the same reason.
+pub const ICO_SIZES: [usize; 7] = [16, 24, 32, 48, 64, 128, 256];
+
+/// The icon as a Windows `.ico`, drawn at every size in [`ICO_SIZES`].
+///
+/// Uncompressed DIB entries rather than PNG ones. PNG would be a fifth of the
+/// size, and would mean either a dependency here or a second copy of the
+/// drawing somewhere that has one — and this file exists precisely so there is
+/// no second copy. A third of a megabyte in an executable of twenty-six is not
+/// the trade worth making it for.
+///
+/// This is what `gui/assets/ragchew.ico` holds and what `build.rs` compiles
+/// into the executable, so that Explorer, the taskbar and Alt-Tab show the
+/// same icon the window does. A test checks the file still matches.
+pub fn ico() -> Vec<u8> {
+    let images: Vec<(usize, Vec<u8>)> = ICO_SIZES.iter().map(|&s| (s, dib(s))).collect();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+    out.extend_from_slice(&1u16.to_le_bytes()); // 1 = icon
+    out.extend_from_slice(&(images.len() as u16).to_le_bytes());
+
+    // Entries first, then the images they point at; 6 bytes of header and 16
+    // per entry come before the first one.
+    let mut at = 6 + 16 * images.len();
+    for (size, data) in &images {
+        // 256 does not fit in a byte and is written as zero, which is what the
+        // format says it means.
+        let dim = if *size >= 256 { 0u8 } else { *size as u8 };
+        out.push(dim); // width
+        out.push(dim); // height
+        out.push(0); // palette entries: none, it is a true-color image
+        out.push(0); // reserved
+        out.extend_from_slice(&1u16.to_le_bytes()); // planes
+        out.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(at as u32).to_le_bytes());
+        at += data.len();
+    }
+    for (_, data) in &images {
+        out.extend_from_slice(data);
+    }
+    out
+}
+
+/// One icon image: a BITMAPINFOHEADER, the pixels bottom-up in BGRA, and the
+/// 1-bit mask the format still requires.
+///
+/// The header's height is *twice* the icon's, which is not a mistake in the
+/// reading of it: a DIB in an icon describes the color image and the mask
+/// stacked, and says so this way. The mask itself is all zeros — every pixel
+/// opaque as far as it is concerned — because a 32-bit icon is composited
+/// through its alpha channel and Windows ignores the mask when there is one.
+/// It cannot be left out, though; a reader that expects it finds the next
+/// image where the mask should be.
+fn dib(size: usize) -> Vec<u8> {
+    let rgba = rgba(size);
+    let mask_row = size.div_ceil(32) * 4; // 1 bit a pixel, rows padded to 4
+    let mut out = Vec::with_capacity(40 + size * size * 4 + mask_row * size);
+
+    out.extend_from_slice(&40u32.to_le_bytes()); // header size
+    out.extend_from_slice(&(size as i32).to_le_bytes()); // width
+    out.extend_from_slice(&(2 * size as i32).to_le_bytes()); // height: image + mask
+    out.extend_from_slice(&1u16.to_le_bytes()); // planes
+    out.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+    out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB, uncompressed
+    out.extend_from_slice(&((size * size * 4) as u32).to_le_bytes()); // image bytes
+    out.extend_from_slice(&0i32.to_le_bytes()); // pixels per meter, x
+    out.extend_from_slice(&0i32.to_le_bytes()); // and y
+    out.extend_from_slice(&0u32.to_le_bytes()); // palette colors used
+    out.extend_from_slice(&0u32.to_le_bytes()); // and important
+
+    // Bottom-up, and BGRA rather than RGBA: both are what a DIB is.
+    for y in (0..size).rev() {
+        for x in 0..size {
+            let p = (y * size + x) * 4;
+            out.extend_from_slice(&[rgba[p + 2], rgba[p + 1], rgba[p], rgba[p + 3]]);
+        }
+    }
+    out.resize(out.len() + mask_row * size, 0);
+    out
 }

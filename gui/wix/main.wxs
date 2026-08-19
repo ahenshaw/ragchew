@@ -1,0 +1,170 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  The Windows installer, built by `cargo wix -p ragchew-gui`.
+
+  Started from the template `cargo wix init` writes and then cut down: this
+  program is one executable, one licence and one Start Menu entry, and
+  everything the template offered beyond that has been taken out rather than
+  commented out. What is left is meant to be read.
+
+  Paths are relative to the package root — `gui/` — because that is where
+  cargo-wix runs the WiX compiler from. `$(var.CargoTargetBinDir)` and
+  `$(var.Version)` are cargo-wix's, the second of them taken from the manifest,
+  so the installer cannot claim a version the program does not.
+
+  There is no licence-acceptance page. The GPL is not an end-user licence
+  agreement — it grants permissions rather than demanding assent, and nothing
+  about running this program requires agreeing to it — so the licence is
+  installed beside the executable, which is what conveying it means, rather
+  than put behind an "I accept" button that would misdescribe it.
+-->
+
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <!--
+      UpgradeCode identifies the *application*, not the version, and must never
+      change: it is how an installer knows it is replacing an older ragchew
+      rather than installing a second one beside it. Generated once, here, and
+      not to be regenerated.
+    -->
+    <Product
+        Id='*'
+        Name='ragchew'
+        UpgradeCode='8FE602F7-79AE-4297-B082-85D2B26D288E'
+        Manufacturer='ragchew'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='ragchew — panoramic multi-protocol monitor'
+            Manufacturer='ragchew'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'/>
+
+        <!-- An install over an older one replaces it, rather than leaving two. -->
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='ragchew Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='ragchew'>
+
+                    <!-- GPLv3 section 4: a copy of the licence travels with the program. -->
+                    <Component Id='License' Guid='*'>
+                        <File Id='LicenseFile'
+                            Name='LICENSE.txt'
+                            DiskId='1'
+                            Source='..\LICENSE'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='binary0' Guid='*'>
+                            <File Id='exe0'
+                                Name='ragchew.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\ragchew.exe'
+                                KeyPath='yes'/>
+                        </Component>
+
+                        <!--
+                          On PATH because this program has a command line worth
+                          reaching: given a recording and a CSV flag it decodes
+                          a night of traffic to a log without opening a window
+                          at all. Its own feature below, so it can be declined.
+                        -->
+                        <Component Id='Path' Guid='71634098-949E-45F0-9954-06CADE2C68E4' KeyPath='yes'>
+                            <Environment
+                                Id='PATH'
+                                Name='PATH'
+                                Value='[Bin]'
+                                Permanent='no'
+                                Part='last'
+                                Action='set'
+                                System='yes'/>
+                        </Component>
+                    </Directory>
+                </Directory>
+            </Directory>
+
+            <!--
+              The Start Menu entry. A shortcut needs a key path that is not the
+              shortcut, which is what the registry value is for and all it is
+              for; the installer removes it, and the shortcut with it.
+            -->
+            <Directory Id='ProgramMenuFolder'>
+                <Component Id='StartMenuShortcut' Guid='*'>
+                    <Shortcut Id='AppShortcut'
+                        Name='ragchew'
+                        Description='Panoramic monitor for HAM digital modes'
+                        Target='[#exe0]'
+                        WorkingDirectory='Bin'
+                        Icon='ProductICO'/>
+                    <RegistryValue
+                        Root='HKCU'
+                        Key='Software\ragchew'
+                        Name='installed'
+                        Type='integer'
+                        Value='1'
+                        KeyPath='yes'/>
+                </Component>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='The program, its licence, and a Start Menu entry.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+            <ComponentRef Id='License'/>
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='StartMenuShortcut'/>
+
+            <Feature
+                Id='Environment'
+                Title='PATH Environment Variable'
+                Description='Add ragchew to PATH, so it can be run from a terminal.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <!--
+          The same icon the window shows and the same one the executable
+          carries: `gui/assets/ragchew.ico` is generated from `icon::ico()`, and
+          a test fails if the file and the drawing part company.
+        -->
+        <Icon Id='ProductICO' SourceFile='assets\ragchew.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/ahenshaw/ragchew'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            <!-- Straight from the welcome page to what will be installed. -->
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        </UI>
+    </Product>
+</Wix>

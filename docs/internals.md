@@ -222,3 +222,25 @@ Three platforms and every feature combination are built and tested on each push
 — see `.github/workflows`. Two thirds of the platform code (the Windows and
 macOS serial backends, the whole Yaesu driver) has a compiler and a test bench
 behind it and nothing else, which is exactly why the matrix is there.
+
+## Releasing
+
+`release.yml` builds the binaries. A `v*` tag builds all three platforms,
+packages them, and opens a **draft** release with the archives and the Windows
+`.msi` attached — draft, so the notes can be read before anyone else sees them.
+Running the workflow by hand builds the same things and leaves them as run
+artifacts instead, which is how to rehearse a change to the packaging without
+spending a tag on it.
+
+The installer is [cargo-wix](https://github.com/volks73/cargo-wix) over WiX v3,
+which is already on the GitHub Windows image. `gui/wix/main.wxs` is the whole
+of it: one executable in `bin`, the licence beside it, a Start Menu entry, and
+`PATH` as a feature that can be declined. `gui/assets/ragchew.ico` is generated
+from `icon::ico()` and checked against it by a test, so the icon in Explorer,
+the icon in the Start Menu and the icon on the window are one drawing —
+`build.rs` compiles it into the executable, which is where the shell reads it
+from.
+
+Nothing is signed. That is a certificate and a hardware token away, and until
+then Windows and macOS will both warn about it; the README says so rather than
+letting a user discover it.

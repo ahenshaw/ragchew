@@ -31,8 +31,21 @@ that does the decoding has **one** dependency, `rustfft`, and not a single
 
 ## Installing
 
-There are no packages yet — you build it, which on a machine with Rust already
-on it is one command.
+Every release carries built binaries for the three platforms, on the
+[releases page](https://github.com/ahenshaw/ragchew/releases): an `.msi`
+installer and a plain `.zip` for Windows, and a `.tar.gz` for Linux and macOS.
+The installer puts ragchew in the Start Menu, offers to put it on `PATH`, and
+uninstalls from Add/Remove Programs like anything else.
+
+Two things to know before you double-click any of it. **Nothing is signed** — a
+code-signing certificate costs a few hundred a year and a hardware token — so
+Windows shows "Windows protected your PC" until you click *More info* and *Run
+anyway*, and macOS refuses the binary until you right-click it and choose
+*Open*. And **the Linux binary is built on current Ubuntu**, so an older
+distribution will complain about glibc and wants the source route below.
+
+Building it yourself is one command on a machine that has Rust, and is the
+better path on Linux.
 
 **Linux** needs the development headers for the audio, windowing and file-dialog
 stacks. On Debian or Ubuntu:
@@ -66,7 +79,8 @@ ragchew --demo           # a synthetic band, with no radio involved
 
 `--help` lists the rest.
 
-To start it from the desktop's application menu instead of a terminal:
+**On Linux**, to start it from the desktop's application menu instead of a
+terminal:
 
 ```
 ./target/release/ragchew --install
@@ -75,7 +89,9 @@ To start it from the desktop's application menu instead of a terminal:
 That writes a launcher entry and its icons under `~/.local/share`, pointing at
 the copy of the binary you ran it from — so run the one you mean to keep, and
 run it again if you move it. It needs no privileges, and deleting the files it
-names undoes it.
+names undoes it. It is an XDG desktop entry and so does nothing useful anywhere
+else: the Windows installer makes its own Start Menu entry, and a macOS build
+is a binary you put where you like.
 
 Before wiring anything to a radio, it is worth half an hour with the synthetic
 bands: `ragchew --demo` opens twelve stations across all three protocols with no

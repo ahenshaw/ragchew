@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "ragchew — panoramic multi-protocol monitor (waterfall + inline decoded text)"
 
+# Windows resources — the icon the shell shows — are compiled in by `build.rs`,
+# which does nothing at all on any other target.
+build = "build.rs"
+
 [lib]
 name = "ragchew_gui"
 path = "src/lib.rs"
@@ -102,6 +106,12 @@ windows-sys = { version = "0.61", optional = true, features = [
     # the whole function on the feature that declares the type.
     "Win32_Security",
 ] }
+
+# Only ever runs on Windows, and only from `build.rs`: it invokes the resource
+# compiler to put the icon and the version block into the executable. Nothing
+# of it ends up in the program.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [dev-dependencies]
 png = "0.17"
