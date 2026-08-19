@@ -97,12 +97,14 @@ jobs:
       # drives it. `--no-build` because the binary above is the one that should
       # ship: built once, from the locked dependencies, and already there.
       #
-      # The manifest is named rather than the package, because the WiX source
-      # is found relative to the manifest given and `gui/wix/main.wxs` is where
-      # it lives. The version is passed explicitly for a duller reason: this
-      # crate inherits its version from the workspace, and rather than find out
-      # on a tag whether cargo-wix resolves that, it is read from the metadata
-      # — which is the same number, resolved by cargo itself.
+      # Both the package and its manifest are named. `cargo metadata` reports
+      # the whole workspace whichever manifest it is pointed at, so cargo-wix
+      # cannot tell which member is meant and says so — "Workspace detected.
+      # Please pass a package name." — and the package is how it finds
+      # `gui/wix/main.wxs`. The version is passed explicitly for a duller
+      # reason: this crate inherits its version from the workspace, and rather
+      # than find out on a tag whether cargo-wix resolves that, it is read from
+      # the metadata, which is the same number resolved by cargo itself.
       - name: installer (windows)
         if: runner.os == 'Windows'
         shell: bash
@@ -113,6 +115,7 @@ jobs:
             | jq -r '.packages[] | select(.name == "ragchew-gui") | .version')
           test -n "$version"
           cargo wix --no-build --nocapture \
+            --package ragchew-gui \
             --install-version "$version" \
             --output "dist/${{ matrix.artifact }}.msi" \
             gui/Cargo.toml
