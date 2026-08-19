@@ -54,7 +54,7 @@ fn every_station_is_decoded() {
 
     // The PSK31 station is checked for its calls rather than for exact
     // equality. It is the only mode here with no error correction and no frame
-    // to synchronise on: the detector needs a station on the air for most of an
+    // to synchronize on: the detector needs a station on the air for most of an
     // 8.2-second block before it will believe it, so the opening of a
     // transmission is missed — which is also what happens when you tune across
     // a real one. What has to come back is the call, cleanly and repeatedly.
@@ -130,7 +130,7 @@ fn weak_signal_demo_copies_what_it_claims() {
         if st.full_copy {
             assert_eq!(got, st.text, "{} at {} Hz should copy in full", st.mode.name(), st.hz);
         } else {
-            // the one past its reach: recognisable, but visibly damaged
+            // the one past its reach: recognizable, but visibly damaged
             assert!(!got.is_empty(), "{} vanished entirely", st.mode.name());
             assert_ne!(got, st.text, "{} copied in full — recalibrate the demo", st.mode.name());
         }
@@ -257,7 +257,7 @@ fn the_crowded_band_reads_every_station() {
     // and frequency, *not* by mode, so two Olivia stations closer than the
     // wider one's association tolerance land on one row with their texts woven
     // together — which is precisely what this band did when the 8/500 sat dead
-    // centre of the 16/1000, and precisely what the assertions above could not
+    // center of the 16/1000, and precisely what the assertions above could not
     // see. Five stations, five threads, each carrying one station's text whole.
     let set = ChannelSet::from_decodes(
         protocol::decode_all(&samples, 300.0, 2600.0, &protocol::default_modes()),
@@ -300,7 +300,7 @@ fn the_crowded_band_is_stacked_and_audible() {
     use ragchew_gui::demo::{CROWDED_STATIONS, WEAK_STATIONS};
 
     // Above the noise, unlike every station in the weak band. The difficulty
-    // here is the neighbours, not the level, and a reader can see these on the
+    // here is the neighbors, not the level, and a reader can see these on the
     // waterfall — which is the visible contrast between the two bands.
     for st in CROWDED_STATIONS {
         assert!(st.snr_db > 0.0, "{} is below the noise floor", st.mode.name());
@@ -332,7 +332,7 @@ fn the_crowded_band_is_stacked_and_audible() {
     // band; what actually settles it is decoding the thing and counting the
     // threads, which `the_crowded_band_reads_every_station` does.
 
-    // All at one level. A station well above its neighbour buries it, and the
+    // All at one level. A station well above its neighbor buries it, and the
     // band would be showing physics rather than decoding.
     let (lo, hi) = CROWDED_STATIONS
         .iter()
@@ -366,7 +366,7 @@ fn weak_band_overlaps_and_sits_below_the_noise() {
         .count();
     assert!(overlaps >= 2, "only {overlaps} overlapping pairs");
 
-    // overlapping neighbours stay within a few dB, or the louder simply buries
+    // overlapping neighbors stay within a few dB, or the louder simply buries
     // the quieter and the demo shows physics rather than decoding
     for (i, a) in WEAK_STATIONS.iter().enumerate() {
         for b in &WEAK_STATIONS[i + 1..] {
@@ -448,7 +448,7 @@ fn a_psk_over_reaches_the_log_as_one_entry() {
 ///   can separate them. 32/1000 hosts 8/250 and 16/500 hosts 4/125.
 /// - A station whose **guard region is mostly other stations** reads low,
 ///   because the noise floor is read off that region. Lowering the quantile
-///   buys tolerance of it — 8/500, with four neighbours in its skirts, gained
+///   buys tolerance of it — 8/500, with four neighbors in its skirts, gained
 ///   0.55 dB from that — but not immunity.
 #[test]
 fn the_reported_snr_matches_the_band_it_was_built_with() {
@@ -798,7 +798,7 @@ fn the_signals_band_quotes_the_numbers_it_was_measured_at() {
 /// a collision here would teach a second lesson over the top of the first. The
 /// Olivia thread is the one to watch — it grows to a kilohertz wide when it
 /// QSYs to 32/1000, and it is the last mode change that would land on a
-/// neighbour if one were too close.
+/// neighbor if one were too close.
 #[test]
 fn the_signals_band_threads_stay_clear_of_each_other() {
     use ragchew::protocol::ModeId;
@@ -817,7 +817,7 @@ fn the_signals_band_threads_stay_clear_of_each_other() {
     for (i, a) in spans.iter().enumerate() {
         for b in &spans[i + 1..] {
             if a.2 == b.2 {
-                continue; // the Olivia modes share a centre frequency on purpose
+                continue; // the Olivia modes share a center frequency on purpose
             }
             let gap = (a.0 - b.0).abs() - (a.1 + b.1) / 2.0;
             assert!(gap > 0.0, "{} and {} overlap by {:.0} Hz", a.2, b.2, -gap);

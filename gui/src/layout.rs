@@ -1,6 +1,6 @@
 //! 1-D label placement: given each channel's ideal vertical position (from its
 //! frequency), assign non-overlapping row positions that stay as close to the
-//! ideals as possible. Neighbours are pushed apart; the leader lines (drawn
+//! ideals as possible. Neighbors are pushed apart; the leader lines (drawn
 //! elsewhere) bridge the residual offset back to the true frequency.
 //!
 //! Uses cluster merging: adjacent labels that would overlap are grouped and the

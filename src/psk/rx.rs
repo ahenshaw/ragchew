@@ -270,7 +270,7 @@ impl Rx {
         // symbol instants straddle the transition evenly. It needs no carrier
         // phase, which is why it suits a signal whose phase is the data.
         if let Some(prev) = self.prev_sym {
-            // Normalised by the symbol power, or the loop gain would scale with
+            // Normalized by the symbol power, or the loop gain would scale with
             // how loud the station is: the same error would be corrected ten
             // times faster on a strong signal than a weak one, and the loop
             // would be tuned for exactly one signal level.
@@ -371,7 +371,7 @@ struct Front {
     since: usize,
 }
 
-/// Input samples between renormalisations of the oscillator.
+/// Input samples between renormalizations of the oscillator.
 const NORM_EVERY: usize = 1024;
 
 impl Front {
@@ -628,7 +628,7 @@ mod tests {
         let text = "cq de w1aw  test test test  ";
         let (mut audio, at) = band(text, 1500.0, PSK31, 1.0, 0.5);
         // `band` leaves a second of noise at the end; give it eight, which is
-        // long enough for the old behaviour to fill a line.
+        // long enough for the old behavior to fill a line.
         let ends_at = audio.len() - SAMPLE_RATE as usize;
         let mut seed = 0xDEADu64;
         audio.extend((0..7 * SAMPLE_RATE as usize).map(|_| {

@@ -174,7 +174,7 @@ fn with_digit(value: f64, place: f64, digit: u32) -> f64 {
 /// Painted rather than typed for the reason the clear mark is: the arrows a
 /// keyboard offers are in none of the fonts egui bundles, and these have to
 /// line up with a digit a few pixels wide.
-fn arrow(painter: &egui::Painter, at: egui::Rect, up: bool, colour: Color32) {
+fn arrow(painter: &egui::Painter, at: egui::Rect, up: bool, color: Color32) {
     let (w, mid) = (at.width() * 0.34, at.center().x);
     let (near, far) = if up { (at.bottom(), at.top()) } else { (at.top(), at.bottom()) };
     painter.add(egui::Shape::convex_polygon(
@@ -183,15 +183,15 @@ fn arrow(painter: &egui::Painter, at: egui::Rect, up: bool, colour: Color32) {
             egui::pos2(mid + w, near),
             egui::pos2(mid, far),
         ],
-        colour,
+        color,
         Stroke::NONE,
     ));
 }
 
 /// Where a rig's filter sits in the audio this app draws.
 ///
-/// A receiver's filter is quoted as a width and placed about a centre, and the
-/// centre is the part no rig volunteers over CAT in any way this could rely
+/// A receiver's filter is quoted as a width and placed about a center, and the
+/// center is the part no rig volunteers over CAT in any way this could rely
 /// on. Fifteen hundred hertz is the convention for data operating — it is what
 /// a K3 and a KX3 use for their data modes out of the box — so that is what
 /// this assumes, and the readout says as much rather than pretending to know.
@@ -246,7 +246,7 @@ fn on_the_band(dial: Option<f64>, mode: Option<&str>, audio_hz: f64) -> Option<f
 /// all. A radio solves it the same way — the positions are always there and the
 /// leading zeros are blanked, which here means drawn dim.
 ///
-/// Three megahertz digits rather than two, so a rig on two metres has somewhere
+/// Three megahertz digits rather than two, so a rig on two meters has somewhere
 /// to put its hundreds.
 fn dial_digits(hz: f64) -> String {
     let total = hz.round().max(0.0) as u64;
@@ -286,7 +286,7 @@ const VFO_BLACK: Color32 = Color32::from_rgb(12, 10, 8);
 const VFO_SCALE: f32 = 1.9;
 
 /// Transmitting because this app asked for it, and transmitting for a reason it
-/// does not know. Two colours because they call for two different reactions.
+/// does not know. Two colors because they call for two different reactions.
 const TX_RED: Color32 = Color32::from_rgb(255, 60, 60);
 const TX_ELSEWHERE: Color32 = Color32::from_rgb(255, 170, 40);
 
@@ -395,7 +395,7 @@ const MIN_TRACK_W: f32 = 90.0;
 /// Which settings get a track depends on the radio, not on the interface: a
 /// `rigctld` rig states its power exactly and says nothing about its passband,
 /// an Elecraft is the other way round, and a Yaesu says neither. On screen that
-/// reads as one control having a slider and its neighbour not, which looks like
+/// reads as one control having a slider and its neighbor not, which looks like
 /// an oversight — it looked like one to the person who wrote it, with the whole
 /// design in front of him. The rig is what did not say, and a tooltip is the
 /// only place that can be said.
@@ -513,7 +513,7 @@ struct MarkStroke {
 ///
 /// Transcribed rather than rendered. Both strokes are straight lines —
 /// `the_clear_mark_is_the_one_in_the_asset` reads the file and fails the moment
-/// that stops being true — and rasterising them would mean carrying an SVG
+/// that stops being true — and rasterizing them would mean carrying an SVG
 /// stack in the binary to draw, at the eleven pixels this is seen at, what two
 /// line segments draw better at every scale factor.
 ///
@@ -536,7 +536,7 @@ const CLEAR_MARK: [MarkStroke; 2] = [
 /// The side of the viewport [`CLEAR_MARK`] is drawn in.
 const CLEAR_MARK_BOX: f32 = 100.0;
 
-/// The colour the asset draws it in, `stroke:#ff0000`.
+/// The color the asset draws it in, `stroke:#ff0000`.
 ///
 /// It goes through [`legible`] like every other accent here: pure red on the
 /// light palette is a stain rather than a mark.
@@ -568,7 +568,7 @@ const MIN_QSO_W: f32 = 240.0;
 /// Clamp a wanted waterfall width so both panels stay usable in a window this
 /// wide.
 ///
-/// The minimums cannot always both be honoured — a narrow enough window has no
+/// The minimums cannot always both be honored — a narrow enough window has no
 /// room for either — so the waterfall's wins and the text panel takes what is
 /// left. Getting that order wrong is a panic, not a cosmetic bug: `clamp` needs
 /// its bounds the right way round.
@@ -994,7 +994,7 @@ impl Theme {
     }
 }
 
-/// Per-mode colour, so a channel's colour tells you what it is.
+/// Per-mode color, so a channel's color tells you what it is.
 ///
 /// Each protocol gets its own end of the spectrum — JS8 cool through warm,
 /// Olivia violet through cyan, PSK a yellow of its own — so you can tell the
@@ -1022,7 +1022,7 @@ fn mode_color(m: ModeId) -> Color32 {
     }
 }
 
-/// The mode's colour, legible as text on the panel background.
+/// The mode's color, legible as text on the panel background.
 ///
 /// The palette above is pitched to sit on a dark panel, and on a light one
 /// those pastels are all but white. Scaling them towards black keeps the hue —
@@ -1031,7 +1031,7 @@ fn mode_text_color(dark: bool, m: ModeId) -> Color32 {
     legible(dark, mode_color(m))
 }
 
-/// A colour picked for a dark panel, made to hold up on a light one.
+/// A color picked for a dark panel, made to hold up on a light one.
 ///
 /// Every accent here is a light tint, which is right on the dark background
 /// this started life with and nearly invisible on a white one. Scaling towards
@@ -1103,7 +1103,7 @@ struct Settings {
     ///
     /// Three plain fields rather than the enum itself, for the reason the modes
     /// are names: a settings file outlives the shape of the type that wrote it,
-    /// and a word this build does not recognise should cost the rig setting
+    /// and a word this build does not recognize should cost the rig setting
     /// rather than the whole file.
     rig_keying: String,
     rig_host: String,
@@ -1763,7 +1763,7 @@ struct App {
     preferred_output: Option<String>,
 
     /// True while a drag that began on the band bar is in progress, and the
-    /// frequency offset between where it was grabbed and the view centre — so
+    /// frequency offset between where it was grabbed and the view center — so
     /// the grabbed point stays under the cursor instead of snapping to it.
     bar_drag: bool,
     bar_grab_hz: f64,
@@ -2853,8 +2853,8 @@ impl App {
                         .on_hover_text(hint(
                             "how wide the receiver's filter is. Anything outside it is shaded \
                              on the waterfall: the app draws the band, the radio decides how \
-                             much of it you can hear. Taken as centred on 1500 Hz, which is \
-                             what a rig's data modes use — no rig reports the centre in a way \
+                             much of it you can hear. Taken as centered on 1500 Hz, which is \
+                             what a rig's data modes use — no rig reports the center in a way \
                              this can rely on.",
                             known.is_some(),
                         ))
@@ -2911,7 +2911,7 @@ impl App {
     /// It shows three states, and the third is the reason the rig is asked
     /// rather than assumed: keyed because we keyed it, keyed by somebody else —
     /// a hand on the front panel, a foot switch, a line stuck down — and not
-    /// keyed. The middle one is worth its own colour, because a rig
+    /// keyed. The middle one is worth its own color, because a rig
     /// transmitting for a reason this app does not know about is the one a
     /// reader most needs to be told about and the one it cannot fix by
     /// releasing a button.
@@ -2928,7 +2928,7 @@ impl App {
             (true, t) if t >= 1.0 => format!("TX {t:.0}s"),
             (true, _) => "TX".to_string(),
         };
-        let colour = match (live, theirs) {
+        let color = match (live, theirs) {
             (false, _) => None,
             (true, false) => Some(legible(ui.visuals().dark_mode, TX_RED)),
             (true, true) => Some(legible(ui.visuals().dark_mode, TX_ELSEWHERE)),
@@ -2937,7 +2937,7 @@ impl App {
         // key-down does not resize the control under the hand about to press
         // it again.
         let mut button = egui::Button::new(label).min_size(egui::vec2(66.0, height));
-        if let Some(c) = colour {
+        if let Some(c) = color {
             button = button.fill(c.gamma_multiply(0.35)).stroke(Stroke::new(1.0, c));
         }
 
@@ -2972,7 +2972,7 @@ impl App {
             }
         }
         // A transmitting rig has to keep being drawn, or the count stops and
-        // the colour is whatever the last event left behind.
+        // the color is whatever the last event left behind.
         if live {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -3220,8 +3220,8 @@ impl App {
 
     /// The mode legend, doubling as the on/off control for what is scanned.
     ///
-    /// Each protocol gets a menu of its modes; the colour swatch next to each
-    /// is the colour that mode's channels are drawn in. Returns true if the
+    /// Each protocol gets a menu of its modes; the color swatch next to each
+    /// is the color that mode's channels are drawn in. Returns true if the
     /// selection changed.
     fn modes_menu(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
@@ -3352,8 +3352,8 @@ impl App {
         let pad = ui.spacing().button_padding;
         let cross = 9.0; // side of the cross itself, inside its hit square
         let hit = cross + 5.0;
-        // The colour goes into the layout, not into the paint call: a galley
-        // laid out with a colour ignores the one passed when it is drawn.
+        // The color goes into the layout, not into the paint call: a galley
+        // laid out with a color ignores the one passed when it is drawn.
         let text_color = if selected { color } else { color.gamma_multiply(0.7) };
         let galley = ui.painter().layout_no_wrap(label.to_owned(), font, text_color);
         let size = egui::vec2(
@@ -3530,8 +3530,8 @@ impl App {
 
     /// The RX/TX marker on a log line: the tag set smaller than the body text
     /// and boxed in a thin outline, so it reads as a label on the line rather
-    /// than as the first word of what was said. Colour alone did not separate
-    /// them — a received line and its tag were the same mode colour.
+    /// than as the first word of what was said. Color alone did not separate
+    /// them — a received line and its tag were the same mode color.
     fn dir_badge(ui: &mut egui::Ui, tag: &str, color: Color32) {
         let body = egui::TextStyle::Monospace.resolve(ui.style());
         let font = FontId::new((body.size * 0.75).max(7.0), body.family.clone());
@@ -3819,9 +3819,9 @@ impl App {
                     for e in &q.log {
                         let (color, tag) = match e.dir {
                             Dir::Rx => (mode_text_color(dark, q.mode), Dir::Rx.tag()),
-                            // Our own text takes the theme's own strong colour:
+                            // Our own text takes the theme's own strong color:
                             // it is us talking, not a station with a mode
-                            // colour.
+                            // color.
                             Dir::Tx => (ui.visuals().strong_text_color(), Dir::Tx.tag()),
                         };
                         ui.horizontal_top(|ui| {
@@ -4019,7 +4019,7 @@ impl App {
     ///
     /// [`rig::Ptt`] cancels all of its schedule or none of it, so dropping one
     /// transmission's spans means dropping every span and re-scheduling the
-    /// ones still owed. Until this existed, nothing cancelled a key span at
+    /// ones still owed. Until this existed, nothing canceled a key span at
     /// all: an aborted message left its key-down behind it and the rig held a
     /// bare carrier for the length of a transmission that was no longer being
     /// made — which is worse on the air than the message would have been.
@@ -4090,7 +4090,7 @@ impl App {
         let [px_w, px_h] = size;
         // A waterfall gains one column at a time and drops one off the far end:
         // the picture is the same picture, moved. Redrawing it whole cost a
-        // logarithm and a colour-map lookup for every one of half a million
+        // logarithm and a color-map lookup for every one of half a million
         // pixels, 25 times a second, which was the interface's entire frame.
         //
         // So the image is kept and scrolled, and only the new columns drawn.
@@ -4983,7 +4983,7 @@ impl App {
                     // unsnapped thumb visibly changes shape as it slides; on
                     // the grid it only ever translates.
                     //
-                    // A copy, because quantising the clock itself is what the
+                    // A copy, because quantizing the clock itself is what the
                     // slider's own `fixed_decimals` did — and since the slider
                     // writes back every frame, at 1x the clock gained 0.017 s
                     // and lost all of it again to rounding. Playback stopped
@@ -5319,7 +5319,7 @@ impl App {
             } else {
                 (t_now * SAMPLE_RATE as f64 / hop).round() as i64
             };
-            // How far the waterfall has actually travelled. Live, that is not
+            // How far the waterfall has actually traveled. Live, that is not
             // `col_hi`: the spectrogram is capped, so once full its length
             // stops changing while the newest column keeps arriving and the
             // oldest keeps falling off. Scrolling has to follow the data, not
@@ -5529,7 +5529,7 @@ impl App {
                         // of the band. `quality` is the decoder's own
                         // confidence against its own protocol's threshold, so
                         // it is a ratio and stays one — this used to be
-                        // labelled SNR, which it never was.
+                        // labeled SNR, which it never was.
                         match (ch.snr_db, ch.best_snr_db) {
                             (Some(now), Some(best)) => {
                                 ui.label(format!("SNR {now:+.0} dB (best {best:+.0})"))
@@ -5661,7 +5661,7 @@ mod tests {
     }
 
     /// The split stays inside the window, and both panels keep some width —
-    /// even when the window is too narrow to honour both minimums.
+    /// even when the window is too narrow to honor both minimums.
     #[test]
     fn split_stays_usable_at_any_window_width() {
         for window in [1280.0f32, 640.0, 300.0, 200.0, 120.0] {
@@ -5673,7 +5673,7 @@ mod tests {
         }
     }
 
-    /// A comfortable window honours both minimums and the requested width.
+    /// A comfortable window honors both minimums and the requested width.
     #[test]
     fn split_is_respected_when_there_is_room() {
         assert_eq!(clamp_waterfall_w(1280.0, 35.0, 420.0), 420.0);
@@ -5775,7 +5775,7 @@ mod tests {
             let mut app = App::base((0.0, 4000.0));
             app.theme = Theme::Dark;
             app.apply(serde_json::from_str(&json).unwrap());
-            assert_eq!(app.theme, Theme::Auto, "{theme} should not have been honoured");
+            assert_eq!(app.theme, Theme::Auto, "{theme} should not have been honored");
             assert_eq!(app.text_px, 17.0, "{theme} took the other settings down with it");
         }
 
@@ -5818,7 +5818,7 @@ mod tests {
             let mut app = App::base((0.0, 4000.0));
             app.default_mode = ModeId::Olivia(ragchew::olivia::OL_8_250);
             app.apply(serde_json::from_str(&json).unwrap());
-            assert_eq!(app.default_mode, DEFAULT_QSO_MODE, "{name} should not have been honoured");
+            assert_eq!(app.default_mode, DEFAULT_QSO_MODE, "{name} should not have been honored");
             assert_eq!(app.text_px, 17.0, "{name} took the other settings with it");
         }
         // and a file from before the setting existed
@@ -5917,7 +5917,7 @@ mod tests {
     /// Lay the whole interface out, QSO panel and all, with no window and no
     /// GPU behind it.
     ///
-    /// egui is pure layout until something rasterises it, so this runs in CI
+    /// egui is pure layout until something rasterizes it, so this runs in CI
     /// where the app itself cannot. It is a smoke test, not a screenshot: what
     /// it catches is a panic, a bad rect, or a widget id clash in a panel that
     /// otherwise only gets exercised by someone sitting in front of it.
@@ -6129,8 +6129,8 @@ mod tests {
     /// Playback must advance at every speed, including the slowest.
     ///
     /// The slider is shown a copy of the clock for exactly this reason: it
-    /// writes its value back every frame, so anything that quantises what it
-    /// is given — `fixed_decimals`, a step — quantises the clock. At 1x the
+    /// writes its value back every frame, so anything that quantizes what it
+    /// is given — `fixed_decimals`, a step — quantizes the clock. At 1x the
     /// clock gained 0.017 s per frame and lost all of it again to rounding.
     /// The waterfall sat still and the app looked dead.
     #[test]
@@ -6235,7 +6235,7 @@ mod tests {
         let _ = app.waterfall_texture(&ctx, &spec, [w, h], col_hi, travel, span);
         let first = app.wf_img.as_ref().expect("an image").rgba.clone();
 
-        // Nothing has travelled: the picture is already right.
+        // Nothing has traveled: the picture is already right.
         let _ = app.waterfall_texture(&ctx, &spec, [w, h], col_hi, travel, span);
         assert_eq!(app.wf_img.as_ref().unwrap().rgba, first, "redrawn for no reason");
 
@@ -7008,7 +7008,7 @@ mod tests {
     /// Which settings get a track is the radio's business, not the interface's:
     /// a `rigctld` rig states its power and not its passband, an Elecraft the
     /// other way round. On screen that is one control with a track and its
-    /// neighbour without, which reads as a bug unless something says otherwise.
+    /// neighbor without, which reads as a bug unless something says otherwise.
     /// This text is the only thing that does, so it has to appear exactly when
     /// the slider does not.
     #[test]
@@ -7613,7 +7613,7 @@ mod tests {
         ));
 
         let began = std::time::Instant::now();
-        let (reading, size, colour) = loop {
+        let (reading, size, color) = loop {
             let out = lay_out(&mut app);
             let found = out.shapes.iter().find_map(|cs| match &cs.shape {
                 egui::Shape::Text(t) if t.galley.text().contains("14.074") => Some((
@@ -7631,7 +7631,7 @@ mod tests {
         };
         assert_eq!(reading, "014.074.000");
         assert!(size > app.text_px * 1.5, "drawn at {size}, no larger than the text at {}", app.text_px);
-        assert_eq!(colour, VFO_AMBER, "the dial is not amber");
+        assert_eq!(color, VFO_AMBER, "the dial is not amber");
     }
 
     /// A rig that does not report its frequency gets dashes, not a zero: a
@@ -7771,7 +7771,7 @@ mod tests {
     /// the hand that works a station already is.
     ///
     /// Drawn rather than asserted on the state, because the state being right
-    /// while the button stays grey is exactly the failure that matters: this is
+    /// while the button stays gray is exactly the failure that matters: this is
     /// the only thing on screen that says the station is transmitting.
     #[test]
     fn the_window_says_when_the_rig_is_keyed() {
@@ -7950,7 +7950,7 @@ mod tests {
         app
     }
 
-    /// The mark is painted, in the asset's colour, inside its own button.
+    /// The mark is painted, in the asset's color, inside its own button.
     ///
     /// Two strokes and nothing typed, so nothing else here would notice if it
     /// were drawn off the edge of the button, or not at all: the button would

@@ -72,7 +72,7 @@ pub const JS8_STATIONS: &[(f64, Submode, &[&str])] = &[
     (2000.0, submode::NORMAL, &["DE W2QRM ", "IN THE MUD ", "TU 73 "]),
 ];
 
-/// (centre Hz, mode, start time in seconds, text). Olivia stations transmit
+/// (center Hz, mode, start time in seconds, text). Olivia stations transmit
 /// continuously from `start` at whatever rate their mode manages, so the text
 /// simply runs on until it is finished.
 pub const OLIVIA_STATIONS: &[(f64, Olivia, f64, &str)] = &[
@@ -228,7 +228,7 @@ pub struct OliviaStation {
 /// one's bandwidth twice over, which is an ordinary sight on the air and the
 /// arrangement most likely to make a scanner drop the quieter of a pair. They
 /// are kept within a few dB of each other, because a signal 10 dB stronger
-/// really does bury its neighbour and that makes for a demonstration of physics
+/// really does bury its neighbor and that makes for a demonstration of physics
 /// rather than of decoding.
 ///
 /// **Mode against depth**: the levels are not equal, they are each mode's own
@@ -289,14 +289,14 @@ pub const WEAK_STATIONS: &[OliviaStation] = &[
 /// pairs, and every character of all five recovered.
 ///
 /// **Why nothing sits exactly on top of anything.** Two stations may share a
-/// patch of spectrum but not a centre frequency, and that is a constraint of
+/// patch of spectrum but not a center frequency, and that is a constraint of
 /// the channel tracker rather than of the decoder. `ChannelSet::add` matches a
 /// decode to a thread by protocol and frequency — not by mode — within the
 /// mode's own association tolerance, which for a kilohertz-wide Olivia signal
 /// is 250 Hz. Two Olivia stations closer than that become one thread with both
 /// texts woven into it, character by character. The decoder reads them both
 /// perfectly; there is simply nowhere to put the second one. An earlier
-/// arrangement here had the 8/500 dead centre of the 16/1000 and showed exactly
+/// arrangement here had the 8/500 dead center of the 16/1000 and showed exactly
 /// that: four threads, one of them gibberish.
 ///
 /// **What makes that possible** is that Olivia spreads a character over 64 chips
@@ -304,16 +304,16 @@ pub const WEAK_STATIONS: &[OliviaStation] = &[
 /// their errors together so much as failing to correlate with each other: the
 /// interferer's energy lands across the whole 64-chip window rather than in the
 /// one place the correlator is looking. It is the same coding gain the weak band
-/// spends on going deep, spent here on ignoring the neighbours.
+/// spends on going deep, spent here on ignoring the neighbors.
 ///
 /// All at one level, which is the condition to keep. A station 10 dB above its
-/// neighbour buries it, and a band showing that would be a demonstration of
+/// neighbor buries it, and a band showing that would be a demonstration of
 /// physics rather than of decoding — the weak band's note on the same point
 /// applies here twice over, because there is nothing else making it hard.
 ///
 /// Olivia 4/125 is deliberately absent, and it is the one mode that could not
 /// join. Its four tones sit on the same 31.25 Hz grid as a 16/500's sixteen, so
-/// a 16/500 demodulator centred nearby reads the same station through four of
+/// a 16/500 demodulator centered nearby reads the same station through four of
 /// its own tones and prints a second, garbled copy. `olivia::decode_all` does
 /// not arbitrate between modes on purpose — the correlation threshold is what
 /// stops one signal being reported twice, and it covers a narrow mode locking
@@ -472,7 +472,7 @@ impl Op {
     /// Straight from the power, because that is how it works. Both stations are
     /// heard over the same path and the path does not care which direction it
     /// is worked in, so a station running a tenth of another's power arrives
-    /// exactly 10 dB down — no other difference between the two is modelled
+    /// exactly 10 dB down — no other difference between the two is modeled
     /// here, and none is needed.
     pub fn snr_db(&self) -> f32 {
         SIGNALS_REF_SNR_DB + 10.0 * (self.watts / SIGNALS_REF_WATTS).log10()
@@ -499,7 +499,7 @@ impl Op {
 /// these modes, which state the level at which about *half* of single
 /// transmissions decode — JS8 Normal is quoted at −24 dB on that convention and
 /// reaches −15 on this one. A band that has to be watched rather than
-/// summarised needs the strict number: a station placed at the half-copy level
+/// summarized needs the strict number: a station placed at the half-copy level
 /// spends the demo in pieces.
 pub const SIGNALS_MODES: &[(ModeId, f64, f32)] = &[
     (ModeId::Psk(PSK31), 47.0, -5.0),
@@ -527,7 +527,7 @@ pub fn signals_floor_db(mode: ModeId) -> f32 {
 ///
 /// The overs are long, and open with the callsigns three times over, which is
 /// how PSK31 is really operated and is also insurance against the one thing
-/// this decoder cannot help. There is no frame to synchronise on, so the gate
+/// this decoder cannot help. There is no frame to synchronize on, so the gate
 /// will not believe in a station until it has been on the air for most of an
 /// 8.2-second analysis block, and an over carrying its only copy of the
 /// callsign in that opening could lose it — which is what the `--demo` band's
@@ -601,7 +601,7 @@ pub const SIGNALS_JS8_OVERS: &[(usize, &str)] = &[
 /// buys sixty per cent more speed, which is a better bargain than it sounds and
 /// the reason 32/1000 is the classic ragchew mode.
 ///
-/// **All three on one centre frequency**, which is both what operators do — you
+/// **All three on one center frequency**, which is both what operators do — you
 /// QSY the mode, not the dial — and what puts the whole exchange on one thread.
 /// `ChannelSet::add` groups decodes by protocol and frequency and *not* by mode,
 /// so the three modes arrive on the row they started on and the row's mode
@@ -895,10 +895,10 @@ mod tests {
         }
         bands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-        // Every pair, not just neighbouring ones. A narrow station sitting
+        // Every pair, not just neighboring ones. A narrow station sitting
         // inside a wide one is not adjacent to it in this list — the PSK31
         // station is separated from its Olivia host by the JS8 station — and
-        // comparing neighbours alone would quietly stop noticing exactly the
+        // comparing neighbors alone would quietly stop noticing exactly the
         // kind of overlap this band is built to contain.
         let collisions: Vec<String> = bands
             .iter()

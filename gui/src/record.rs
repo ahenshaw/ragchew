@@ -240,7 +240,7 @@ fn run(
         };
         for &s in &block {
             // Same scaling as `ragchew::wav::write`, so a recording and a file
-            // written by the library quantise identically.
+            // written by the library quantize identically.
             let v = (s.clamp(-1.0, 1.0) * 32767.0).round() as i16;
             if w.write_all(&v.to_le_bytes()).is_err() {
                 diag_warn!("record", "write failed after {n} samples; stopping");
@@ -352,7 +352,7 @@ mod tests {
         let (got, rate) = ragchew::wav::read(path.to_str().unwrap()).unwrap();
         assert_eq!(rate, 12_000);
         assert_eq!(got.len(), sent.len());
-        // 16-bit quantisation is the only difference allowed: rounding to the
+        // 16-bit quantization is the only difference allowed: rounding to the
         // grid, plus the 32767/32768 asymmetry between how the library writes
         // and how it reads. Two LSBs covers both and nothing else.
         let worst =

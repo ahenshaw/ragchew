@@ -6,10 +6,10 @@
 //! raised cosine twice that long, so consecutive symbols overlap by half. Two
 //! overlapping raised cosines sum to a constant, giving a steady envelope with
 //! no keying clicks. The phase steps by ±90° between symbols so that two
-//! neighbouring symbols on the *same* tone cannot cancel in their overlap.
+//! neighboring symbols on the *same* tone cannot cancel in their overlap.
 //!
 //! Symbol values are Gray-coded before choosing a tone, so mistaking a tone for
-//! its neighbour — by far the likeliest error — corrupts only one bit.
+//! its neighbor — by far the likeliest error — corrupts only one bit.
 //!
 //! # Receive
 //!
@@ -19,7 +19,7 @@
 //! bins at zero. Each symbol yields one soft value per bit ([`fec`]'s input);
 //! the FEC layer does the rest.
 //!
-//! Finding a signal means searching three things at once — centre frequency,
+//! Finding a signal means searching three things at once — center frequency,
 //! block timing, and mode — so [`decode_all_mode`] builds the tone grid for a
 //! whole band once, then slides a 64-symbol block over it at every plausible
 //! frequency and timing, keeping what correlates.
@@ -105,7 +105,7 @@ pub fn synthesize(symbols: &[u8], center_hz: f64, mode: Mode) -> Vec<f32> {
     out
 }
 
-/// Encode text into an Olivia transmission centred on `center_hz`.
+/// Encode text into an Olivia transmission centered on `center_hz`.
 ///
 /// The text is padded with idle characters to a whole number of FEC blocks.
 pub fn encode(text: &str, center_hz: f64, mode: Mode) -> Vec<f32> {
@@ -121,16 +121,16 @@ pub fn encode(text: &str, center_hz: f64, mode: Mode) -> Vec<f32> {
 /// Tone magnitudes over a band, on a grid of half-symbol time slots and
 /// half-tone-spacing frequency bins.
 ///
-/// One of these covers every candidate centre frequency on the bin grid at
+/// One of these covers every candidate center frequency on the bin grid at
 /// once: a signal whose lowest tone sits in bin `b` has its tones in bins `b`,
-/// `b+2`, `b+4`, …, so testing a different centre is just a different starting
+/// `b+2`, `b+4`, …, so testing a different center is just a different starting
 /// bin, not a new transform.
 struct ToneGrid {
     bin_lo: usize,
     n_bins: usize,
     n_slots: usize,
     /// Frequency the input was mixed down by before transforming, to reach
-    /// centres that fall between bins.
+    /// centers that fall between bins.
     delta_hz: f64,
     bin_hz: f64,
     mags: Vec<f32>,
@@ -170,7 +170,7 @@ impl ToneGrid {
     /// Per-bit soft values for a signal whose lowest tone is in bin `b0`,
     /// flattened as `[slot * bits_per_symbol + bit]` for [`fec::decode_block`].
     ///
-    /// Positive means the bit is more likely 0. Values are normalised by the
+    /// Positive means the bit is more likely 0. Values are normalized by the
     /// symbol's total energy, so a fading signal weights its strong symbols
     /// more heavily than its weak ones.
     fn soft_bits(&self, b0: usize, mode: Mode) -> Vec<f32> {
@@ -209,7 +209,7 @@ impl ToneGrid {
 pub struct DecodeResult {
     /// The mode it decoded as.
     pub mode: Mode,
-    /// Centre frequency (Hz).
+    /// Center frequency (Hz).
     pub hz: f64,
     /// Sample offset of the block's first symbol.
     pub offset: usize,
@@ -231,9 +231,9 @@ impl DecodeResult {
 
 /// Decode every Olivia block of one mode in `samples` within `hz_lo..hz_hi`.
 ///
-/// Three unknowns are searched at once. **Frequency**: candidate centres sit on
+/// Three unknowns are searched at once. **Frequency**: candidate centers sit on
 /// a half-tone-spacing grid across the whole band, plus a quarter-spacing offset
-/// pass, so any real centre is covered to within an eighth of a tone spacing.
+/// pass, so any real center is covered to within an eighth of a tone spacing.
 /// **Timing**: a block boundary can fall on any of the 128 half-symbol slots in
 /// a block. **Presence**: the Walsh correlation is itself the detector, since
 /// Olivia carries no sync pattern to look for.
@@ -257,9 +257,9 @@ pub fn decode_all_mode(samples: &[f32], hz_lo: f64, hz_hi: f64, mode: Mode) -> V
 
     let bin_hz = SAMPLE_RATE as f64 / len as f64; // = spacing / 2
     let tone_bins = 2 * (mode.tones as usize - 1);
-    // Lowest tone of the lowest centre we will try, and of the highest. A wide
+    // Lowest tone of the lowest center we will try, and of the highest. A wide
     // mode near the bottom of the band would want tones below 0 Hz; clamping
-    // rather than giving up just means its lowest centres are out of reach.
+    // rather than giving up just means its lowest centers are out of reach.
     let first_lo = hz_lo - mode.bandwidth as f64 / 2.0 + mode.spacing() / 2.0;
     let first_hi = hz_hi - mode.bandwidth as f64 / 2.0 + mode.spacing() / 2.0;
     let bin_first = (first_lo / bin_hz).floor().max(1.0) as usize;
@@ -272,7 +272,7 @@ pub fn decode_all_mode(samples: &[f32], hz_lo: f64, hz_hi: f64, mode: Mode) -> V
     let hop = mode.symbol_separ() / SLOTS_PER_SYMBOL;
     let mut hits: Vec<DecodeResult> = Vec::new();
 
-    // Two mixing offsets, half a bin apart: together they put any centre within
+    // Two mixing offsets, half a bin apart: together they put any center within
     // a quarter of a bin of a grid point.
     for delta in [0.0, bin_hz / 2.0] {
         let grid = ToneGrid::compute(samples, mode, bin_first, bin_hi, delta);
@@ -315,10 +315,10 @@ pub fn decode_all_mode(samples: &[f32], hz_lo: f64, hz_hi: f64, mode: Mode) -> V
                 for (i, &start) in starts.iter().enumerate() {
                     // A lone strong block in an otherwise quiet stretch is noise
                     // getting lucky; a real transmission is blocks on end.
-                    let neighbour_ok = [i.wrapping_sub(1), i + 1]
+                    let neighbor_ok = [i.wrapping_sub(1), i + 1]
                         .iter()
                         .any(|&j| snr.get(j).map_or(false, |&s| s >= threshold(mode)));
-                    if snr[i] < threshold(mode) || !neighbour_ok {
+                    if snr[i] < threshold(mode) || !neighbor_ok {
                         continue;
                     }
                     let block = fec::decode_block(&soft, start, SLOTS_PER_SYMBOL, mode);
@@ -338,7 +338,7 @@ pub fn decode_all_mode(samples: &[f32], hz_lo: f64, hz_hi: f64, mode: Mode) -> V
         }
     }
 
-    // Resolve the overlaps. One real transmission lights up neighbouring centre
+    // Resolve the overlaps. One real transmission lights up neighboring center
     // bins, both mixing passes and several near-miss timings, all claiming the
     // same moment — so take the blocks in order of confidence and drop any that
     // collide with one already taken. Blocks that merely share a frequency
@@ -420,11 +420,11 @@ mod tests {
         }
     }
 
-    /// Mistaking a tone for its neighbour — by far the likeliest error —
+    /// Mistaking a tone for its neighbor — by far the likeliest error —
     /// usually costs a single bit. That is the point of Gray coding.
     ///
     /// The reference maps a symbol *value* to a tone position rather than the
-    /// reverse, which leaves a quarter of neighbouring tone pairs costing more
+    /// reverse, which leaves a quarter of neighboring tone pairs costing more
     /// than one bit. We match it, because that is what is on the air.
     #[test]
     fn adjacent_tones_usually_differ_in_one_bit() {
@@ -432,7 +432,7 @@ mod tests {
         let cost: Vec<u32> = (0..n as u8).map(|t| (ungray(t) ^ ungray(t + 1)).count_ones()).collect();
         let single = cost.iter().filter(|&&c| c == 1).count();
         let mean = cost.iter().sum::<u32>() as f64 / n as f64;
-        assert!(single * 4 >= n * 3, "only {single}/{n} tone neighbours cost one bit");
+        assert!(single * 4 >= n * 3, "only {single}/{n} tone neighbors cost one bit");
         assert!(mean < 1.5, "mean cost of a tone slip is {mean} bits");
     }
 
@@ -520,7 +520,7 @@ mod tests {
                 res.len()
             );
             let hz = res[0].hz;
-            assert!((hz - 1200.0).abs() < mode.spacing(), "{}: centre {hz}", mode.name());
+            assert!((hz - 1200.0).abs() < mode.spacing(), "{}: center {hz}", mode.name());
         }
     }
 }

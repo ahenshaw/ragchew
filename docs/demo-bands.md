@@ -74,20 +74,20 @@ of the way into the second. Nothing here is hard to hear; it is hard to
 separate. What separates it is the same 64-chip Walsh coding the weak band
 spends on going deep: an interfering station's energy lands across the whole
 correlation window instead of in the one place the correlator is looking, so the
-neighbours largely fail to register rather than adding their errors together.
+neighbors largely fail to register rather than adding their errors together.
 
-Two stations may share a patch of spectrum but not a centre frequency, and that
+Two stations may share a patch of spectrum but not a center frequency, and that
 is a limit of the display rather than of the decoder. Threads are grouped by
 protocol and frequency, not by mode, so two Olivia stations closer than the
 wider one's association tolerance — 250 Hz for a kilohertz-wide signal — arrive
 on one row with both texts woven into it. The decoder reads them both perfectly;
 there is simply nowhere to put the second. An earlier version of this band had
-the 8/500 dead centre of the 16/1000 and showed exactly that: four threads, one
+the 8/500 dead center of the 16/1000 and showed exactly that: four threads, one
 of them gibberish.
 
 Olivia 4/125 is the one mode absent from it, and for an honest reason. Its four
 tones fall on the same 31.25 Hz grid as a 16/500's sixteen, so a 16/500
-demodulator centred nearby reads the same station through four of its own tones
+demodulator centered nearby reads the same station through four of its own tones
 and prints a second, garbled copy. The Olivia scan does not arbitrate between
 modes on purpose — real bands stack signals, and a scanner that assumes one
 signal per slice of spectrum drops the quieter of every such pair — so what
@@ -119,7 +119,7 @@ PSK31's typing speed.
 The Olivia thread is the one that moves. The two operators start on 8/250, agree
 to speed up twice, and finish on 32/1000 — 18, 23 then 29 words a minute against
 floors of −13, −12 and −11 dB, so two decibels of reach buys sixty per cent more
-speed. All three modes are sent on the same centre frequency, which is both what
+speed. All three modes are sent on the same center frequency, which is both what
 operators do (you QSY the mode, not the dial) and what keeps the exchange on one
 row: threads are grouped by protocol and frequency and not by mode, so the row's
 label simply follows the station up through the gears.
@@ -144,4 +144,4 @@ but 27 of a string built to suit its varicode. And the floor here is the level a
 which a *whole over* comes back character for character, every time, which is a
 stricter test than the half-of-all-transmissions convention the published figures
 use: JS8 Normal is quoted at −24 dB on that convention and reaches −15 on this
-one. A band that gets watched rather than summarised needs the strict number.
+one. A band that gets watched rather than summarized needs the strict number.

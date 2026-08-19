@@ -43,7 +43,7 @@ pub enum Message {
 impl Message {
     /// Render for a reader: what the station said, or a note that we cannot say.
     ///
-    /// The two compound frames are the ones we recognise but cannot yet parse,
+    /// The two compound frames are the ones we recognize but cannot yet parse,
     /// and what they render as matters, because this string is what reaches the
     /// conversation log, the traffic CSV and the interface. The reference — and
     /// this, until it was seen on the air — returns the frame type's own name,
@@ -630,7 +630,7 @@ mod tests {
         assert!(matches!(unpack(&last), Message::Dense(t) if t == "HELLO WORLD<>"));
     }
 
-    /// The frame types we recognise but cannot parse must not read as though a
+    /// The frame types we recognize but cannot parse must not read as though a
     /// station sent them.
     ///
     /// This string goes into the conversation log, the traffic CSV and the

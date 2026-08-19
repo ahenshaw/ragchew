@@ -3,7 +3,7 @@
 //! Generated so that it comes from the app's own palette — [`crate::colormap`],
 //! the same magma the waterfall is painted in — and cannot drift away from it.
 //! It costs a few milliseconds once at startup, against carrying a binary in
-//! the repository that nothing can check is still the right colour.
+//! the repository that nothing can check is still the right color.
 //!
 //! What it shows is what the app shows: four signal traces on a noise floor,
 //! frequency down and time across, so a station transmitting is a horizontal
@@ -26,7 +26,7 @@ const HALF: f32 = 0.0525;
 
 /// One signal trace: where it sits, how far it runs, and where in the colormap
 /// it is drawn from — so the icon carries the palette's range rather than one
-/// colour out of it.
+/// color out of it.
 struct Trace {
     y: f32,
     x0: f32,
@@ -179,7 +179,7 @@ mod tests {
         assert!(on > off * 3, "trace {on} is not brighter than the floor {off}");
 
         // And the brightest thing in the icon is the top of the colormap, which
-        // is where the palette is most recognisably this app's. Taken as the
+        // is where the palette is most recognizably this app's. Taken as the
         // brightest pixel rather than a chosen one, because the grain rides on
         // the traces too and no single sample is fully saturated.
         let hot = magma(1.0);

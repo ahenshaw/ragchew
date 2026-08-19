@@ -48,7 +48,7 @@ impl Protocol {
     pub const ALL: [Protocol; 3] = [Protocol::Js8, Protocol::Olivia, Protocol::Psk];
 }
 
-/// A specific mode of a specific protocol — everything needed to name, colour
+/// A specific mode of a specific protocol — everything needed to name, color
 /// and scan for one kind of signal.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ModeId {
@@ -115,8 +115,8 @@ impl ModeId {
     /// The time analogue of [`assoc_tol_hz`](Self::assoc_tol_hz), and it exists
     /// because a live scan re-reads overlapping windows: the same block of
     /// audio is decoded several times over and the repeats have to be
-    /// recognised. Too tight and text is doubled; too loose and a decode's
-    /// *neighbour* is mistaken for the decode itself and thrown away.
+    /// recognized. Too tight and text is doubled; too loose and a decode's
+    /// *neighbor* is mistaken for the decode itself and thrown away.
     ///
     /// Half a chunk suits a mode whose chunks all take the same time. It does
     /// not suit PSK, whose "chunk" is a character of *variable* length: the
@@ -158,7 +158,7 @@ impl ModeId {
     ///
     /// Olivia and PSK are given no margin on purpose. Their nominal bandwidth
     /// already holds their power, and widening a measurement band reaches into
-    /// the neighbours: Olivia 8/250 measured over 500 Hz with a station 200 Hz
+    /// the neighbors: Olivia 8/250 measured over 500 Hz with a station 200 Hz
     /// away reads 3 dB strong, counting that station as its own.
     pub fn power_bandwidth_hz(self) -> f64 {
         match self {
@@ -192,7 +192,7 @@ impl ModeId {
 #[derive(Clone, Debug)]
 pub struct Decode {
     pub mode: ModeId,
-    /// Centre frequency in Hz.
+    /// Center frequency in Hz.
     pub hz: f64,
     /// Start time in seconds from the beginning of the decoded samples.
     pub time_s: f64,
@@ -201,7 +201,7 @@ pub struct Decode {
     ///
     /// Each protocol measures an entirely different thing — JS8 the strength of
     /// its Costas sync, Olivia the peak of a Walsh correlation, PSK the
-    /// envelope line at the symbol rate — so this is normalised to make the
+    /// envelope line at the symbol rate — so this is normalized to make the
     /// numbers mean the same *kind* of thing, not to make them comparable.
     /// It says how sure the decoder is, not how loud the station is: for the
     /// latter see [`Decode::snr_db`], which is comparable across every mode
@@ -287,7 +287,7 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
                         let mode = ModeId::Js8(r.mode);
                         let message = js8::message::unpack(&r.a87);
                         // Only what a station said. JS8 has frame types this
-                        // decoder recognises but cannot parse — compound
+                        // decoder recognizes but cannot parse — compound
                         // callsigns, and the directed frames built on them —
                         // and what it knows about those is that somebody is on
                         // that frequency, not what they say. A note to that
@@ -318,7 +318,7 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
     }
 
     // Olivia modes are scanned together so one signal cannot be reported twice
-    // under two neighbouring modes.
+    // under two neighboring modes.
     let olivia_modes: Vec<olivia::Mode> = modes
         .iter()
         .filter_map(|m| match m {
@@ -378,7 +378,7 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
 ///
 /// Measured over the decode's own stretch of audio, or the second around it
 /// where that is shorter than the measurement needs — a PSK character being a
-/// fifth of a second. The window is centred on the decode when it has to grow,
+/// fifth of a second. The window is centered on the decode when it has to grow,
 /// so what is measured stays the signal that produced it.
 ///
 /// `None` at the edges of the buffer, where there is not enough audio either
@@ -480,7 +480,7 @@ mod tests {
     /// A frame the decoder cannot parse does not reach the interface as text.
     ///
     /// JS8 has compound-callsign frames and directed frames built on them, and
-    /// this decoder recognises both without being able to read either. What it
+    /// this decoder recognizes both without being able to read either. What it
     /// learns from one is that somebody is transmitting there — which the
     /// waterfall already shows — and not a word of what they said. Passing a
     /// note about it along as the decode's *text* put it on a row of the text

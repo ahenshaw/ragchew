@@ -48,28 +48,28 @@ across 500 Hz — as the worked example:
 
 That last row is the crux. Tones land **exactly two bins apart**, and a Hann
 window's spectral nulls fall on every other tone's bin, so each tone contributes
-zero leakage to its neighbours. That is the orthogonality the whole scheme rests
+zero leakage to its neighbors. That is the orthogonality the whole scheme rests
 on, and it is why the analysis window is the symbol *shape* rather than some
 independently chosen length.
 
 It also buys a large efficiency. A signal whose lowest tone sits in bin `b` has
-its tones at `b, b+2, b+4, …`, so **testing a different centre frequency is just
+its tones at `b, b+2, b+4, …`, so **testing a different center frequency is just
 a different starting index into the same FFT** — not a new transform. One grid
 per mode covers every candidate frequency in the band at once.
 
 A second grid, mixed down by half a bin, is computed alongside it. Together they
-put any real centre frequency within an eighth of a tone spacing of a grid
+put any real center frequency within an eighth of a tone spacing of a grid
 point.
 
 ## The search
 
-For each hypothesis — **every candidate centre frequency × every block timing**
+For each hypothesis — **every candidate center frequency × every block timing**
 (a block is 64 symbols, and timing is searched to half a symbol, so 128 phases)
 — attempt a Walsh decode:
 
 1. **Soft bits.** Per symbol, per bit position: sum ±(tone energy) across all
    tones, signed by whether that bit is set in the tone's symbol value after
-   un-Gray-coding, normalised by the symbol's total energy. Positive means the
+   un-Gray-coding, normalized by the symbol's total energy. Positive means the
    bit is more likely a 0.
 
 2. **De-interleave.** Chip `t` of character `f` rode in bit
@@ -108,7 +108,7 @@ Two further gates:
   not a single lucky one. Scoring the best *run* rather than the average also
   means a station transmitting for ten seconds of a two-minute recording still
   syncs.
-- **An isolated block is rejected.** A strong block with quiet neighbours is
+- **An isolated block is rejected.** A strong block with quiet neighbors is
   noise getting lucky; a real transmission is blocks on end.
 
 Calibration target: nothing invented from 45 seconds of noise across the whole

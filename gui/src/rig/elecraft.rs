@@ -326,7 +326,7 @@ mod tests {
     /// which agreed with itself and proved nothing.
     ///
     /// The pair is what makes it evidence. A receiving record alone cannot tell
-    /// the right column from a neighbouring zero; these two differ in exactly
+    /// the right column from a neighboring zero; these two differ in exactly
     /// one place outside the frequency, and it is the place this reads.
     #[test]
     fn the_if_record_says_whether_it_is_transmitting() {

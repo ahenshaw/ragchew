@@ -11,7 +11,7 @@
 //! Sections:
 //!   A. accuracy against level, per protocol, over `power_bandwidth_hz`
 //!   B. accuracy against carrier frequency, in case anything is grid-dependent
-//!   C. two stations at once: does a neighbour 200 Hz away move the answer?
+//!   C. two stations at once: does a neighbor 200 Hz away move the answer?
 //!   D. what a wrong bandwidth costs — the multiples are of the mode's
 //!      *nominal* bandwidth, so JS8's right answer is the x2 column
 //!   E. the noise floor on its own, which everything above rests on
@@ -223,19 +223,19 @@ fn main() {
         println!();
     }
 
-    // ---- C: a neighbour in the guard region ----
+    // ---- C: a neighbor in the guard region ----
     println!("\n== C. a second station 200 Hz away, both at -6 dB ==");
     println!("   the noise floor is a median over the guard region, so a");
-    println!("   neighbour in it should shift the answer very little. The x2");
+    println!("   neighbor in it should shift the answer very little. The x2");
     println!("   columns ask whether a band widened to catch JS8's skirts");
-    println!("   starts swallowing the neighbour instead.");
+    println!("   starts swallowing the neighbor instead.");
     println!(
         "{:<16}{:>10}{:>12}{:>9}{:>12}{:>14}{:>9}",
-        "mode", "alone", "+neighbour", "shift", "x2 alone", "x2 +neighbour", "shift"
+        "mode", "alone", "+neighbor", "shift", "x2 alone", "x2 +neighbor", "shift"
     );
     for name in ["PSK31", "Olivia 8/250", "JS8 Normal"] {
         let sig = signals(1500.0).into_iter().find(|s| s.name == name).expect("mode");
-        let neighbour = psk::encode(&"cq de n0isy ".repeat(20), 1700.0, psk::PSK31);
+        let neighbor = psk::encode(&"cq de n0isy ".repeat(20), 1700.0, psk::PSK31);
         let mut row = Vec::new();
         for mult in [1.0f64, 2.0] {
             let mut alone = Vec::new();
@@ -248,7 +248,7 @@ fn main() {
                         .expect("measurable")
                         .db,
                 );
-                let other = scale_for_snr(&neighbour, -6.0);
+                let other = scale_for_snr(&neighbor, -6.0);
                 for (i, s) in other.iter().enumerate() {
                     if from + i < audio.len() {
                         audio[from + i] += s;

@@ -106,7 +106,7 @@ fn invents_nothing_from_noise() {
 }
 
 /// Silence is not a signal either — with no energy at all there is nothing to
-/// normalise, and the decoder must not divide its way into a decode.
+/// normalize, and the decoder must not divide its way into a decode.
 #[test]
 fn invents_nothing_from_silence() {
     let audio = vec![0.0f32; 30 * RATE];

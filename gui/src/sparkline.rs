@@ -237,7 +237,7 @@ impl<'a> Snr<'a> {
         self
     }
 
-    /// Draw the trace in this colour — the mode's, where the caller has one, so
+    /// Draw the trace in this color — the mode's, where the caller has one, so
     /// the plot is tied to the signal it describes as everything else is.
     pub fn color(mut self, c: Color32) -> Snr<'a> {
         self.color = Some(c);

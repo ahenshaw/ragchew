@@ -413,7 +413,7 @@ mod tests {
 
     /// The stamp has to be right, because every conclusion drawn from a log is
     /// drawn from when things happened. Checked against dates whose weekday and
-    /// leap-year behaviour are known independently.
+    /// leap-year behavior are known independently.
     #[test]
     fn utc_stamps_are_correct() {
         assert_eq!(stamp_iso(0.0), "1970-01-01T00:00:00.000Z");

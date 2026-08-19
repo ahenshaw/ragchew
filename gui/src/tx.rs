@@ -816,7 +816,7 @@ mod tests {
                 let claimed = delivered_chars(text, mode, secs);
 
                 // A narrow search band: a wide one lets the scan report the
-                // same signal at more than one candidate centre, and the
+                // same signal at more than one candidate center, and the
                 // concatenation would not be the message.
                 let got: String =
                     ragchew::protocol::decode_all(&audio[..cut], hz - 200.0, hz + 200.0, &[mode])
@@ -831,7 +831,7 @@ mod tests {
                 // A receiver that copied *nothing* is passed over rather than
                 // failed. Below about two blocks this decoder cannot find the
                 // signal at all — it is scanning a band for a carrier, not
-                // tracking one it is already synchronised to — and that is a
+                // tracking one it is already synchronized to — and that is a
                 // statement about acquisition, not about what was radiated. The
                 // test keeps its teeth everywhere copying succeeded, which is
                 // where the block-length error was caught.
@@ -1036,7 +1036,7 @@ mod tests {
         assert!(drop_pending(&mut q, &[1], now).is_empty(), "took back a burst already going");
         assert_eq!(q.len(), 3);
 
-        // A queued one is, and its neighbours are left alone.
+        // A queued one is, and its neighbors are left alone.
         assert_eq!(drop_pending(&mut q, &[2], now), vec![2]);
         assert_eq!(q.iter().map(|b| b.id).collect::<Vec<_>>(), vec![1, 3]);
 

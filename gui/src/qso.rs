@@ -1600,7 +1600,7 @@ mod tests {
     ///
     /// The log line is the half that is easy to forget. The log is written when
     /// a message is *queued* — a cycle or more before a JS8 frame leaves — so a
-    /// transmission cancelled in that window had already been recorded as sent.
+    /// transmission canceled in that window had already been recorded as sent.
     /// A log that keeps it is a log that lies about what went on the air, which
     /// is the one thing a log may not do.
     #[test]

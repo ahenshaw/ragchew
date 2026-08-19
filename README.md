@@ -10,7 +10,7 @@ with the signal it came from — whatever mode that signal happens to be using.
 Three protocol families are decoded side by side: **JS8** in all four submodes,
 **Olivia** MFSK at any `tones/bandwidth` pair, and **PSK31/PSK63**. You do not
 tell it which one to expect. It scans for all of them at once, groups what it
-finds into threads by protocol and frequency, and colours each thread by mode,
+finds into threads by protocol and frequency, and colors each thread by mode,
 so a band with a JS8 net at 700 Hz, an Olivia QSO at 1800 and somebody calling
 CQ on PSK31 in between reads as three conversations rather than one pile of
 text.
@@ -140,7 +140,7 @@ node the link was just attached to.
 ### What it is scanning for
 
 On the right of the toolbar, one menu per protocol, each listing its modes with
-the colour that mode's threads are drawn in. The count on the menu (`Olivia
+the color that mode's threads are drawn in. The count on the menu (`Olivia
 4/6`) is how many of them are on.
 
 This is not only a legend. Every enabled mode costs scan time — the Olivia
@@ -186,7 +186,7 @@ program's job.
 ## Working a station
 
 Click a station's text and it opens as a **QSO** in the panel on the left, one
-tab per conversation, labelled with the other operator's call as soon as the
+tab per conversation, labeled with the other operator's call as soon as the
 text says what it is.
 
 ![A QSO tab: fields, log, and the reply being composed](docs/images/qso.png)
@@ -234,7 +234,7 @@ readout, a click of the wheel is a hundred hertz.
 Click the readout and it takes the keyboard: **←→** move between digits, **↑↓**
 step the one you are on, and typing a digit fills it and moves along, so a whole
 frequency goes in as eight keystrokes from the left. A typed frequency shows in
-a different colour until **Enter** sends it — entered a digit at a time it
+a different color until **Enter** sends it — entered a digit at a time it
 passes through others on the way, and any of those is somewhere the radio would
 actually go, in another band, on somebody else's QSO — while **Esc**, or
 clicking away, puts back whatever the rig says. Steps made with the wheel or the
@@ -390,7 +390,7 @@ being restarted.
 And it is fast enough to be worth doing that way: 20–60× real-time for an
 Olivia band scan, ~35× for a full JS8 decode, single core, in release. There is
 one catch, and it bites everyone once — a *debug* build decodes far too slowly
-to keep up with live audio, so both crates are built optimised even in `dev`.
+to keep up with live audio, so both crates are built optimized even in `dev`.
 See [performance](docs/internals.md#performance) for the measurements that
 forced that.
 
@@ -433,5 +433,5 @@ guard hardest is that a band of pure noise produces **nothing at all**. See
 GPL-3.0-or-later. JS8/JS8Call and fldigi are GPL, as is Pawel Jalocha's MFSK
 reference vendored in `tools/ref/olivia/jalocha/`; the embedded
 `src/js8/jsc_words.txt` word list originates from JS8Call. The JS8 reference in
-`tools/ref/js8/` is Robert Morris's `fate`, which is **MIT** — its licence text
+`tools/ref/js8/` is Robert Morris's `fate`, which is **MIT** — its license text
 travels with it as `LICENSE.fate`, as MIT requires.

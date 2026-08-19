@@ -28,13 +28,13 @@ rustfft = "6"
 opt-level = 3
 
 # A debug build decodes far too slowly to keep up with live audio: one Olivia
-# pass over its 24-second window across six modes measured 41 s unoptimised
-# against 3.5 s optimised, and the decode threads then never sleep. Since
+# pass over its 24-second window across six modes measured 41 s unoptimized
+# against 3.5 s optimized, and the decode threads then never sleep. Since
 # `cargo run` gives a debug build, that is what most people meet first.
 #
 # The waterfall is the same story: rendering one 45-second view measured 177 ms
-# a frame unoptimised, so a debug build ran the interface at six frames a
-# second before anything had gone wrong. Both crates are therefore optimised in
+# a frame unoptimized, so a debug build ran the interface at six frames a
+# second before anything had gone wrong. Both crates are therefore optimized in
 # dev too, at the cost of stepping through them in a debugger — `cargo build`
 # without this is still there when that is what is wanted.
 [profile.dev.package."*"]

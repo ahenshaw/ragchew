@@ -76,10 +76,10 @@ impl Mode {
         self.chars_per_block() as f64 / self.block_secs()
     }
 
-    /// Frequency of tone `k` (0-based, low to high) for a signal centred on
+    /// Frequency of tone `k` (0-based, low to high) for a signal centered on
     /// `center_hz`.
     ///
-    /// Tones are laid out symmetrically about the centre: the block of tones
+    /// Tones are laid out symmetrically about the center: the block of tones
     /// spans `center ± bandwidth/2`, with each tone half a spacing in from the
     /// edge. (fldigi's own layout sits a quarter of a tone spacing higher, an
     /// artefact of rounding the first carrier to an FFT bin; that is well
@@ -168,7 +168,7 @@ mod tests {
         let m = OL_32_1000;
         let lo = m.tone_hz(1500.0, 0);
         let hi = m.tone_hz(1500.0, m.tones as usize - 1);
-        assert_eq!(lo + hi, 3000.0, "tone block should be centred");
+        assert_eq!(lo + hi, 3000.0, "tone block should be centered");
         assert!((hi - lo - (m.bandwidth as f64 - m.spacing())).abs() < 1e-9);
     }
 

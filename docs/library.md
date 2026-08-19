@@ -79,6 +79,6 @@ cargo run -p ragchew-gui --no-default-features --release --example render_png --
 
 `scene_png` takes an optional playback time and demo band name
 (`scene.png 45 weak`). It draws the layout — rows, leader lines, waterfall — but
-not the text itself: there is no font rasteriser in that build, so a row of text
+not the text itself: there is no font rasterizer in that build, so a row of text
 comes out as a bar the width the text would have been. It is a layout check, not
 a screenshot.

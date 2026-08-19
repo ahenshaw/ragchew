@@ -379,7 +379,7 @@ impl Continuous {
     ///
     /// Windows overlap by design and a PSK station is read by two things at its
     /// handover, so the same character arrives more than once and must be
-    /// recognised.
+    /// recognized.
     ///
     /// The rule differs by protocol, and PSK is the one that needs care. Half a
     /// character either side is right for an Olivia block, but a PSK character
@@ -680,7 +680,7 @@ mod tests {
     /// instead of a block at a time.
     ///
     /// A callback is 512 samples, 43 ms — a seventh of a PSK31 character. If
-    /// the old behaviour were still in place, every character would land in one
+    /// the old behavior were still in place, every character would land in one
     /// of the handful of callbacks an acquisition falls in, and the busiest
     /// callback would hold fifteen of them.
     #[test]

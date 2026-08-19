@@ -20,7 +20,7 @@
 //! **Stage one — the envelope line.** Every phase reversal drives the amplitude
 //! through zero, so a narrowband slice of a real signal has a spectral line in
 //! its *envelope* at exactly the symbol rate. Noise has none. [`screen`] scores
-//! that line against the median of its neighbours.
+//! that line against the median of its neighbors.
 //!
 //! **Stage two — phase concentration.** A line at 31.25 Hz only says "amplitude
 //! modulated at 31.25 baud", which several Olivia modes also are — they run at
@@ -196,7 +196,7 @@ pub fn synthesize(bits: &[u8], center_hz: f64, mode: Mode) -> Vec<f32> {
         .collect();
 
     // A raised cosine two symbols long at one-symbol spacing: like-signed
-    // neighbours sum to a constant, opposite-signed ones cross through zero.
+    // neighbors sum to a constant, opposite-signed ones cross through zero.
     let shape = dsp::hann(2 * sps);
 
     let mut base = vec![0.0f64; syms.len() * sps + 2 * sps];
@@ -210,7 +210,7 @@ pub fn synthesize(bits: &[u8], center_hz: f64, mode: Mode) -> Vec<f32> {
     base.iter().enumerate().map(|(n, &x)| (x * (w * n as f64).cos()) as f32).collect()
 }
 
-/// Encode text into a BPSK31 transmission centred on `center_hz`, with idle
+/// Encode text into a BPSK31 transmission centered on `center_hz`, with idle
 /// either side of it.
 pub fn encode(text: &str, center_hz: f64, mode: Mode) -> Vec<f32> {
     let mut bits = vec![0u8; IDLE_SYMBOLS];
@@ -298,7 +298,7 @@ fn baseband(spec: &[Complex32], n: usize, hz: f64, out_len: usize) -> Vec<Comple
         if src < 0 || src as usize >= spec.len() {
             continue;
         }
-        // The slice's centre bin becomes DC; everything below it wraps to the
+        // The slice's center bin becomes DC; everything below it wraps to the
         // top of the buffer, which is where negative frequencies belong.
         let dst = if i >= SLICE_BINS / 2 {
             i - SLICE_BINS / 2
@@ -321,7 +321,7 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 /// Stage one: the envelope's symbol-rate line against the median of its
-/// neighbours. 1.0 is "no line at all"; see [`NOISE_FLOOR`] for what noise
+/// neighbors. 1.0 is "no line at all"; see [`NOISE_FLOOR`] for what noise
 /// scores.
 fn envelope_score(bb: &[Complex32]) -> f64 {
     let k = bb.len();
@@ -428,7 +428,7 @@ impl Block {
             // still most of a slice away from it.
             let (lo, hi) = (bin(f - 1.8 * baud), bin(f + 1.8 * baud));
             // The floor is measured clear of that, or the signal's own skirts
-            // would raise the level its centre is weighed against.
+            // would raise the level its center is weighed against.
             let (wlo, whi) = (bin(f - 6.0 * baud), bin(f + 6.0 * baud));
             if hi >= self.spec.len() || lo >= hi {
                 break;
@@ -463,7 +463,7 @@ impl Block {
     /// hand the bits to varicode.
     ///
     /// Timing is the offset, of the sixteen the interpolated baseband allows,
-    /// that maximises phase concentration — which inter-symbol interference
+    /// that maximizes phase concentration — which inter-symbol interference
     /// spoils, so it peaks where the symbol clock actually is.
     fn demod(&self, hz: f64) -> Demod {
         let bb = baseband(&self.spec, self.n, hz, DEMOD_LEN);
@@ -493,7 +493,7 @@ impl Block {
         // and begins wherever it begins. The cost of making it earn the first
         // dozen symbols is nothing, because blocks overlap by half and a
         // character suppressed at one block's edge sits in the middle of its
-        // neighbour.
+        // neighbor.
         let b = (1.0 / CARRIER_TC) as f32;
         let mut running = Complex32::new(0.0, 0.0);
         let mut carrier: Vec<f32> = Vec::with_capacity(syms.len());
@@ -603,7 +603,7 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[Mode]) -> Ve
             }
 
             // The grid is finer than the screen's tolerance, so one signal can
-            // survive at two neighbouring candidates. After refinement both
+            // survive at two neighboring candidates. After refinement both
             // land on the same carrier: keep the stronger.
             kept.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             let mut stations: Vec<(f64, f64, f64)> = Vec::new();

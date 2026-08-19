@@ -1564,7 +1564,7 @@ mod tests {
         assert!(tx.describe().contains("VOX"), "{}", tx.describe());
     }
 
-    /// The default is the behaviour this app had before it could key anything.
+    /// The default is the behavior this app had before it could key anything.
     #[test]
     fn nothing_is_keyed_until_something_is_configured() {
         assert_eq!(Keying::default(), Keying::None);
@@ -1753,7 +1753,7 @@ mod tests {
         ptt.key(false);
 
         thread::sleep(Duration::from_millis(300));
-        assert!(!bench.keyings().contains(&true), "the cancelled span transmitted anyway");
+        assert!(!bench.keyings().contains(&true), "the canceled span transmitted anyway");
     }
 
     /// A span whose time has passed is dropped, not fired late. Keying for a

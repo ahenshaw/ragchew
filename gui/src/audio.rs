@@ -45,7 +45,7 @@ pub struct AudioBuf {
     cap: usize,
     started: bool,
     /// When the last block of samples arrived, so a block that arrives late
-    /// carrying no more audio than usual can be recognised as a gap.
+    /// carrying no more audio than usual can be recognized as a gap.
     last_append: f64,
     /// Wall clock the capture has lost to stalls and never made up, total, and
     /// how much of it the heartbeat has yet to report. See [`AudioBuf::append`].
@@ -1760,7 +1760,7 @@ mod tests {
         check_stall(&h.continuous, "continuous (Olivia/PSK)", CONT_STALL_S);
 
         // But one that was asked for and is not running is still a fault, and
-        // the counters behind that judgement are the ones the heartbeat reads.
+        // the counters behind that judgment are the ones the heartbeat reads.
         h.continuous.wanted.store(true, Ordering::Relaxed);
         assert!(
             h.continuous.wanted.load(Ordering::Relaxed)
@@ -1956,7 +1956,7 @@ mod tests {
     }
 
     /// Thirty advertised PCMs come down to the handful a person would
-    /// recognise — the same set another recorder on this machine offers.
+    /// recognize — the same set another recorder on this machine offers.
     #[test]
     fn winnowing_matches_what_a_person_would_expect() {
         let kept = winnow(real_alsa_listing());

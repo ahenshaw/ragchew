@@ -81,7 +81,7 @@ pub fn entry(exec: &Path) -> String {
 /// Write one icon, at one size.
 ///
 /// A minimal PNG writer rather than a dependency: this needs exactly one
-/// colour type at one bit depth, written once at install time, and the crate
+/// color type at one bit depth, written once at install time, and the crate
 /// that would otherwise do it is already only a dev-dependency.
 fn write_png(path: &Path, size: usize) -> std::io::Result<()> {
     let rgba = crate::icon::rgba(size);

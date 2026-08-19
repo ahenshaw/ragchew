@@ -111,7 +111,7 @@ fn once(source: &Source) -> Result<String, String> {
 /// ports to join.
 ///
 /// Separated from the doing of it so the decision can be tested against a real
-/// graph, which is the half with judgement in it — the other half is running
+/// graph, which is the half with judgment in it — the other half is running
 /// `pw-link` twice.
 #[derive(Debug, PartialEq)]
 struct Plan {
@@ -431,7 +431,7 @@ mod tests {
     /// These are the exact `pw-link` calls that were run by hand against the
     /// live daemon this fixture was taken from — join Firefox's stereo pair to
     /// the capture's, drop the two microphone links — so the test pins the
-    /// behaviour to something that was watched working rather than to what the
+    /// behavior to something that was watched working rather than to what the
     /// code happens to do.
     #[test]
     fn routing_a_browser_in_is_two_links_in_and_two_out() {

@@ -76,7 +76,7 @@ pub fn decode_all(samples: &[f32], hz_lo: f64, hz_hi: f64, modes: &[ModeId]) -> 
 This is deliberately protocol-blind: a JS8 frame and an Olivia FEC block arrive
 as the same kind of thing, and the UI never branches on which produced what. It
 only asks the `ModeId` for what it needs to draw — bandwidth, association
-tolerance, how long a chunk took on the air, what colour to use.
+tolerance, how long a chunk took on the air, what color to use.
 
 A full 4 kHz JS8 cycle decodes in ~0.7 s (see `README.md` §Performance), so
 per-cycle live decoding has ample headroom. Olivia costs roughly a second per

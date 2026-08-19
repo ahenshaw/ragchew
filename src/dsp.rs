@@ -32,7 +32,7 @@ pub fn plan(n: usize) -> Arc<dyn Fft<f32>> {
 
 /// A cached inverse FFT plan of length `n` (per thread).
 ///
-/// Unnormalised, as rustfft leaves it: everything built on this reads ratios,
+/// Unnormalized, as rustfft leaves it: everything built on this reads ratios,
 /// not absolute levels. The PSK gate uses it to cut a narrow slice out of a
 /// band-wide spectrum and turn it back into a decimated complex baseband.
 pub fn plan_inverse(n: usize) -> Arc<dyn Fft<f32>> {
@@ -92,7 +92,7 @@ pub const SNR_REF_BW_HZ: f64 = 2500.0;
 /// usually not empty. The quantile survives having that fraction of it full of
 /// other people's signals: at the median, a station whose guard is 63% occupied
 /// — Olivia 8/500 in this repository's weak-signal band, which has four
-/// neighbours inside its skirts — reads 1.7 dB weak, because the middle of the
+/// neighbors inside its skirts — reads 1.7 dB weak, because the middle of the
 /// spread is a signal and not the noise.
 ///
 /// Lower would tolerate a busier band still, at the cost of leaning on the
@@ -132,9 +132,9 @@ pub struct Snr {
 ///   bandwidth reads 2.2 dB weak. That figure is the mode's, not this crate's:
 ///   an off-air recording and `js8::modem::synthesize_sm` agree on it to within
 ///   4%. Twice the nominal band holds 99% and measures true.
-/// - **Too wide** reaches past the noise and into the neighbours. Widening
+/// - **Too wide** reaches past the noise and into the neighbors. Widening
 ///   Olivia 8/250 to 500 Hz with a station 200 Hz away reads **3 dB strong**,
-///   because the neighbour's power lands inside the band and counts as signal.
+///   because the neighbor's power lands inside the band and counts as signal.
 ///
 /// So there is no safe blanket margin, and callers should pass what the mode
 /// actually occupies. `examples/snr.rs` measures all of the above.
@@ -142,7 +142,7 @@ pub struct Snr {
 /// The noise is taken from the spectrum on either side of the signal rather
 /// than from a quiet moment, so it needs neither a squelch nor a gap in the
 /// traffic — and it is a low *quantile* of that spectrum
-/// ([`NOISE_QUANTILE`]), so neighbouring stations in the guard region move it
+/// ([`NOISE_QUANTILE`]), so neighboring stations in the guard region move it
 /// very little. A quantile of a periodogram sits below its mean, which is
 /// corrected for below; leave the correction out and every signal reads
 /// several dB strong.
@@ -156,9 +156,9 @@ pub struct Snr {
 /// strong signal is not the same as the band's quiet-time floor: on
 /// `tests/vectors/john_3_16.wav` a frame measures +30.4 dB here against
 /// +36.7 dB taken from a silent second of the same recording, the difference
-/// being the receiver's own images and leakage lifting the neighbourhood while
+/// being the receiver's own images and leakage lifting the neighborhood while
 /// the transmission is on. Reading it conservatively is the intended
-/// behaviour — what limits copy is the floor a signal actually competes with —
+/// behavior — what limits copy is the floor a signal actually competes with —
 /// but it is a floor, not a vacuum.
 ///
 /// `None` if there is too little audio to transform, or if the band asked for
@@ -275,7 +275,7 @@ pub fn hann(n: usize) -> Vec<f32> {
 }
 
 /// A Hann-windowed sinc low-pass of `n` taps, cutting off at `fc` in cycles
-/// per sample (so `0.5` is Nyquist), normalised to unity gain at DC.
+/// per sample (so `0.5` is Nyquist), normalized to unity gain at DC.
 ///
 /// The transition band is roughly `4/n` wide in the same units, which is what
 /// sets the tap count when a decimator has to put everything above the new
@@ -320,7 +320,7 @@ mod tests {
     fn the_low_pass_passes_and_stops() {
         let (n, fc) = (289, 4.6 * 31.25 / 12_000.0); // 144 Hz at 12 kHz
         let h = low_pass(n, fc);
-        // Response at a normalised frequency, in dB.
+        // Response at a normalized frequency, in dB.
         let at = |f: f64| {
             let mut re = 0.0f64;
             let mut im = 0.0f64;

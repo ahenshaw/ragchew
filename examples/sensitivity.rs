@@ -78,7 +78,7 @@ const TEXT_LC: &str = "cq cq de w1aw w1aw k ";
 /// What a station sends in this mode, and how many times over.
 ///
 /// PSK31 repeats because there is no other way to measure it. It has no frame
-/// to synchronise on, so the detector will not believe in a station until it
+/// to synchronize on, so the detector will not believe in a station until it
 /// has been on the air for most of an 8.2-second analysis block — the opening
 /// of every over is lost at any SNR whatever, exactly as it is when you tune
 /// across a real one. Asked for a whole over it would report "never" at +6 dB,

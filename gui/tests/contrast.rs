@@ -32,7 +32,7 @@ fn exact(spec: &Spectrogram) -> (f32, f32) {
 fn sampled_percentiles_agree_and_are_cheap() {
     let hop = WINDOW / 4;
     // Real traffic, not a synthetic ramp: the demo band is a whole 4 kHz of
-    // stations plus noise, which is the distribution this has to summarise.
+    // stations plus noise, which is the distribution this has to summarize.
     let samples = ragchew_gui::demo::synth();
     let mut spec = Spectrogram::compute(&samples, 0.0, 4000.0, hop);
     // Grow it to the live cap by repeating the band.

@@ -131,7 +131,7 @@ pub struct Channel {
     /// `None` until a decode arrives that could be measured.
     pub snr_db: Option<f32>,
     /// Best SNR seen on this channel, for the same reason `best_quality` is
-    /// kept: a station fading in and out is better summarised by its peak than
+    /// kept: a station fading in and out is better summarized by its peak than
     /// by wherever it happened to be on the last block.
     pub best_snr_db: Option<f32>,
     /// Recent (time_s, snr_db) samples, for drawing how the station has been

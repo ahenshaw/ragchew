@@ -2,7 +2,7 @@
 //! RGBA image. No windowing here, so it's testable and can be dumped to PNG.
 //!
 //! Orientation (per the design spec): **frequency is vertical, high at the top;
-//! time is horizontal, newest at the LEFT edge and ageing to the right.**
+//! time is horizontal, newest at the LEFT edge and aging to the right.**
 
 use ragchew::Spectrogram;
 
@@ -71,7 +71,7 @@ const BG: [u8; 3] = [8, 10, 14];
 ///
 /// Estimated from a sample, not from every value. Two percentiles are a summary
 /// of a distribution, and a distribution of eight million values is no better
-/// summarised than one of a hundred thousand. Live capture recomputes this every
+/// summarized than one of a hundred thousand. Live capture recomputes this every
 /// second against a spectrogram that reaches 12,000 columns — 7.7 M values,
 /// 31 MB — and copying and sorting all of it cost 229 ms in release and 3.3 s in
 /// debug, on the UI thread, every time. That is the whole frame budget and more:
@@ -103,7 +103,7 @@ pub fn percentiles(spec: &Spectrogram) -> (f32, f32) {
 
 /// How many values the contrast estimate settles for. A hundred thousand
 /// samples put the 99.5th percentile inside a thousandth of the value the whole
-/// spectrogram gives, which is far below anything the eye can see in a colour
+/// spectrogram gives, which is far below anything the eye can see in a color
 /// ramp.
 const SAMPLE_TARGET: usize = 100_000;
 
@@ -128,7 +128,7 @@ fn column_step(cols: usize, bins: usize) -> usize {
 ///
 /// Time runs newest-at-the-left, so new data enters there and everything else
 /// moves right: the image is a memmove per row plus a strip of new pixels,
-/// where a full render is a logarithm and a colour-map lookup for every pixel
+/// where a full render is a logarithm and a color-map lookup for every pixel
 /// of it. At a 45-second span in a 700-pixel panel that is 800 pixels of work
 /// instead of 560,000.
 ///
@@ -228,7 +228,7 @@ pub fn render(spec: &Spectrogram, vp: &Viewport, width: usize, height: usize) ->
 
 /// Render a scrolling time window ending at column `col_hi` (exclusive, the
 /// newest column = "now") and `span_cols` wide. Newest is at the **left** edge,
-/// ageing right. Columns outside `[0, n_cols)` render as background, so the view
+/// aging right. Columns outside `[0, n_cols)` render as background, so the view
 /// can sit before the start or after the end. `norm` fixes the contrast bounds
 /// (see [`percentiles`]); `None` stretches to the window's own data.
 pub fn render_window(

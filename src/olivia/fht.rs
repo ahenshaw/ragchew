@@ -1,7 +1,7 @@
 //! Fast Hadamard (Walsh) transform, the core of Olivia's forward error
 //! correction.
 //!
-//! Both directions are the unnormalised butterfly pair from Pawel Jalocha's
+//! Both directions are the unnormalized butterfly pair from Pawel Jalocha's
 //! reference (`pj_fht.h`); `FHT(IFHT(x)) == len * x`. The sign convention
 //! matters — it decides which Walsh function a character maps to — so these are
 //! transcribed exactly rather than replaced with a "standard" Hadamard
@@ -56,7 +56,7 @@ mod tests {
     use super::*;
 
     /// `FHT ∘ IFHT` scales by the transform length, as the reference's
-    /// unnormalised pair does.
+    /// unnormalized pair does.
     #[test]
     fn round_trip_scales_by_len() {
         for len in [2usize, 4, 8, 64] {

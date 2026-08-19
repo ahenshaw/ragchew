@@ -29,5 +29,5 @@ somewhere a station would actually be.
 | `weak.png` | `ragchew --weak` | run to the end of the band, then crop to the panorama: text on six rows against a waterfall carrying one obvious PSK31 carrier and almost nothing else an eye would pick out. |
 
 The headless renderer (`scene_png`) is not an alternative for any of these — it
-draws the layout but has no font rasteriser, so every row of text comes out as a
+draws the layout but has no font rasterizer, so every row of text comes out as a
 bar. It is a layout check.

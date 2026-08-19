@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(bench.heard(), "", "asked the radio about limits it was never going to give");
     }
 
-    /// The link's own behaviour, through this driver: a radio that volunteers
+    /// The link's own behavior, through this driver: a radio that volunteers
     /// records does not put the answers out of step.
     ///
     /// The same guarantee [`crate::rig::cat`] gives the Elecraft, checked here

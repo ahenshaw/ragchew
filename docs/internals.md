@@ -98,7 +98,7 @@ The GUI (`ragchew-gui`) keeps its pure rendering, layout and conversation pieces
 windowing dependency, so they are unit-tested and validated by rendering to PNG
 without a display. `audio` and `tx` are the sound card either way round, and the
 whole interface lays itself out headlessly in a test — egui is pure layout until
-something rasterises it — so the panels are exercised in CI even though the app
+something rasterizes it — so the panels are exercised in CI even though the app
 cannot run there.
 
 Widget styling comes from [`egui-elegance`](https://crates.io/crates/egui-elegance):
@@ -125,16 +125,16 @@ straight from it, filtering with a cheap hard-decision parity check before
 running belief-propagation. For reference, Robert Morris's `fate` decoder (FFTW
 + OSD) on the same file runs ~1.9× real-time.
 
-The Olivia scan builds two tone grids per mode (a half-bin apart, so any centre
+The Olivia scan builds two tone grids per mode (a half-bin apart, so any center
 frequency is covered) and searches them exhaustively; a quiet band is at the
 fast end of that range and a busy one at the slow end, since every timing that
 looks plausible has to be decoded properly to be ruled out. Cost scales with the
 number of modes enabled, which is what the GUI's mode menus are really for.
 
 A debug build is not usable for live audio: one Olivia pass over its 24-second
-window across six modes measured 41 s unoptimised against 3.5 s optimised, and
+window across six modes measured 41 s unoptimized against 3.5 s optimized, and
 rendering one 45-second waterfall view measured 177 ms a frame. Both crates are
-therefore optimised in `dev` too — see the profile section of the root
+therefore optimized in `dev` too — see the profile section of the root
 `Cargo.toml` for the numbers and the trade.
 
 ## Validation

@@ -251,7 +251,7 @@ fn run(mode: Mode) {
     println!();
 
     // ---- D + E: discrimination and framing ----
-    println!("\n== D/E. other modes at -6 dB and at +20 dB, scored at their centre ==");
+    println!("\n== D/E. other modes at -6 dB and at +20 dB, scored at their center ==");
     println!(
         "   {:<20} {:>9} {:>7} {:>6} {:>7} {:>7}   {}",
         "signal", "envelope", "conc", "words", "tight", "valid", "verdict"

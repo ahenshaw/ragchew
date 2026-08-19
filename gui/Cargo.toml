@@ -41,7 +41,7 @@ desktop = [
 # own fields and are carried through untouched, so the tedious part of the
 # configuration survives swapping builds. The choice of radio itself resets to
 # none, which is what this app already does with a theme or a mode name it does
-# not recognise, and is one click to put back.
+# not recognize, and is one click to put back.
 
 # The serial port itself, shared by every rig above. Not a rig and not meant to
 # be selected on its own — whichever rig features are on turn it on. On its own
