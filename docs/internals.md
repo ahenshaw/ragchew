@@ -131,6 +131,27 @@ fast end of that range and a busy one at the slow end, since every timing that
 looks plausible has to be decoded properly to be ruled out. Cost scales with the
 number of modes enabled, which is what the GUI's mode menus are really for.
 
+Those modes are scanned on a thread each: they read the same samples, share
+nothing, and only PSK depends on another mode's findings, so it runs as a
+second phase once the rest have reported. What that is worth is best measured
+against the deadline the live scanner actually has — an acquisition every four
+seconds over the last twenty-four:
+
+| pass | modes | serial | threaded | of its cadence |
+|------|------:|-------:|---------:|---------------:|
+| acquisition (Olivia + PSK) | 8 | 2.62 s | **0.68 s** | 66% → 17% |
+| JS8 | 4 submodes | 2.53 s | **1.03 s** | 17% → 7% |
+
+The point is not the throughput. `continuous.rs` documents what a scan that
+outruns its cadence does — it yields, scans thin out, and Olivia gets looked at
+less often — and on a machine four times slower per core the serial scan was
+over its deadline before it started. The threading is what keeps a modest
+machine inside it.
+
+The answer does not depend on the threading: results are merged in the order
+the modes were given, the final sort is stable, and `tests/scan.rs` holds it
+there.
+
 A debug build is not usable for live audio: one Olivia pass over its 24-second
 window across six modes measured 41 s unoptimized against 3.5 s optimized, and
 rendering one 45-second waterfall view measured 177 ms a frame. Both crates are
