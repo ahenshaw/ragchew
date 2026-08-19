@@ -552,7 +552,7 @@ impl Qso {
         // Once was wrong because a call arrives in pieces. JS8 packs about
         // thirteen characters of prose into a frame and an over is several of
         // them, so the packing cuts whatever word it reaches: the demo band's
-        // own "W1JS8 DE K2LOW 2W ONLY" goes out as "W1JS8 DE K2L" and
+        // own "W1JSK DE K2LOW 2W ONLY" goes out as "W1JSK DE K2L" and
         // "OW 2W ONLY" — and the front of a call is a call, K2L passing every
         // test K2LOW does. The tab, the Call field and the log all said K2L.
         // A continuous mode has the same problem a character at a time, which
@@ -1097,16 +1097,16 @@ mod tests {
     /// A call cut in half by JS8's frame packing is put back together by the
     /// frame that finishes it.
     ///
-    /// This is the demo band's own traffic. "W1JS8 DE K2LOW 2W ONLY" is
+    /// This is the demo band's own traffic. "W1JSK DE K2LOW 2W ONLY" is
     /// twenty-two characters and a Normal frame carries about thirteen, so it
-    /// goes out as "W1JS8 DE K2L" and "OW 2W ONLY" — and K2L is a call sign by
+    /// goes out as "W1JSK DE K2L" and "OW 2W ONLY" — and K2L is a call sign by
     /// every rule there is. The tab, the Call field and the log all carried
     /// K2L until this test existed.
     #[test]
     fn a_call_split_across_two_frames_is_read_whole() {
         let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
         let mut set = ChannelSet::new(15.0);
-        set.add(js8_decode(700.0, 0.0, "W1JS8 DE K2L"));
+        set.add(js8_decode(700.0, 0.0, "W1JSK DE K2L"));
         let mut qsos = QsoSet::new();
         qsos.open_for_channel(&set.channels()[0], 0.0);
         assert_eq!(qsos.qsos()[0].call, "K2L", "the first frame reads as far as it can");
@@ -1176,7 +1176,7 @@ mod tests {
     fn a_typed_call_survives_the_rest_of_the_over() {
         let period = ModeId::Js8(js8::Mode::Normal).period_s().expect("cycle-aligned") as f64;
         let mut set = ChannelSet::new(15.0);
-        set.add(js8_decode(700.0, 0.0, "W1JS8 DE K2L"));
+        set.add(js8_decode(700.0, 0.0, "W1JSK DE K2L"));
         let mut qsos = QsoSet::new();
         qsos.open_for_channel(&set.channels()[0], 0.0);
 

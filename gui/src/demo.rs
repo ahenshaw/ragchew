@@ -574,13 +574,20 @@ pub const SIGNALS_PSK_OVERS: &[(usize, &str)] = &[
 /// is why the thread reads with a `<>` where each operator stopped talking, the
 /// same mark JS8Call shows.
 pub const SIGNALS_JS8_HZ: f64 = 700.0;
+/// W1JSK and not W1JS8, which is what this station was called until the call
+/// tracker was asked what it made of it: a call sign's suffix is letters, so
+/// `qso::callsign_in` reads W1JS8 as no call at all, and the thread ended up
+/// named after the *quiet* operator while the other two threads were named
+/// after the loud one. The mnemonic survives the K, and the packing does too —
+/// the over below still breaks mid-call, which is the case
+/// `a_call_broken_over_two_js8_frames_reaches_the_panel_whole` exists for.
 pub const SIGNALS_JS8_OPS: [Op; 2] =
-    [Op { call: "W1JS8", watts: 100.0 }, Op { call: "K2LOW", watts: 2.0 }];
+    [Op { call: "W1JSK", watts: 100.0 }, Op { call: "K2LOW", watts: 2.0 }];
 
 /// `(which operator, what they send)`, in order, on consecutive cycles.
 pub const SIGNALS_JS8_OVERS: &[(usize, &str)] = &[
-    (0, "CQ DE W1JS8 JS8 NORMAL"),
-    (1, "W1JS8 DE K2LOW 2W ONLY"),
+    (0, "CQ DE W1JSK JS8 NORMAL"),
+    (1, "W1JSK DE K2LOW 2W ONLY"),
     (0, "10 WPM SOLID -15 DB"),
     (1, "R TU 73 SK"),
 ];

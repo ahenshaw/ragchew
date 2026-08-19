@@ -549,14 +549,20 @@ fn the_signals_band_holds_three_conversations() {
     }
 }
 
-/// The call the QSO panel shows for the signals band's JS8 station is the whole
-/// of it.
+/// The call the QSO panel shows is the whole of it, however the frames fell.
 ///
-/// The station is K2LOW, and "W1JS8 DE K2LOW 2W ONLY" is longer than a Normal
-/// frame carries — so it goes on the air as "W1JS8 DE K2L" and "OW 2W ONLY",
-/// and the first of those names a station that does not exist. It is decoded
-/// audio that exposes this and nothing else does: every unit test that fed the
-/// tracker whole sentences was green while the tab said K2L.
+/// The answering station is K2LOW, and "W1JSK DE K2LOW 2W ONLY" is longer than
+/// a Normal frame carries — so it goes on the air as "W1JSK DE K2L" and
+/// "OW 2W ONLY", and the first of those names a station that does not exist.
+/// It is decoded audio that exposes this and nothing else does: every unit test
+/// that fed the tracker whole sentences was green while the tab said K2L.
+///
+/// Both ways of arriving at the thread are checked, because they read different
+/// text. Open it from the first decode and the calling station names it, which
+/// is the ordinary case. Click it while the other operator is part way through
+/// answering — the case an operator meets every time they tune across a QSO in
+/// progress — and the name comes out of the over that is landing, half a call
+/// at first and whole a cycle later.
 #[test]
 fn a_call_broken_over_two_js8_frames_reaches_the_panel_whole() {
     use ragchew::protocol::ModeId;
@@ -573,20 +579,30 @@ fn a_call_broken_over_two_js8_frames_reaches_the_panel_whole() {
     );
     assert!(!decodes.is_empty(), "the JS8 thread did not decode");
 
-    // As the app does it: each decode as it lands, the QSO opened on the first.
-    let mut set = ChannelSet::new(15.0);
-    let mut qsos = QsoSet::new();
-    for d in decodes {
-        set.add(d);
-        if qsos.qsos().is_empty() {
-            qsos.open_for_channel(&set.channels()[0], 0.0);
+    // Each decode as it lands, as the app does it. `open_at` is the decode the
+    // operator clicks on: the first one, or the one that starts the answer.
+    let run = |open_at: fn(&str) -> bool| -> String {
+        let mut set = ChannelSet::new(15.0);
+        let mut qsos = QsoSet::new();
+        for d in decodes.iter().cloned() {
+            let click = open_at(&d.text);
+            set.add(d);
+            if qsos.qsos().is_empty() && click {
+                qsos.open_for_channel(&set.channels()[0], 0.0);
+            }
+            if !qsos.qsos().is_empty() {
+                qsos.absorb(&set);
+            }
         }
-        qsos.absorb(&set);
-    }
+        qsos.qsos()[0].label()
+    };
 
-    let q = &qsos.qsos()[0];
-    assert_eq!(q.call, "K2LOW", "the panel named the station {:?}", q.call);
-    assert_eq!(q.label(), "K2LOW", "the tab is labelled {:?}", q.label());
+    assert_eq!(run(|_| true), "W1JSK", "the station calling CQ did not name the thread");
+    assert_eq!(
+        run(|t| t.contains("DE K2L")),
+        "K2LOW",
+        "a station clicked mid-over kept the half of its call that had arrived"
+    );
 }
 
 /// Every over in the band arrives as its own over, on all three protocols.
