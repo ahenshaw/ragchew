@@ -178,7 +178,7 @@ pub fn scroll_window(
     let vb = (b1 - b0 + 1) as i64;
 
     let (lo, hi) = norm;
-    let span_v = (hi - lo).max(1e-6);
+    let inv_span = 1.0 / (hi - lo).max(1e-6);
     for oy in 0..height {
         let top = b1 as i64 - (oy as i64 * vb) / height as i64;
         let bot = b1 as i64 - ((oy + 1) as i64 * vb) / height as i64;
@@ -189,13 +189,28 @@ pub fn scroll_window(
             let chi = col_hi - (ox as i64 * span) / width as i64;
             let clo = col_hi - ((ox + 1) as i64 * span) / width as i64;
             let c = match cell(spec, clo.max(0), chi.max(clo + 1).min(n_cols), blo, bhi) {
-                Some(lm) => colormap::magma(((lm - lo) / span_v).clamp(0.0, 1.0)),
+                Some(lm) => shade(lm, lo, inv_span),
                 None => BG,
             };
             img.put(ox, oy, c);
         }
     }
     true
+}
+
+/// One pixel's color, from its log magnitude and the contrast bounds.
+///
+/// Shared by the full render and the scroll for the same reason [`cell`] is:
+/// the two must agree pixel for pixel, and the only way to be sure of that is
+/// for there to be one piece of code that decides.
+///
+/// `inv_span` is the reciprocal of the contrast range rather than the range
+/// itself, so that the per-pixel work is a multiply. Worth about a millisecond
+/// of a redraw at 1200x760 — small beside the table below it, and free.
+#[inline]
+fn shade(lm: f32, lo: f32, inv_span: f32) -> [u8; 3] {
+    let t = ((lm - lo) * inv_span).clamp(0.0, 1.0);
+    colormap::lut()[(t * (colormap::LEVELS - 1) as f32 + 0.5) as usize]
 }
 
 /// The log-magnitude behind one output pixel: the loudest bin in the block of
@@ -258,25 +273,64 @@ pub fn render_window(
     let (b0, b1) = (b0.min(b1), b0.max(b1));
     let vb = (b1 - b0 + 1) as i64;
 
-    // source column window per output x (newest at left)
-    let col_range = |ox: usize| -> (i64, i64) {
-        let hi = col_hi - (ox as i64 * span) / width as i64;
-        let lo = col_hi - ((ox + 1) as i64 * span) / width as i64;
-        (lo, hi.max(lo + 1))
-    };
+    // Source column window per output x (newest at left), worked out once for
+    // the whole image rather than once per pixel: it does not depend on the
+    // row, and it costs two integer divisions. Two milliseconds of a redraw at
+    // 1200x760, which is worth having and is not where the time went — that was
+    // the color map, one search of the stop list and three interpolations per
+    // pixel, now a table in `colormap`.
+    let cols_at: Vec<(i64, i64)> = (0..width)
+        .map(|ox| {
+            let hi = col_hi - (ox as i64 * span) / width as i64;
+            let lo = col_hi - ((ox + 1) as i64 * span) / width as i64;
+            (lo, hi.max(lo + 1))
+        })
+        .collect();
     let bin_range = |oy: usize| -> (usize, usize) {
         let top = b1 as i64 - (oy as i64 * vb) / height as i64;
         let bot = b1 as i64 - ((oy + 1) as i64 * vb) / height as i64;
         (bot.max(0) as usize, top.max(0) as usize)
     };
 
+    // The logarithm, once per spectrogram cell in view instead of once per
+    // pixel — worth it exactly when a cell covers more than a pixel, which is
+    // what zooming in does. Zoomed out the opposite holds: several cells fall
+    // under one pixel, the reduction below takes their maximum, and one
+    // logarithm per pixel is the cheaper of the two. So it is measured rather
+    // than assumed, and the answer is a `max` either way: taking the maximum of
+    // the logarithms and taking the logarithm of the maximum are the same
+    // number to the last bit, since the logarithm only ever increases.
+    //
+    // The cached rectangle is what the loops below can actually reach, which is
+    // a little more than the viewport: a row's bin range runs one bin under
+    // `b0` at the bottom edge, and a column range one past `col_hi` where a
+    // pixel is narrower than a column.
+    let (vis_lo, vis_hi) = ((col_hi - span).max(0), (col_hi + 1).min(n_cols));
+    let (bmin, bmax) = (b0.saturating_sub(1), b1);
+    let vis_cols = (vis_hi - vis_lo).max(0) as usize;
+    let vis_bins = bmax - bmin + 1;
+    let logs: Option<Vec<f32>> = (vis_cols > 0 && vis_cols * vis_bins <= width * height)
+        .then(|| {
+            let mut v = Vec::with_capacity(vis_cols * vis_bins);
+            for j in vis_lo..vis_hi {
+                let col = &spec.columns[j as usize];
+                v.extend(col[bmin..=bmax].iter().map(|m| (m + 1e-9).ln()));
+            }
+            v
+        });
+
     let mut grid = vec![f32::NEG_INFINITY; width * height]; // -inf = no data
     let mut vals: Vec<f32> = Vec::new();
     for oy in 0..height {
         let (blo, bhi) = bin_range(oy);
-        for ox in 0..width {
-            let (clo, chi) = col_range(ox);
-            let Some(lm) = cell(spec, clo.max(0), chi.min(n_cols), blo, bhi) else {
+        for (ox, &(clo, chi)) in cols_at.iter().enumerate() {
+            let (clo, chi) = (clo.max(0), chi.min(n_cols));
+            let cached = logs.as_ref().map(|l| {
+                block_max(clo, chi, blo, bhi.min(bmax), |j, b| {
+                    l[(j - vis_lo) as usize * vis_bins + (b - bmin)]
+                })
+            });
+            let Some(lm) = cached.unwrap_or_else(|| cell(spec, clo, chi, blo, bhi)) else {
                 continue; // outside the recording -> stays -inf (bg)
             };
             grid[oy * width + ox] = lm;
@@ -295,20 +349,46 @@ pub fn render_window(
             (pct(0.55), pct(0.995))
         }
     });
-    let span_v = (hi - lo).max(1e-6);
+    let inv_span = 1.0 / (hi - lo).max(1e-6);
 
-    for oy in 0..height {
-        for ox in 0..width {
-            let lm = grid[oy * width + ox];
-            let c = if lm == f32::NEG_INFINITY {
-                BG
-            } else {
-                colormap::magma(((lm - lo) / span_v).clamp(0.0, 1.0))
-            };
-            img.put(ox, oy, c);
+    // Written a row at a time rather than a pixel at a time: every pixel here
+    // is inside the image by construction, and `Image::put` pays for a bounds
+    // check to prove it half a million times.
+    for (row, lms) in img.rgba.chunks_exact_mut(width * 4).zip(grid.chunks_exact(width)) {
+        for (px, &lm) in row.chunks_exact_mut(4).zip(lms) {
+            let c = if lm == f32::NEG_INFINITY { BG } else { shade(lm, lo, inv_span) };
+            px[0] = c[0];
+            px[1] = c[1];
+            px[2] = c[2];
+            px[3] = 255;
         }
     }
     img
+}
+
+/// The largest value in a block of spectrogram, by whatever `at` reads out of
+/// it. `None` where the block is empty.
+#[inline]
+fn block_max<F: Fn(i64, usize) -> f32>(
+    clo: i64,
+    chi: i64,
+    blo: usize,
+    bhi: usize,
+    at: F,
+) -> Option<f32> {
+    if clo >= chi || blo > bhi {
+        return None;
+    }
+    let mut mx = f32::NEG_INFINITY;
+    for j in clo..chi {
+        for b in blo..=bhi {
+            let v = at(j, b);
+            if v > mx {
+                mx = v;
+            }
+        }
+    }
+    Some(mx)
 }
 
 #[cfg(test)]
@@ -341,6 +421,13 @@ mod scroll_tests {
 
         // Every width here divides its span exactly, which is the condition
         // under which a column of new data is a whole pixel of travel.
+        //
+        // The comparison is worth more than it looks: only `render_window`
+        // caches the logarithms, so every pair of images here is also the
+        // cached path checked against the uncached one. The last size is there
+        // to make sure both regimes are covered — it is the only one whose
+        // spectrogram cells are fewer than its pixels, which is the test the
+        // cache turns on.
         for (w, h, span) in [
             (375usize, 200usize, 1125usize), // 3 columns per pixel
             (225, 120, 1125),                // 5
@@ -348,6 +435,7 @@ mod scroll_tests {
             (80, 120, 1120),                 // 14, the panel at its narrowest
             (256, 128, 1024),                // a power-of-two ratio
             (250, 100, 1000),                // 4
+            (200, 700, 200),                 // one column per pixel: cache on
         ] {
             for vp in [&full_band, &zoomed] {
                 let step = (span / w).max(1) as i64;
