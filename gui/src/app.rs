@@ -3603,7 +3603,7 @@ impl App {
                 elegance::TextArea::new(&mut q.draft)
                     .rows(2)
                     .desired_width(f32::INFINITY)
-                    .hint("reply…"),
+                    .hint("enter text here…"),
             );
             if q.want_focus {
                 resp.request_focus();
