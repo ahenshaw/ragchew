@@ -1,6 +1,6 @@
 # ragchew
 
-A panoramic monitor for HAM radio keyboard-to-keyboard digital modes. Point it
+A panoramic monitor for Ham Radio keyboard-to-keyboard digital modes. Point it
 at a receiver and it shows you a waterfall of the whole audio passband with
 every conversation in it decoded and printed alongside, on a row that lines up
 with the signal it came from — whatever mode that signal happens to be using.
