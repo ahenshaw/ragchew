@@ -39,6 +39,7 @@ use crate::{diag_info, diag_warn};
 use crate::qso::{Dir, QsoSet};
 use crate::scene::{self, Geometry};
 use crate::sparkline;
+use crate::spot::{Reporter, Spotter, Station};
 use crate::tx::{self, Tx};
 use crate::waterfall::{self, Viewport};
 
@@ -1121,6 +1122,15 @@ struct Settings {
     rig_baud: u32,
     /// Whether the rig's settings are expanded under the dial.
     rig_more: bool,
+    /// This station, as PSKReporter is to know it.
+    my_call: String,
+    my_grid: String,
+    /// Which protocols are reported to PSKReporter. All off unless turned on:
+    /// reporting publishes, under the operator's callsign, what this app
+    /// heard, and that is for them to choose.
+    spot_js8: bool,
+    spot_olivia: bool,
+    spot_psk: bool,
 }
 
 impl Default for Settings {
@@ -1152,6 +1162,11 @@ impl Default for Settings {
             rig_device: DEFAULT_RIG_DEVICE.to_string(),
             rig_baud: DEFAULT_RIG_BAUD,
             rig_more: false,
+            my_call: String::new(),
+            my_grid: String::new(),
+            spot_js8: false,
+            spot_olivia: false,
+            spot_psk: false,
         }
     }
 }
@@ -1701,6 +1716,20 @@ impl LiveMode {
     }
 }
 
+/// PSKReporter, while it is on: which overs have been read, and the thread
+/// sending what they held.
+///
+/// The thread waits for a complete station — a callsign and a locator — and so
+/// does the reading: an operator part way through typing their call is not
+/// reported under the half of it they have typed. Kept across that rather than
+/// rebuilt on every keystroke, since rebuilding would forget what was already
+/// reported and start a new stream on the server.
+struct Spotting {
+    spotter: Spotter,
+    reporter: Option<Reporter>,
+    station: Option<Station>,
+}
+
 struct App {
     band: (f64, f64),
     duration_s: f64,
@@ -1850,6 +1879,15 @@ struct App {
     dial_by_key: Option<Pos2>,
     /// Whether the rig's settings are on show under the dial.
     rig_more: bool,
+
+    /// This station's callsign and locator, which PSKReporter files reports
+    /// under.
+    my_call: String,
+    my_grid: String,
+    /// Which protocols to report, in [`Protocol::ALL`] order.
+    spot: [bool; 3],
+    /// Reporting, while any protocol is turned on and the app is listening.
+    spotting: Option<Spotting>,
 
     /// Whether the list of modes is showing, which it does while the pointer is
     /// on the mode or in the list itself.
@@ -2088,6 +2126,10 @@ impl App {
             dial_typing: false,
             mode_menu: false,
             rig_more: false,
+            my_call: String::new(),
+            my_grid: String::new(),
+            spot: [false; 3],
+            spotting: None,
             file_set: ChannelSet::new(15.0),
             fed_frames: 0,
             frames_dirty: false,
@@ -2123,6 +2165,11 @@ impl App {
             rig_device: self.rig_device.clone(),
             rig_baud: self.rig_baud,
             rig_more: self.rig_more,
+            my_call: self.my_call.clone(),
+            my_grid: self.my_grid.clone(),
+            spot_js8: self.spot[0],
+            spot_olivia: self.spot[1],
+            spot_psk: self.spot[2],
         }
     }
 
@@ -2155,6 +2202,9 @@ impl App {
             self.rig_baud = s.rig_baud;
         }
         self.rig_more = s.rig_more;
+        self.my_call = s.my_call;
+        self.my_grid = s.my_grid;
+        self.spot = [s.spot_js8, s.spot_olivia, s.spot_psk];
         let keying = self.keying_for(&s.rig_keying);
         self.set_keying(keying);
         // An unknown name leaves the theme at Auto rather than at whatever the
@@ -3041,6 +3091,82 @@ impl App {
     }
 
     /// What the transmitter is doing, as far as anything can tell.
+    /// Read what has been heard since the last frame and pass on whatever is
+    /// worth reporting.
+    ///
+    /// Only off live audio: a file's stations were heard whenever it was
+    /// recorded, on whatever dial it was recorded at, and the demo band's were
+    /// never heard at all. And only with the rig saying where the dial is and
+    /// which sideband it is on, because where a station was heard is half of
+    /// what a report says — see [`on_the_band`].
+    fn report_spots(&mut self) {
+        let wanted = self.spot;
+        if !wanted.contains(&true) || self.live.is_none() {
+            self.spotting = None;
+            return;
+        }
+        let st = self.ptt_state();
+        let (dial, sideband) = if st.linked { (st.dial_hz, st.dial_mode) } else { (None, None) };
+        let me = Station {
+            call: self.my_call.trim().to_ascii_uppercase(),
+            grid: self.my_grid.trim().to_string(),
+        };
+        let sp = self.spotting.get_or_insert_with(|| Spotting {
+            spotter: Spotter::new(),
+            reporter: None,
+            station: None,
+        });
+        if me.is_complete() && sp.station.as_ref() != Some(&me) {
+            match &sp.reporter {
+                Some(r) => r.station(me.clone()),
+                None => sp.reporter = Some(Reporter::start(me.clone())),
+            }
+            diag_info!("spot", "reporting to PSKReporter as {} in {}", me.call, me.grid);
+            sp.station = Some(me.clone());
+        }
+        let Some(lm) = self.live.as_ref() else { return };
+        let spots = sp.spotter.observe(
+            lm.channels.channels(),
+            lm.t_now,
+            unix_now(),
+            |audio| on_the_band(dial, sideband.as_deref(), audio),
+            |p| wanted[Protocol::ALL.iter().position(|&q| q == p).unwrap_or(0)],
+            &me.call,
+        );
+        // Heard while the station was incomplete: read, and let go.
+        if let (Some(r), true) = (&sp.reporter, me.is_complete()) {
+            r.spots(spots);
+        }
+    }
+
+    /// What PSKReporter reporting is doing, in a line, and whether that line
+    /// is a fault. Says why nothing is going whenever nothing is, since every
+    /// one of these reasons is otherwise silent.
+    fn spot_status(&self, live: bool) -> (String, bool) {
+        let me = Station { call: self.my_call.trim().to_string(), grid: self.my_grid.trim().to_string() };
+        let st = self.ptt_state();
+        let status = self.spotting.as_ref().and_then(|s| s.reporter.as_ref()).map(|r| r.status());
+        if !self.spot.contains(&true) {
+            return ("off".into(), false);
+        }
+        if !me.is_complete() {
+            return ("waiting for your callsign and grid".into(), false);
+        }
+        if !live {
+            return ("only reports while listening live".into(), false);
+        }
+        if let Some(e) = status.as_ref().and_then(|s| s.fault.clone()) {
+            return (e, true);
+        }
+        if on_the_band(st.dial_hz.filter(|_| st.linked), st.dial_mode.as_deref(), 0.0).is_none() {
+            return ("paused: the rig is not saying where its dial is, \
+                     or is not on a sideband".into(), false);
+        }
+        let Some(s) = status else { return ("starting".into(), false) };
+        let last = s.last_sent.map_or("none sent yet".to_string(), |t| format!("last sent {}", &utc_stamp(t)[11..]));
+        (format!("{} reported, {} waiting, {last}", s.sent, s.queued), false)
+    }
+
     fn ptt_state(&self) -> rig::State {
         self.ptt.as_ref().map(|p| p.state()).unwrap_or_default()
     }
@@ -4305,6 +4431,7 @@ impl App {
                 .map(|r| (r.path().display().to_string(), r.seconds(), r.bytes()));
             ctx.request_repaint(); // keep the live view flowing
         }
+        self.report_spots();
 
         // ---- FILE: async load + simulated playback clock ----
         if !live {
@@ -4794,6 +4921,38 @@ impl App {
                             }
                         }
                     });
+                    // Beside the rig because it leans on it: a report says
+                    // where a station was heard, and only the rig knows.
+                    let spot_status = self.spot_status(live);
+                    ui.menu_button("PSKReporter", |ui| {
+                        ui.set_min_width(300.0);
+                        egui::Grid::new("pskreporter").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                            ui.label("Callsign");
+                            ui.add(egui::TextEdit::singleline(&mut self.my_call).desired_width(140.0));
+                            ui.end_row();
+                            ui.label("Grid");
+                            ui.add(egui::TextEdit::singleline(&mut self.my_grid).desired_width(140.0))
+                                .on_hover_text("your Maidenhead locator: four or six characters, FN42 or FN42hn");
+                            ui.end_row();
+                        });
+                        ui.label("Report stations heard on");
+                        ui.horizontal(|ui| {
+                            for (on, p) in self.spot.iter_mut().zip(Protocol::ALL) {
+                                ui.add(elegance::Checkbox::new(on, p.name()));
+                            }
+                        });
+                        let (text, fault) = spot_status;
+                        if fault {
+                            ui.colored_label(ui.visuals().warn_fg_color, text);
+                        } else {
+                            ui.weak(text);
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "report the callsigns this app decodes to pskreporter.info, \
+                         under your callsign, so the map shows who you are hearing",
+                    );
 
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -5707,6 +5866,9 @@ mod tests {
         app.rig_port = 4599;
         app.rig_device = "/dev/ttyUSB3".to_string();
         app.rig_baud = 9600;
+        app.my_call = "N1DQ".to_string();
+        app.my_grid = "FN42hn".to_string();
+        app.spot = [true, false, true];
         app.set_keying(rig::Keying::RigCtld { host: "radio.local".into(), port: 4599 });
         app.set_view(1200.0, 1400.0);
         for (m, on) in app.modes.iter_mut() {
@@ -5739,8 +5901,23 @@ mod tests {
         // that switching back does not ask for it again.
         assert_eq!(restored.rig_device, "/dev/ttyUSB3");
         assert_eq!(restored.rig_baud, 9600);
+        assert_eq!((restored.my_call.as_str(), restored.my_grid.as_str()), ("N1DQ", "FN42hn"));
+        assert_eq!(restored.spot, [true, false, true]);
         assert_eq!(restored.enabled_modes(), app.enabled_modes());
         assert!(restored.enabled_modes().iter().all(|m| m.protocol() == Protocol::Olivia));
+    }
+
+    /// PSKReporter is off out of the box, and off for every settings file
+    /// written before it existed: reporting publishes under the operator's
+    /// callsign, so no installation starts doing it on an upgrade.
+    #[test]
+    fn reporting_starts_off() {
+        let mut app = App::base((0.0, 4000.0));
+        app.apply(serde_json::from_str(r#"{"forget_min":15.0}"#).unwrap());
+        assert_eq!(app.spot, [false; 3]);
+        app.report_spots();
+        assert!(app.spotting.is_none());
+        assert_eq!(app.spot_status(true), ("off".to_string(), false));
     }
 
     /// The timeout is on out of the box, and a settings file from before it

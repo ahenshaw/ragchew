@@ -18,6 +18,9 @@ pub mod record;
 /// builds and is tested without the windowing or audio stack.
 pub mod rig;
 pub mod scene;
+/// Reporting stations heard to PSKReporter. Pure `std`: a UDP socket and a
+/// thread, testable without the window.
+pub mod spot;
 pub mod traffic;
 pub mod waterfall;
 
